@@ -31,11 +31,13 @@ def prepare_tft_data(
     group_id: str = "ticker",
     max_encoder_length: int = TFT_MAX_ENCODER_LENGTH,
     max_prediction_length: int = TFT_MAX_PREDICTION_LENGTH,
+    ticker: str | None = None,
 ) -> pd.DataFrame:
     """
     Prepare DataFrame for TimeSeriesDataSet / TFT.
     Expects OHLCV with columns: open, high, low, close, volume.
     Adds time_idx, group_ids, target, time_varying features.
+    ticker: if set, used as group id (for multi-ticker TFT); otherwise "asset".
     """
     if df.empty or len(df) < max_encoder_length + max_prediction_length:
         return pd.DataFrame()
@@ -47,7 +49,7 @@ def prepare_tft_data(
     # Returns
     df["return_1d"] = df["close"].pct_change()
     df["forward_return_30d"] = df["close"].shift(-max_prediction_length) / df["close"] - 1
-    df[group_id] = "asset"
+    df[group_id] = ticker if ticker else "asset"
 
     # Rolling features
     df["vol_20d"] = df["return_1d"].rolling(20).std()

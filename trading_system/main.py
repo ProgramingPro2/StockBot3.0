@@ -1,12 +1,14 @@
 """
 CLI entry point for The Boardroom trading system.
-Modes: --train, --backtest, --paper
+Modes: train, backtest, paper, live (multi-asset: TRADE_TICKERS).
 """
-import json
 import argparse
+import json
 from pathlib import Path
 
-from .config import OUTPUT_DIR, SPECIALIST_CACHE_DIR
+import numpy as np
+
+from .config import N_ASSETS, OUTPUT_DIR, SPECIALIST_CACHE_DIR, TRADE_TICKERS
 from .utils.logger import setup_logger, get_logger
 
 setup_logger()
@@ -35,65 +37,84 @@ def _run_specialists(ticker: str = "SPY") -> dict:
     return out
 
 
+def _position_used(position_pct: float) -> float:
+    """Use 50% when policy outputs ~0 so backtest/paper/live have meaningful exposure."""
+    return 0.5 if position_pct < 0.01 else position_pct
+
+
+def _tickers_from_args(args: argparse.Namespace) -> list[str]:
+    """Resolve ticker list: --tickers override or config TRADE_TICKERS."""
+    if getattr(args, "tickers", None):
+        return [s.strip().upper() for s in args.tickers.split(",") if s.strip()]
+    return list(TRADE_TICKERS)
+
+
 def cmd_train(args: argparse.Namespace) -> None:
-    """Train specialists and meta-learner."""
+    """Train specialists and meta-learner on TRADE_TICKERS (5 stocks)."""
+    import numpy as np
+
     from .agents.fundamental import _ensure_model as ensure_fundamental
     from .agents.quantitative import _ensure_model as ensure_quantitative
     from .agents.regime import _ensure_model as ensure_regime
     from .meta_learner import PPOTrader
 
-    logger.info("Training specialists...")
-    ensure_quantitative("SPY", retrain=args.retrain)
+    tickers = _tickers_from_args(args)
+    n_assets = len(tickers)
+    if n_assets == 0:
+        logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
+        return
+
+    logger.info("Training specialists for %d tickers: %s", n_assets, tickers)
+    ensure_quantitative(tickers, retrain=args.retrain)
     ensure_fundamental()
     ensure_regime(retrain=args.retrain)
 
     logger.info("Training meta-learner (PPO)...")
-    trader = PPOTrader(n_assets=1, load=False)
+    trader = PPOTrader(n_assets=n_assets, load=False)
 
-    ticker = args.ticker
-    cache_path = SPECIALIST_CACHE_DIR / f"{ticker.upper()}.json"
-
-    def _load_specialist_cache() -> dict | None:
-        if not cache_path.exists():
+    def _load_specialist_cache(t: str) -> dict | None:
+        p = SPECIALIST_CACHE_DIR / f"{t.upper()}.json"
+        if not p.exists():
             return None
         try:
-            with open(cache_path) as f:
+            with open(p) as f:
                 return json.load(f)
         except Exception:
             return None
 
-    def _save_specialist_cache(data: dict) -> None:
+    def _save_specialist_cache(t: str, data: dict) -> None:
         try:
-            with open(cache_path, "w") as f:
+            p = SPECIALIST_CACHE_DIR / f"{t.upper()}.json"
+            with open(p, "w") as f:
                 json.dump(data, f)
         except Exception:
             pass
 
-    def specialist_fn() -> dict:
-        # Fetch once, cache; reuse for all env resets (avoids network on every reset)
-        cached = _load_specialist_cache()
-        if cached:
-            return cached
-        try:
-            out = _run_specialists(ticker)
-            _save_specialist_cache(out)
-            return out
-        except Exception as e:
-            logger.warning("Specialist fetch failed: %s. Using cached/random fallback.", e)
-            import numpy as np
-            fallback = {
-                "sentiment": float(np.random.uniform(-1, 1)),
-                "quant_prob": float(np.random.uniform(0, 1)),
-                "fund_score": float(np.random.uniform(-1, 1)),
-                "regime_flag": float(np.random.uniform(0, 1)),
-                "regime_name": "Sideways",
-            }
-            _save_specialist_cache(fallback)  # Cache fallback so we don't retry network
-            return fallback
+    def specialist_fn() -> list[dict]:
+        out_list: list[dict] = []
+        for t in tickers:
+            cached = _load_specialist_cache(t)
+            if cached:
+                out_list.append(cached)
+                continue
+            try:
+                out = _run_specialists(t)
+                _save_specialist_cache(t, out)
+                out_list.append(out)
+            except Exception as e:
+                logger.warning("Specialist fetch failed for %s: %s. Using fallback.", t, e)
+                fallback = {
+                    "sentiment": float(np.random.uniform(-1, 1)),
+                    "quant_prob": float(np.random.uniform(0, 1)),
+                    "fund_score": float(np.random.uniform(-1, 1)),
+                    "regime_flag": float(np.random.uniform(0, 1)),
+                    "regime_name": "Sideways",
+                }
+                _save_specialist_cache(t, fallback)
+                out_list.append(fallback)
+        return out_list
 
-    # Pre-fetch and cache before training starts
     specialist_fn()
-
     trader.train(total_timesteps=args.timesteps, specialist_fn=specialist_fn)
     logger.info("Training complete. Models saved.")
 
@@ -160,91 +181,114 @@ def _proxy_specialists_from_returns(
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
-    """Backtest with trained models; save performance plots."""
+    """Backtest portfolio (5 tickers) with trained models; save performance plot."""
+    import numpy as np
     import pandas as pd
     from .data.loader import load_ohlcv
     from .meta_learner import PPOTrader
     from .utils.plotting import save_performance_plot
 
-    ticker = args.ticker
-    logger.info("Running backtest for %s...", ticker)
-
-    df = load_ohlcv(ticker, lookback_years=3)
-    if df.empty or len(df) < 252:
-        logger.error("Insufficient data for backtest")
+    tickers = _tickers_from_args(args)
+    n_assets = len(tickers)
+    if n_assets == 0:
+        logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
         return
 
-    trader = PPOTrader(n_assets=1)
-    df = df.tail(252 * 2).copy()
-    df["return"] = df["close"].pct_change()
-    returns_series = df["return"]
-    n = len(df)
+    logger.info("Running portfolio backtest for %s...", tickers)
+
+    dfs: list[pd.DataFrame] = []
+    for t in tickers:
+        df = load_ohlcv(t, lookback_years=3)
+        if df.empty or len(df) < 252:
+            logger.error("Insufficient data for backtest: %s", t)
+            return
+        df = df[["close"]].copy()
+        df.columns = [t]
+        df["return_" + t] = df[t].pct_change()
+        dfs.append(df)
+
+    aligned = dfs[0]
+    for df in dfs[1:]:
+        aligned = aligned.join(df, how="inner")
+    aligned = aligned.dropna(how="all").tail(252 * 2)
+    if len(aligned) < 252:
+        logger.error("Insufficient aligned data for backtest")
+        return
+
+    return_cols = ["return_" + t for t in tickers]
+    n = len(aligned)
     window = 21
-    # Rolling backtest: one prediction per 21-day block, proxy specialists from prior returns
-    strategy_returns = pd.Series(0.0, index=df.index, dtype=float)
-    position_pcts: list[float] = []
+    trader = PPOTrader(n_assets=n_assets)
+
+    strategy_returns = pd.Series(0.0, index=aligned.index, dtype=float)
     for start in range(0, n, window):
         end = min(start + window, n)
-        sentiment, quant_prob, fund_score, regime_flag = _proxy_specialists_from_returns(
-            returns_series, start, window
-        )
-        action = trader.predict(sentiment, quant_prob, fund_score, regime_flag)
-        position_pct = float(action[0])
-        # Fallback: trained policy can collapse to 0; use 50% exposure so backtest is meaningful
-        position_used = 0.5 if position_pct < 0.01 else position_pct
-        position_pcts.append(position_used)
-        strategy_returns.iloc[start:end] = returns_series.iloc[start:end] * position_used
+        specialist_list: list[dict] = []
+        for t, ret_col in zip(tickers, return_cols):
+            ret_series = aligned[ret_col]
+            s, q, f, r = _proxy_specialists_from_returns(ret_series, start, window)
+            specialist_list.append({
+                "sentiment": s, "quant_prob": q, "fund_score": f, "regime_flag": r,
+            })
+        action = trader.predict(specialist_outputs_by_asset=specialist_list)
+        action = np.array([_position_used(float(a)) for a in action])
+        total = float(np.sum(action)) + 1e-8
+        weights = action / total
+        for day in range(start, end):
+            day_ret = sum(
+                weights[i] * aligned[return_cols[i]].iloc[day]
+                for i in range(n_assets)
+            )
+            strategy_returns.iloc[day] = day_ret
+    strategy_returns = strategy_returns.fillna(0)
 
-    df["strategy_return"] = strategy_returns
-    df["equity"] = (1 + df["strategy_return"].fillna(0)).cumprod()
-    returns = df["strategy_return"].dropna()
-    bh_returns = df["return"].copy()
+    equity = (1 + strategy_returns).cumprod()
+    bh_returns = aligned[return_cols].mean(axis=1)
+    bh_equity = (1 + bh_returns.fillna(0)).cumprod()
+    returns = strategy_returns.dropna()
 
-    _backtest_stats(df["equity"], returns, bh_returns)
-    mean_pos = sum(position_pcts) / len(position_pcts) if position_pcts else 0.0
-    logger.info("Position (mean over blocks): %.1f%%", mean_pos * 100)
-
-    path = save_performance_plot(df["equity"], returns, filename=f"backtest_{ticker}.png")
+    _backtest_stats(equity, returns, bh_returns)
+    path = save_performance_plot(equity, returns, filename="backtest_portfolio.png")
     logger.info("Saved plot to %s", path)
 
 
 def cmd_paper(args: argparse.Namespace) -> None:
-    """Paper trading loop: poll data, run specialists, meta-learner, log decisions."""
+    """Paper trading loop: poll data, run specialists for all tickers, log decisions."""
     import time
 
-    from .agents import get_sentiment, get_trend_probability, get_intrinsic_value_score, detect_regime
     from .broker import send_discord_notification
     from .meta_learner import PPOTrader
 
-    ticker = args.ticker
+    tickers = _tickers_from_args(args)
+    n_assets = len(tickers)
+    if n_assets == 0:
+        logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
+        return
     interval_sec = args.interval * 60
 
-    trader = PPOTrader(n_assets=1)
-    logger.info("Starting paper trading for %s (interval=%dm)", ticker, args.interval)
+    trader = PPOTrader(n_assets=n_assets)
+    logger.info("Starting paper trading for %s (interval=%dm)", tickers, args.interval)
 
     while True:
         try:
-            outputs = _run_specialists(ticker)
-            action = trader.predict(
-                outputs["sentiment"],
-                outputs["quant_prob"],
-                outputs["fund_score"],
-                outputs["regime_flag"],
-            )
-            position_pct = float(action[0])
+            specialist_list: list[dict] = []
+            for t in tickers:
+                specialist_list.append(_run_specialists(t))
+            action = trader.predict(specialist_outputs_by_asset=specialist_list)
 
-            logger.info(
-                "Paper | %s | Sentiment=%.2f Quant=%.2f Fund=%.2f Regime=%s | Position=%.1f%%",
-                ticker,
-                outputs["sentiment"],
-                outputs["quant_prob"],
-                outputs["fund_score"],
-                outputs["regime_name"],
-                position_pct * 100,
-            )
-
-            # Send Discord notification
-            send_discord_notification(ticker, "PAPER", position_pct, specialist_outputs=outputs)
+            for i, t in enumerate(tickers):
+                position_pct = _position_used(float(action[i]))
+                out = specialist_list[i]
+                logger.info(
+                    "Paper | %s | Sentiment=%.2f Quant=%.2f Fund=%.2f Regime=%s | Position=%.1f%%",
+                    t,
+                    out["sentiment"],
+                    out["quant_prob"],
+                    out["fund_score"],
+                    out["regime_name"],
+                    position_pct * 100,
+                )
+                send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
 
             time.sleep(interval_sec)
         except KeyboardInterrupt:
@@ -256,14 +300,17 @@ def cmd_paper(args: argparse.Namespace) -> None:
 
 
 def cmd_live(args: argparse.Namespace) -> None:
-    """Live trading with Alpaca: poll data, run specialists, place orders, send Discord notifications."""
+    """Live trading with Alpaca: poll data, run specialists for all tickers, place orders."""
     import time
 
-    from .agents import get_sentiment, get_trend_probability, get_intrinsic_value_score, detect_regime
     from .broker import AlpacaBroker, send_discord_notification
     from .meta_learner import PPOTrader
 
-    ticker = args.ticker
+    tickers = _tickers_from_args(args)
+    n_assets = len(tickers)
+    if n_assets == 0:
+        logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
+        return
     interval_sec = args.interval * 60
 
     broker = AlpacaBroker()
@@ -271,47 +318,45 @@ def cmd_live(args: argparse.Namespace) -> None:
         logger.error("Alpaca client not initialized. Check API keys in config.py or .env")
         return
 
-    trader = PPOTrader(n_assets=1)
-    logger.info("Starting LIVE trading for %s (interval=%dm)", ticker, args.interval)
+    trader = PPOTrader(n_assets=n_assets)
+    logger.info("Starting LIVE trading for %s (interval=%dm)", tickers, args.interval)
 
     while True:
         try:
             account = broker.get_account()
-            cash = account.get("cash", 0)
+            cash = float(account.get("cash", 0))
             logger.info("Account cash: $%.2f", cash)
 
-            outputs = _run_specialists(ticker)
-            action = trader.predict(
-                outputs["sentiment"],
-                outputs["quant_prob"],
-                outputs["fund_score"],
-                outputs["regime_flag"],
-            )
-            position_pct = float(action[0])
+            specialist_list: list[dict] = []
+            for t in tickers:
+                specialist_list.append(_run_specialists(t))
+            action = trader.predict(specialist_outputs_by_asset=specialist_list)
+            action = np.array([_position_used(float(a)) for a in action])
+            total = float(np.sum(action)) + 1e-8
+            weights = action / total
 
-            # Get current position
-            current_pos = broker.get_position(ticker)
-            current_value = current_pos.get("market_value", 0)
-            target_value = cash * position_pct
+            for i, t in enumerate(tickers):
+                target_value = cash * weights[i]
+                current_pos = broker.get_position(t)
+                current_value = float(current_pos.get("market_value", 0))
+                outputs = specialist_list[i]
+                position_pct = weights[i]
 
-            # Determine action
-            if target_value > current_value + 100:
-                # Buy more
-                notional = target_value - current_value
-                order = broker.place_order(ticker, notional=notional, side="buy")
-                if order:
-                    logger.info("BUY %s: $%.2f", ticker, notional)
-                    send_discord_notification(ticker, "BUY", position_pct, outputs, order)
-            elif current_value > target_value + 100:
-                # Sell some
-                notional = current_value - target_value
-                order = broker.place_order(ticker, notional=notional, side="sell")
-                if order:
-                    logger.info("SELL %s: $%.2f", ticker, notional)
-                    send_discord_notification(ticker, "SELL", position_pct, outputs, order)
-            else:
-                logger.info("HOLD %s | Position=%.1f%%", ticker, position_pct * 100)
-                send_discord_notification(ticker, "HOLD", position_pct, outputs)
+                if target_value > current_value + 100:
+                    notional = target_value - current_value
+                    order = broker.place_order(t, notional=notional, side="buy")
+                    if order:
+                        logger.info("BUY %s: $%.2f", t, notional)
+                        send_discord_notification(t, "BUY", position_pct, outputs, order)
+                elif current_value > target_value + 100:
+                    notional = current_value - target_value
+                    order = broker.place_order(t, notional=notional, side="sell")
+                    if order:
+                        logger.info("SELL %s: $%.2f", t, notional)
+                        send_discord_notification(t, "SELL", position_pct, outputs, order)
+                else:
+                    logger.info("HOLD %s | Position=%.1f%%", t, position_pct * 100)
+                    send_discord_notification(t, "HOLD", position_pct, outputs)
 
             time.sleep(interval_sec)
         except KeyboardInterrupt:
@@ -326,23 +371,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="The Boardroom - Hierarchical Multi-Agent Trading System")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    train_p = sub.add_parser("train", help="Train specialists and meta-learner")
-    train_p.add_argument("--ticker", default="SPY", help="Ticker for training")
+    train_p = sub.add_parser("train", help="Train specialists and meta-learner on TRADE_TICKERS")
+    train_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     train_p.add_argument("--retrain", action="store_true", help="Force retrain specialists")
     train_p.add_argument("--timesteps", type=int, default=50_000, help="PPO timesteps")
     train_p.set_defaults(func=cmd_train)
 
-    back_p = sub.add_parser("backtest", help="Backtest with trained models")
-    back_p.add_argument("--ticker", default="SPY", help="Ticker for backtest")
+    back_p = sub.add_parser("backtest", help="Backtest portfolio with trained models")
+    back_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     back_p.set_defaults(func=cmd_backtest)
 
     paper_p = sub.add_parser("paper", help="Paper trading loop")
-    paper_p.add_argument("--ticker", default="SPY", help="Ticker for paper trading")
+    paper_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     paper_p.add_argument("--interval", type=int, default=60, help="Minutes between decisions")
     paper_p.set_defaults(func=cmd_paper)
 
     live_p = sub.add_parser("live", help="Live trading with Alpaca")
-    live_p.add_argument("--ticker", default="SPY", help="Ticker for live trading")
+    live_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     live_p.add_argument("--interval", type=int, default=60, help="Minutes between decisions")
     live_p.set_defaults(func=cmd_live)
 

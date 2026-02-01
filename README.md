@@ -1,6 +1,6 @@
 # The Boardroom - Hierarchical Multi-Agent Trading System
 
-A hierarchical multi-agent algorithmic trading system for long-term equity strategies. Four specialist agents (Narrative, Quantitative, Fundamental, Regime) feed into a PPO meta-learner for position sizing.
+A hierarchical multi-agent algorithmic trading system for long-term equity strategies. Four specialist agents (Narrative, Quantitative, Fundamental, Regime) feed into a PPO meta-learner for position sizing. The system trades a configurable list of symbols (default: 5 stocks: SPY, AAPL, MSFT, GOOGL, NVDA).
 
 ## Requirements
 
@@ -53,50 +53,63 @@ Run from the **project root** (`StockBot3.0`), not from inside `trading_system/`
 ```bash
 cd StockBot3.0
 source .venv/bin/activate
-python -m trading_system train --ticker SPY --timesteps 50000
+python -m trading_system train --timesteps 50000
 ```
 
-Or use the helper script: `./run.sh train --ticker SPY --timesteps 50000`
+By default the system uses the ticker list in config (`TRADE_TICKERS`: SPY, AAPL, MSFT, GOOGL, NVDA). Override with `--tickers`:
+
+```bash
+python -m trading_system train --tickers SPY,AAPL,MSFT,GOOGL,AMD --timesteps 50000
+```
+
+Or use the helper script: `./run.sh train --timesteps 50000`
 
 ### Train Specialists and Meta-Learner
 
 ```bash
-python -m trading_system train --ticker SPY --timesteps 50000
+python -m trading_system train --timesteps 50000
 ```
 
 Options:
-- `--ticker`: Ticker for training (default: SPY)
+
+- `--tickers`: Comma-separated tickers (default: config `TRADE_TICKERS`)
 - `--retrain`: Force retrain specialists (default: false)
 - `--timesteps`: PPO training timesteps (default: 50000)
+
+Training runs specialists (TFT on all tickers, fundamental/regime as before) and the PPO meta-learner on the full ticker list.
 
 ### Backtest
 
 ```bash
-python -m trading_system backtest --ticker SPY
+python -m trading_system backtest
 ```
 
-Saves performance plot to `trading_system/outputs/backtest_SPY.png`.
+Portfolio backtest over all tickers; saves performance plot to `trading_system/outputs/backtest_portfolio.png`. Use `--tickers SPY,AAPL,...` to override the list.
 
 ### Paper Trading
 
 ```bash
-python -m trading_system paper --ticker SPY --interval 60
+python -m trading_system paper --interval 60
 ```
 
-Runs a loop that polls data, runs specialists, and logs decisions every `--interval` minutes. No real orders are placed. Sends Discord notifications if webhook is configured.
+Runs a loop that polls data, runs specialists for all tickers, and logs position sizes every `--interval` minutes. No real orders are placed. Sends Discord notifications per ticker if webhook is configured.
 
 ### Live Trading (Alpaca)
 
 ```bash
-python -m trading_system live --ticker SPY --interval 60
+python -m trading_system live --interval 60
 ```
 
+Places real orders for all tickers; cash is allocated by normalizing PPO position weights. Use `--tickers` to override the list.
+
 **WARNING**: This places REAL orders via Alpaca. Use paper trading URL in `.env` for testing:
+
 ```
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 ```
 
 For live trading, change to:
+
 ```
 ALPACA_BASE_URL=https://api.alpaca.markets
 ```
@@ -104,10 +117,12 @@ ALPACA_BASE_URL=https://api.alpaca.markets
 ## Data Sources
 
 Market data sources are **free**:
+
 - **yfinance**: OHLCV, fundamentals, news headlines
 - **Ollama**: Local LLM for sentiment (no API keys)
 
 Trading integration:
+
 - **Alpaca**: Commission-free trading API (requires account)
 
 ## Architecture
@@ -117,6 +132,10 @@ See `docs/ARCHITECTURE.md` for the full agent flow and data pipeline.
 ## Configuration
 
 Edit `trading_system/config.py` for:
+
+- `TRADE_TICKERS`: list of symbols to trade (default: SPY, AAPL, MSFT, GOOGL, NVDA). Can be overridden by env `TRADE_TICKERS=SPY,AAPL,...` in `.env`.
 - `OLLAMA_URL`, `OLLAMA_MODEL`
 - `DEVICE` (cuda/cpu)
 - TFT, XGBoost, VAE, PPO hyperparameters
+
+Changing the number of tickers requires retraining the PPO (saved policy has fixed input/output dimensions).

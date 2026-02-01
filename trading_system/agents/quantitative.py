@@ -2,6 +2,7 @@
 Quantitative Specialist: TFT for trend probability.
 """
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -71,8 +72,11 @@ def _forecast_to_probability(forecast: float, scale: float = 20.0) -> float:
     return 1.0 / (1.0 + math.exp(-scale * forecast))
 
 
-def _ensure_model(ticker: str | None = None, retrain: bool = False) -> bool:
-    """Load or train TFT model."""
+def _ensure_model(
+    ticker: str | list[str] | None = None,
+    retrain: bool = False,
+) -> bool:
+    """Load or train TFT model. ticker: single symbol, list of symbols (train on all), or None for SPY."""
     global _model, _training_dataset
 
     ckpt = QUANTITATIVE_MODEL_DIR / "tft.ckpt"
@@ -84,18 +88,31 @@ def _ensure_model(ticker: str | None = None, retrain: bool = False) -> bool:
         except Exception as e:
             logger.warning("Failed to load TFT: %s", e)
 
-    # Train on ticker or SPY as proxy
-    train_ticker = ticker or "SPY"
-    df = load_ohlcv(train_ticker, lookback_years=YFINANCE_LOOKBACK_YEARS)
-    if df.empty or len(df) < TFT_MAX_ENCODER_LENGTH + TFT_MAX_PREDICTION_LENGTH + 100:
-        logger.warning("Insufficient data for TFT training: %s", train_ticker)
+    tickers: list[str] = []
+    if isinstance(ticker, list):
+        tickers = [t.upper() for t in ticker if t]
+    else:
+        tickers = [ticker.upper() if ticker else "SPY"]
+
+    if not tickers:
+        tickers = ["SPY"]
+
+    parts: list[pd.DataFrame] = []
+    for t in tickers:
+        df = load_ohlcv(t, lookback_years=YFINANCE_LOOKBACK_YEARS)
+        if df.empty or len(df) < TFT_MAX_ENCODER_LENGTH + TFT_MAX_PREDICTION_LENGTH + 100:
+            logger.warning("Insufficient data for TFT training: %s", t)
+            continue
+        prepared = prepare_tft_data(df, ticker=t)
+        if not prepared.empty:
+            parts.append(prepared)
+
+    if not parts:
+        logger.warning("No valid TFT training data for tickers: %s", tickers)
         return False
 
-    prepared = prepare_tft_data(df)
-    if prepared.empty:
-        return False
-
-    _training_dataset = _build_dataset(prepared)
+    combined = pd.concat(parts, ignore_index=True)
+    _training_dataset = _build_dataset(combined)
     train_dl = _training_dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
 
     model = TemporalFusionTransformer.from_dataset(
@@ -115,7 +132,13 @@ def _ensure_model(ticker: str | None = None, retrain: bool = False) -> bool:
         enable_progress_bar=True,
         enable_model_summary=False,
     )
-    trainer.fit(model, train_dl)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=".*is an instance of `nn.Module` and is already saved during checkpointing.*",
+            module="lightning.pytorch.utilities.parsing",
+        )
+        trainer.fit(model, train_dl)
     QUANTITATIVE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     trainer.save_checkpoint(str(ckpt))
     _model = model
@@ -131,11 +154,12 @@ def get_trend_probability(ticker: str, retrain: bool = False) -> float:
     if not _ensure_model(ticker, retrain=retrain):
         return 0.5
 
+    t = ticker.upper()
     df = load_ohlcv(ticker)
     if df.empty or len(df) < TFT_MAX_ENCODER_LENGTH + TFT_MAX_PREDICTION_LENGTH:
         return 0.5
 
-    prepared = prepare_tft_data(df)
+    prepared = prepare_tft_data(df, ticker=t)
     if prepared.empty:
         return 0.5
 

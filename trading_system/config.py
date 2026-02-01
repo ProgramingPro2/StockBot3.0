@@ -38,10 +38,19 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 # Alpaca (live trading)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2")
 
 # Discord webhook
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+# Trade tickers (5 stocks; override via TRADE_TICKERS=SPY,AAPL,... in .env)
+_tickers_env = os.getenv("TRADE_TICKERS", "").strip()
+TRADE_TICKERS: list[str] = (
+    [s.strip().upper() for s in _tickers_env.split(",") if s.strip()]
+    if _tickers_env
+    else ["SPY", "INTC", "TSLA", "AMD", "NVDA"]
+)
+N_ASSETS = len(TRADE_TICKERS)
 
 # Data
 CACHE_MAX_AGE_HOURS = 1
