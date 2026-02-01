@@ -43,12 +43,13 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 # Discord webhook
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-# Trade tickers (5 stocks; override via TRADE_TICKERS=SPY,AAPL,... in .env)
+# Trade tickers (5 assets; override via TRADE_TICKERS=SPY,IWM,... in .env)
+# Default: ETFs chosen for active-trading fit (volatility, dispersion) vs strong-trend names.
 _tickers_env = os.getenv("TRADE_TICKERS", "").strip()
 TRADE_TICKERS: list[str] = (
     [s.strip().upper() for s in _tickers_env.split(",") if s.strip()]
     if _tickers_env
-    else ["SPY", "INTC", "TSLA", "AMD", "NVDA"]
+    else ["SPY", "IWM", "XLE", "XLF", "EEM"]
 )
 N_ASSETS = len(TRADE_TICKERS)
 
@@ -89,10 +90,15 @@ PPO_N_EPOCHS = 10
 PPO_GAMMA = 0.99
 PPO_GAE_LAMBDA = 0.95
 PPO_CLIP_RANGE = 0.2
+PPO_ENT_COEF = 0.01
+PPO_NET_ARCH: dict | list = None  # None = default; or {"pi": [64, 64], "vf": [64, 64]}
+PPO_TOTAL_TIMESTEPS = 500_000
 
 # Environment
 ENV_ROLLING_SHARPE_DAYS = 252
 ENV_EPISODE_DAYS = 21  # ~1 month
+ENV_REWARD_DRAWDOWN_PENALTY = 0.5  # Subtract this * current drawdown from reward
+ENV_OBS_ROLLING_FEATURES = True  # Add rolling return 5d/21d and vol 21d per asset
 
 # Headless matplotlib
 import matplotlib

@@ -1,6 +1,6 @@
 # The Boardroom - Hierarchical Multi-Agent Trading System
 
-A hierarchical multi-agent algorithmic trading system for long-term equity strategies. Four specialist agents (Narrative, Quantitative, Fundamental, Regime) feed into a PPO meta-learner for position sizing. The system trades a configurable list of symbols (default: 5 stocks: SPY, AAPL, MSFT, GOOGL, NVDA).
+A hierarchical multi-agent algorithmic trading system for long-term equity strategies. Four specialist agents (Narrative, Quantitative, Fundamental, Regime) feed into a PPO meta-learner for position sizing. The system trades a configurable list of symbols (default: 5 ETFs chosen for active-trading fit: SPY, IWM, XLE, XLF, EEM).
 
 ## Requirements
 
@@ -53,30 +53,57 @@ Run from the **project root** (`StockBot3.0`), not from inside `trading_system/`
 ```bash
 cd StockBot3.0
 source .venv/bin/activate
-python -m trading_system train --timesteps 50000
+python -m trading_system train --timesteps 500000
 ```
 
-By default the system uses the ticker list in config (`TRADE_TICKERS`: SPY, AAPL, MSFT, GOOGL, NVDA). Override with `--tickers`:
+By default the system uses the ticker list in config (`TRADE_TICKERS`: SPY, IWM, XLE, XLF, EEM). Override with `--tickers`:
 
 ```bash
-python -m trading_system train --tickers SPY,AAPL,MSFT,GOOGL,AMD --timesteps 50000
+python -m trading_system train --tickers SPY,IWM,XLE,XLF,EEM --timesteps 500000
 ```
 
-Or use the helper script: `./run.sh train --timesteps 50000`
+### Ticker selection
+
+The default tickers (SPY, IWM, XLE, XLF, EEM) are chosen for active-trading fit: more volatility and dispersion across assets, where the RL strategy can add value over buy-and-hold. Strong uptrend names (e.g. NVDA, TSLA) tend to favor buy-and-hold. Override via `TRADE_TICKERS` in `.env` or `--tickers` on the command line.
+
+Or use the helper script: `./run.sh train --timesteps 500000`
 
 ### Train Specialists and Meta-Learner
 
 ```bash
-python -m trading_system train --timesteps 50000
+python -m trading_system train --timesteps 500000
 ```
 
 Options:
 
 - `--tickers`: Comma-separated tickers (default: config `TRADE_TICKERS`)
 - `--retrain`: Force retrain specialists (default: false)
-- `--timesteps`: PPO training timesteps (default: 50000)
+- `--timesteps`: PPO training timesteps (default: 500000)
+- `--use-historical`: Train PPO on real historical returns instead of synthetic (recommended)
+- `--use-tuned`: Use hyperparameters from a previous `tune` run
 
-Training runs specialists (TFT on all tickers, fundamental/regime as before) and the PPO meta-learner on the full ticker list.
+Training runs specialists (TFT on all tickers, fundamental/regime as before) and the PPO meta-learner. Use `--use-historical` to align training with backtest (real market dynamics instead of synthetic returns).
+
+### Hyperparameter Tuning (Optuna)
+
+Run automatic hyperparameter tuning before training to find better PPO settings:
+
+```bash
+python -m trading_system tune --n-trials 50 --timesteps 100000
+```
+
+Options:
+
+- `--tickers`: Comma-separated tickers (default: config `TRADE_TICKERS`)
+- `--n-trials`: Number of Optuna trials (default: 50)
+- `--timesteps`: PPO timesteps per trial (default: 100000)
+- `--timeout`: Max seconds for tuning; use 0 for no limit (default: 3600)
+
+Best parameters are saved to `trading_system/models/meta_learner/ppo_tune_best.json`. Then train with them:
+
+```bash
+python -m trading_system train --use-historical --use-tuned --timesteps 500000
+```
 
 ### Backtest
 
@@ -137,5 +164,7 @@ Edit `trading_system/config.py` for:
 - `OLLAMA_URL`, `OLLAMA_MODEL`
 - `DEVICE` (cuda/cpu)
 - TFT, XGBoost, VAE, PPO hyperparameters
+- `ENV_REWARD_DRAWDOWN_PENALTY`: Penalty for drawdown in PPO reward (default: 0.5)
+- `ENV_OBS_ROLLING_FEATURES`: Include rolling return/volatility in observations (default: true)
 
-Changing the number of tickers requires retraining the PPO (saved policy has fixed input/output dimensions).
+Use `python -m trading_system tune` for automatic PPO hyperparameter optimization instead of manual config edits. Changing the number of tickers requires retraining the PPO (saved policy has fixed input/output dimensions).

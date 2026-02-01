@@ -2,24 +2,28 @@
 PPO meta-learner via stable-baselines3.
 Weights specialist opinions to decide position sizing.
 """
+import logging
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
 
 from ..config import (
+    ENV_OBS_ROLLING_FEATURES,
     META_LEARNER_MODEL_DIR,
     PPO_BATCH_SIZE,
     PPO_CLIP_RANGE,
+    PPO_ENT_COEF,
     PPO_GAMMA,
     PPO_GAE_LAMBDA,
     PPO_LEARNING_RATE,
     PPO_N_EPOCHS,
+    PPO_NET_ARCH,
     PPO_N_STEPS,
 )
-from .env import TradingEnv
+from .env import HistoricalTradingEnv, TradingEnv
 
 
 def _get_device() -> str:
@@ -43,12 +47,19 @@ class PPOTrader:
                 except Exception:
                     self.model = None
 
-    def train(self, total_timesteps: int = 50_000, specialist_fn=None) -> None:
+    def train(
+        self,
+        total_timesteps: int = 500_000,
+        specialist_fn=None,
+        historical_returns: np.ndarray | None = None,
+        ppo_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         """
-        Train PPO on simulated episodes.
+        Train PPO on simulated or historical episodes.
         specialist_fn: callable() -> list[dict] of length n_assets; each dict has
             sentiment, quant_prob, fund_score, regime_flag.
-        If None, uses random simulated outputs per asset.
+        historical_returns: if provided, shape (n_days, n_assets), use HistoricalTradingEnv.
+        ppo_kwargs: optional overrides for PPO hyperparameters (e.g. from tuning).
         """
         import numpy as np
 
@@ -64,41 +75,59 @@ class PPOTrader:
             ]
 
         specialist_fn = specialist_fn or _default_specialist_fn
-
-        if self.model is None:
-            self.model = PPO(
-                "MlpPolicy",
-                self.env,
-                learning_rate=PPO_LEARNING_RATE,
-                n_steps=PPO_N_STEPS,
-                batch_size=PPO_BATCH_SIZE,
-                n_epochs=PPO_N_EPOCHS,
-                gamma=PPO_GAMMA,
-                gae_lambda=PPO_GAE_LAMBDA,
-                clip_range=PPO_CLIP_RANGE,
-                device=_get_device(),
-                verbose=1,
+        kwargs = dict(ppo_kwargs or {})
+        best_value = kwargs.pop("best_value", None)
+        if best_value is not None:
+            logging.getLogger("boardroom").info(
+                "Training with tuned params (baseline eval reward: %.4f)", best_value
             )
 
-        def _reset_fn():
-            if specialist_fn:
-                outputs = specialist_fn()
-                # Ensure list of n_assets dicts for env
-                if isinstance(outputs, dict):
-                    outputs = [outputs] * self.n_assets
-                outputs = (list(outputs) + [{}] * self.n_assets)[: self.n_assets]
-                return {"specialist_outputs": outputs}
-            return {}
+        if historical_returns is not None:
+            env = HistoricalTradingEnv(
+                returns_array=historical_returns,
+                n_assets=self.n_assets,
+            )
+        else:
+            def _reset_fn():
+                if specialist_fn:
+                    outputs = specialist_fn()
+                    if isinstance(outputs, dict):
+                        outputs = [outputs] * self.n_assets
+                    outputs = (list(outputs) + [{}] * self.n_assets)[: self.n_assets]
+                    return {"specialist_outputs": outputs}
+                return {}
 
-        # Wrap env for specialist injection
-        class SpecialistWrapper(TradingEnv):
-            def reset(self, seed=None, options=None):
-                opts = options or {}
-                opts.update(_reset_fn())
-                return super().reset(seed=seed, options=opts)
+            class SpecialistWrapper(TradingEnv):
+                def reset(self, seed=None, options=None):
+                    opts = options or {}
+                    opts.update(_reset_fn())
+                    return super().reset(seed=seed, options=opts)
 
-        wrapped = SpecialistWrapper(n_assets=self.n_assets)
-        self.model.set_env(wrapped)
+            env = SpecialistWrapper(n_assets=self.n_assets)
+
+        if self.model is None:
+            policy_kwargs = kwargs.pop("policy_kwargs", None) or PPO_NET_ARCH
+            if policy_kwargs is None:
+                policy_kwargs = {}
+            self.model = PPO(
+                "MlpPolicy",
+                env,
+                learning_rate=kwargs.pop("learning_rate", PPO_LEARNING_RATE),
+                n_steps=kwargs.pop("n_steps", PPO_N_STEPS),
+                batch_size=kwargs.pop("batch_size", PPO_BATCH_SIZE),
+                n_epochs=kwargs.pop("n_epochs", PPO_N_EPOCHS),
+                gamma=kwargs.pop("gamma", PPO_GAMMA),
+                gae_lambda=kwargs.pop("gae_lambda", PPO_GAE_LAMBDA),
+                clip_range=kwargs.pop("clip_range", PPO_CLIP_RANGE),
+                ent_coef=kwargs.pop("ent_coef", PPO_ENT_COEF),
+                policy_kwargs=policy_kwargs,
+                device=_get_device(),
+                verbose=1,
+                **kwargs,
+            )
+        else:
+            self.model.set_env(env)
+
         self.model.learn(total_timesteps=total_timesteps, progress_bar=True)
 
         META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,6 +149,9 @@ class PPOTrader:
             return np.ones(self.n_assets, dtype=np.float32) * 0.5
 
         outputs = (list(specialist_outputs_by_asset) + [{}] * self.n_assets)[: self.n_assets]
+        if holdings is None:
+            holdings = np.zeros(self.n_assets, dtype=np.float32)
+
         parts: list[float] = []
         for i in range(self.n_assets):
             s = outputs[i] if i < len(outputs) else {}
@@ -127,9 +159,11 @@ class PPOTrader:
             parts.append(float(s.get("quant_prob", 0.5)))
             parts.append(float(s.get("fund_score", 0.0)))
             parts.append(float(s.get("regime_flag", 0.5)))
-        if holdings is None:
-            holdings = np.zeros(self.n_assets, dtype=np.float32)
-        parts.extend(holdings.tolist())
+            parts.append(float(holdings[i]))
+            if ENV_OBS_ROLLING_FEATURES:
+                parts.append(float(s.get("rolling_return_5d", 0.0)))
+                parts.append(float(s.get("rolling_return_21d", 0.0)))
+                parts.append(float(s.get("rolling_vol_21d", 0.0)))
         obs = np.array(parts, dtype=np.float32)
         obs = np.clip(obs, -1, 1)
         action, _ = self.model.predict(obs, deterministic=True)

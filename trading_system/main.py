@@ -49,6 +49,33 @@ def _tickers_from_args(args: argparse.Namespace) -> list[str]:
     return list(TRADE_TICKERS)
 
 
+def _load_aligned_returns(tickers: list[str], lookback_years: int = 3):
+    """Load and align OHLCV returns for tickers. Returns (aligned_df, returns_array)."""
+    import pandas as pd
+    from .data.loader import load_ohlcv
+
+    dfs: list[pd.DataFrame] = []
+    for t in tickers:
+        df = load_ohlcv(t, lookback_years=lookback_years)
+        if df.empty or len(df) < 252:
+            return None, None
+        df = df[["close"]].copy()
+        df.columns = [t]
+        df["return_" + t] = df[t].pct_change()
+        dfs.append(df)
+
+    aligned = dfs[0]
+    for df in dfs[1:]:
+        aligned = aligned.join(df, how="inner")
+    aligned = aligned.dropna(how="all").tail(252 * 2)
+    if len(aligned) < 252:
+        return None, None
+
+    return_cols = ["return_" + t for t in tickers]
+    returns_array = aligned[return_cols].fillna(0).values.astype(np.float32)
+    return aligned, returns_array
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     """Train specialists and meta-learner on TRADE_TICKERS (5 stocks)."""
     import numpy as np
@@ -68,6 +95,15 @@ def cmd_train(args: argparse.Namespace) -> None:
     ensure_quantitative(tickers, retrain=args.retrain)
     ensure_fundamental()
     ensure_regime(retrain=args.retrain)
+
+    historical_returns = None
+    if getattr(args, "use_historical", False):
+        _, returns_array = _load_aligned_returns(tickers)
+        if returns_array is not None:
+            historical_returns = returns_array
+            logger.info("Using historical returns for PPO training (%d days)", len(returns_array))
+        else:
+            logger.warning("Could not load historical data; falling back to synthetic env")
 
     logger.info("Training meta-learner (PPO)...")
     trader = PPOTrader(n_assets=n_assets, load=False)
@@ -115,7 +151,21 @@ def cmd_train(args: argparse.Namespace) -> None:
         return out_list
 
     specialist_fn()
-    trader.train(total_timesteps=args.timesteps, specialist_fn=specialist_fn)
+    ppo_kwargs = None
+    if getattr(args, "use_tuned", False):
+        from .meta_learner.tuner import load_tuned_params
+        ppo_kwargs = load_tuned_params()
+        if ppo_kwargs:
+            logger.info("Using tuned hyperparameters from previous tune run")
+        else:
+            logger.warning("No tuned params found; run 'tune' first")
+
+    trader.train(
+        total_timesteps=args.timesteps,
+        specialist_fn=specialist_fn,
+        historical_returns=historical_returns,
+        ppo_kwargs=ppo_kwargs,
+    )
     logger.info("Training complete. Models saved.")
 
 
@@ -159,29 +209,78 @@ def _backtest_stats(equity: "pd.Series", strategy_returns: "pd.Series", bh_retur
 
 def _proxy_specialists_from_returns(
     returns: "pd.Series", start: int, window: int = 21
-) -> tuple[float, float, float, float]:
+) -> dict:
     """
     Derive proxy specialist outputs from rolling returns for backtest (no API).
-    Returns (sentiment, quant_prob, fund_score, regime_flag) in expected ranges.
+    Returns dict with sentiment, quant_prob, fund_score, regime_flag, and
+    optional rolling_return_5d, rolling_return_21d, rolling_vol_21d.
     """
+    from .config import ENV_OBS_ROLLING_FEATURES
+
     lookback = returns.iloc[max(0, start - window) : start]
     if lookback.empty or lookback.isna().all():
-        return 0.0, 0.5, 0.0, 0.5
+        out = {"sentiment": 0.0, "quant_prob": 0.5, "fund_score": 0.0, "regime_flag": 0.5}
+        if ENV_OBS_ROLLING_FEATURES:
+            out.update({"rolling_return_5d": 0.0, "rolling_return_21d": 0.0, "rolling_vol_21d": 0.0})
+        return out
+
     mean_ret = float(lookback.mean())
     std_ret = float(lookback.std())
     if std_ret < 1e-8:
         std_ret = 0.01
-    # quant_prob: 0.5 + trend bias, clamped to [0, 1]
+
     trend = max(-0.5, min(0.5, mean_ret * 20))
     quant_prob = 0.5 + trend
-    # regime_flag: higher vol -> higher value, clamped to [0, 1]
     vol_norm = max(-0.5, min(0.5, (std_ret - 0.01) * 50))
     regime_flag = 0.5 + vol_norm
-    return 0.0, quant_prob, 0.0, regime_flag
+
+    out = {"sentiment": 0.0, "quant_prob": quant_prob, "fund_score": 0.0, "regime_flag": regime_flag}
+    if ENV_OBS_ROLLING_FEATURES:
+        ret_5d = float(lookback.tail(5).mean()) if len(lookback) >= 5 else mean_ret
+        ret_21d = float(lookback.tail(21).mean()) if len(lookback) >= 21 else mean_ret
+        vol_21d = float(lookback.tail(21).std()) if len(lookback) >= 21 else std_ret
+        if vol_21d < 1e-8:
+            vol_21d = 0.01
+        out["rolling_return_5d"] = max(-1, min(1, ret_5d * 50))
+        out["rolling_return_21d"] = max(-1, min(1, ret_21d * 50))
+        out["rolling_vol_21d"] = max(-1, min(1, (vol_21d - 0.01) * 50))
+    return out
+
+
+def cmd_tune(args: argparse.Namespace) -> None:
+    """Run Optuna hyperparameter tuning for PPO on historical data."""
+    from .meta_learner.tuner import PPO_TUNE_PARAMS_PATH, run_tuning
+
+    tickers = _tickers_from_args(args)
+    n_assets = len(tickers)
+    if n_assets == 0:
+        logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
+        return
+
+    _, returns_array = _load_aligned_returns(tickers)
+    if returns_array is None:
+        logger.error("Could not load historical data for tuning")
+        return
+
+    logger.info("Running hyperparameter tuning for %d tickers (%d trials, %d timesteps/trial)...", n_assets, args.n_trials, args.timesteps)
+    best = run_tuning(
+        returns_array=returns_array,
+        n_assets=n_assets,
+        n_trials=args.n_trials,
+        n_timesteps=args.timesteps,
+        timeout=args.timeout if args.timeout > 0 else None,
+    )
+    logger.info("Tuning complete. Best params saved to %s", PPO_TUNE_PARAMS_PATH)
+    for k, v in best.items():
+        if k != "policy_kwargs":
+            logger.info("  %s: %s", k, v)
+    logger.info("Run 'train --use-historical --use-tuned' to train with these params.")
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
     """Backtest portfolio (5 tickers) with trained models; save performance plot."""
+    from datetime import datetime
+
     import numpy as np
     import pandas as pd
     from .data.loader import load_ohlcv
@@ -221,19 +320,29 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     trader = PPOTrader(n_assets=n_assets)
 
     strategy_returns = pd.Series(0.0, index=aligned.index, dtype=float)
+    rebalance_dates: list = []
+    rebalance_direction: list = []
+    prev_position_sum: float | None = None
+
     for start in range(0, n, window):
         end = min(start + window, n)
         specialist_list: list[dict] = []
         for t, ret_col in zip(tickers, return_cols):
             ret_series = aligned[ret_col]
-            s, q, f, r = _proxy_specialists_from_returns(ret_series, start, window)
-            specialist_list.append({
-                "sentiment": s, "quant_prob": q, "fund_score": f, "regime_flag": r,
-            })
+            specialist_list.append(_proxy_specialists_from_returns(ret_series, start, window))
         action = trader.predict(specialist_outputs_by_asset=specialist_list)
         action = np.array([_position_used(float(a)) for a in action])
-        total = float(np.sum(action)) + 1e-8
+        position_sum = float(np.sum(action))
+        total = position_sum + 1e-8
         weights = action / total
+
+        rebalance_dates.append(aligned.index[start])
+        if prev_position_sum is not None:
+            rebalance_direction.append(1 if position_sum > prev_position_sum else -1)
+        else:
+            rebalance_direction.append(0)
+        prev_position_sum = position_sum
+
         for day in range(start, end):
             day_ret = sum(
                 weights[i] * aligned[return_cols[i]].iloc[day]
@@ -248,7 +357,14 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     returns = strategy_returns.dropna()
 
     _backtest_stats(equity, returns, bh_returns)
-    path = save_performance_plot(equity, returns, filename="backtest_portfolio.png")
+    plot_filename = f"backtest_portfolio_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+    path = save_performance_plot(
+        equity,
+        returns,
+        filename=plot_filename,
+        rebalance_dates=rebalance_dates,
+        rebalance_direction=rebalance_direction,
+    )
     logger.info("Saved plot to %s", path)
 
 
@@ -374,8 +490,17 @@ def main() -> None:
     train_p = sub.add_parser("train", help="Train specialists and meta-learner on TRADE_TICKERS")
     train_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     train_p.add_argument("--retrain", action="store_true", help="Force retrain specialists")
-    train_p.add_argument("--timesteps", type=int, default=50_000, help="PPO timesteps")
+    train_p.add_argument("--timesteps", type=int, default=500_000, help="PPO timesteps")
+    train_p.add_argument("--use-historical", action="store_true", help="Train PPO on real historical returns instead of synthetic")
+    train_p.add_argument("--use-tuned", action="store_true", help="Use hyperparameters from previous 'tune' run")
     train_p.set_defaults(func=cmd_train)
+
+    tune_p = sub.add_parser("tune", help="Run Optuna hyperparameter tuning for PPO")
+    tune_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
+    tune_p.add_argument("--n-trials", type=int, default=50, help="Number of Optuna trials")
+    tune_p.add_argument("--timesteps", type=int, default=100_000, help="PPO timesteps per trial")
+    tune_p.add_argument("--timeout", type=int, default=3600, help="Max seconds for tuning (None = no limit)")
+    tune_p.set_defaults(func=cmd_tune)
 
     back_p = sub.add_parser("backtest", help="Backtest portfolio with trained models")
     back_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")

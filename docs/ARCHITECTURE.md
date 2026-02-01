@@ -53,19 +53,21 @@ Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
 ## Meta-Learner
 
 - **Model**: PPO (stable-baselines3)
-- **Observation**: Per-asset specialist features + holdings. Length = 5 \* n_assets: for each asset (sentiment, quant_prob, fund_score, regime_flag), then n_assets holdings. Example: 25-dim for 5 assets.
+- **Observation**: Per-asset specialist features + holdings + optional rolling features. Length = 8 \* n_assets when `ENV_OBS_ROLLING_FEATURES` is true: for each asset (sentiment, quant_prob, fund_score, regime_flag, holdings, rolling_return_5d, rolling_return_21d, rolling_vol_21d). Example: 40-dim for 5 assets.
 - **Action**: Position size % per asset [0, 1]; n_assets outputs (e.g. 5).
-- **Reward**: Portfolio rolling Sharpe ratio (portfolio return = position-weighted sum of asset returns).
+- **Reward**: Portfolio rolling Sharpe ratio minus drawdown penalty (configurable via `ENV_REWARD_DRAWDOWN_PENALTY`).
+- **Training**: Two modes: synthetic `TradingEnv` (random returns) or `HistoricalTradingEnv` (real OHLCV returns). Use `--use-historical` for real data.
+- **Tuning**: Run `tune` for Optuna-based hyperparameter optimization; use `--use-tuned` when training.
 
 ## File Structure
 
 ```
 trading_system/
   config.py         - Configuration (loads from .env)
-  main.py           - CLI: train, backtest, paper, live
+  main.py           - CLI: train, tune, backtest, paper, live
   data/             - Loader, news scraper, processor
   agents/           - sentiment, quantitative, fundamental, regime
-  meta_learner/     - Gym env, PPO trader
+  meta_learner/     - Gym env (TradingEnv, HistoricalTradingEnv), PPO trader, Optuna tuner
   broker/           - Alpaca integration, Discord notifications
   utils/            - Logger, plotting (headless)
   models/           - Saved checkpoints
@@ -74,7 +76,9 @@ trading_system/
 
 ## Trading Modes
 
-**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override the list.
+**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` to train on real returns, `--use-tuned` to apply tuned hyperparameters.
+
+**Tune**: Run Optuna hyperparameter tuning on historical data. Best params saved to `models/meta_learner/ppo_tune_best.json`.
 
 **Backtest**: Portfolio backtest over all tickers; aligned OHLCV, proxy specialists per ticker, one portfolio equity curve and plot (`backtest_portfolio.png`).
 
