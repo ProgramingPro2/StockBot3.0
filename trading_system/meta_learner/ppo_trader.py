@@ -137,14 +137,20 @@ class PPOTrader:
         self,
         specialist_outputs_by_asset: list[dict],
         holdings: np.ndarray | None = None,
+        debug: bool = False,
     ) -> np.ndarray:
         """
         Get position sizes from meta-learner.
         specialist_outputs_by_asset: list of n_assets dicts with sentiment, quant_prob,
             fund_score, regime_flag.
         holdings: current position % per asset, or None for zeros.
+        debug: if True, log obs shape, feature ranges, and raw action.
         Returns array of size n_assets with position % in [0, 1].
         """
+        from ..utils.logger import get_logger
+
+        log = get_logger()
+
         if self.model is None:
             return np.ones(self.n_assets, dtype=np.float32) * 0.5
 
@@ -167,4 +173,27 @@ class PPOTrader:
         obs = np.array(parts, dtype=np.float32)
         obs = np.clip(obs, -1, 1)
         action, _ = self.model.predict(obs, deterministic=True)
-        return np.clip(action, 0, 1)
+        action_clipped = np.clip(action, 0, 1)
+
+        if debug:
+            per_asset = 5 + (3 if ENV_OBS_ROLLING_FEATURES else 0)
+            names = ["sentiment", "quant_prob", "fund_score", "regime_flag", "holdings"]
+            if ENV_OBS_ROLLING_FEATURES:
+                names.extend(["rolling_return_5d", "rolling_return_21d", "rolling_vol_21d"])
+            parts = []
+            for i in range(self.n_assets):
+                start = i * per_asset
+                chunk = obs[start : start + per_asset]
+                chunk_str = ", ".join(f"{n}={float(v):.3f}" for n, v in zip(names, chunk))
+                parts.append(f"  asset_{i}: {chunk_str}")
+            log.info(
+                "DEBUG | PPO obs shape=%s min=%.3f max=%.3f:\n%s | raw_action=%s | clipped=%s",
+                obs.shape,
+                float(obs.min()),
+                float(obs.max()),
+                "\n".join(parts),
+                [round(float(a), 4) for a in action],
+                [round(float(a), 4) for a in action_clipped],
+            )
+
+        return action_clipped

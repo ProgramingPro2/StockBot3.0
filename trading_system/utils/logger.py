@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 _loggers: dict[str, logging.Logger] = {}
+_debug_enabled: bool = False
 
 
 def setup_logger(
@@ -51,3 +52,14 @@ def get_logger(name: str = "boardroom") -> logging.Logger:
     if name in _loggers:
         return _loggers[name]
     return setup_logger(name)
+
+
+def set_debug(enabled: bool) -> None:
+    """Enable or disable debug logging for feature verification."""
+    global _debug_enabled
+    _debug_enabled = enabled
+
+
+def is_debug() -> bool:
+    """Return whether debug mode is enabled."""
+    return _debug_enabled

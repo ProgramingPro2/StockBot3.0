@@ -66,12 +66,7 @@ def fetch_news(ticker: str, max_items: int = 20) -> list[NewsItem]:
 
     _throttle()
 
-    try:
-        yf_ticker = yf.Ticker(ticker)
-        raw = yf_ticker.news
-        if not raw:
-            return _load_cache()
-
+    def _parse_news(raw: list) -> list[NewsItem]:
         items = []
         for item in raw[:max_items]:
             title = item.get("title", "")
@@ -79,7 +74,22 @@ def fetch_news(ticker: str, max_items: int = 20) -> list[NewsItem]:
             pub = item.get("providerPublishTime")
             published = str(pub) if pub else None
             items.append(NewsItem(title=title, summary=summary, published=published))
+        return items
 
+    try:
+        raw = None
+        yf_ticker = yf.Ticker(ticker)
+        raw = yf_ticker.news
+        if not raw:
+            try:
+                search = yf.Search(ticker, news_count=max_items)
+                raw = search.news if hasattr(search, "news") else None
+            except Exception:
+                raw = None
+        if not raw:
+            return _load_cache()
+
+        items = _parse_news(raw)
         if items:
             _save_cache(items)
         return items

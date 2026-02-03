@@ -39,6 +39,8 @@ def _proxy_specialists_from_returns_np(
     quant_prob = 0.5 + trend
     vol_norm = np.clip((std_ret - 0.01) * 50, -0.5, 0.5)
     regime_flag = 0.5 + vol_norm
+    sentiment_proxy = float(np.clip(mean_ret * 12, -0.5, 0.5))
+    fund_score_proxy = float(np.clip(-mean_ret * 15, -0.5, 0.5))
 
     ret_5d = float(np.mean(lookback[-5:])) if len(lookback) >= 5 else mean_ret
     ret_21d = float(np.mean(lookback[-21:])) if len(lookback) >= 21 else mean_ret
@@ -51,7 +53,7 @@ def _proxy_specialists_from_returns_np(
     ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
     vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
 
-    return 0.0, quant_prob, 0.0, regime_flag, ret_5d_norm, ret_21d_norm, vol_21d_norm
+    return sentiment_proxy, quant_prob, fund_score_proxy, regime_flag, ret_5d_norm, ret_21d_norm, vol_21d_norm
 
 
 def _obs_features_per_asset() -> int:

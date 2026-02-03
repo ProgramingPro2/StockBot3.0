@@ -56,6 +56,7 @@ N_ASSETS = len(TRADE_TICKERS)
 # Data
 CACHE_MAX_AGE_HOURS = 1
 CACHE_MAX_AGE_DAYS = 7  # Stale cache OK when network fails
+SPECIALIST_CACHE_MAX_AGE_HOURS = 1  # Refetch when older (sentiment/news change)
 RATE_LIMIT_REQUESTS_PER_MIN = 30
 YFINANCE_LOOKBACK_YEARS = 10
 
@@ -92,12 +93,12 @@ PPO_GAE_LAMBDA = 0.95
 PPO_CLIP_RANGE = 0.2
 PPO_ENT_COEF = 0.01
 PPO_NET_ARCH: dict | list = None  # None = default; or {"pi": [64, 64], "vf": [64, 64]}
-PPO_TOTAL_TIMESTEPS = 500_000
+PPO_TOTAL_TIMESTEPS = int(os.getenv("PPO_TOTAL_TIMESTEPS", "500000"))  # Try 1000000+ with --use-historical --use-tuned
 
 # Environment
 ENV_ROLLING_SHARPE_DAYS = 252
-ENV_EPISODE_DAYS = 21  # ~1 month
-ENV_REWARD_DRAWDOWN_PENALTY = 0.5  # Subtract this * current drawdown from reward
+ENV_EPISODE_DAYS = int(os.getenv("ENV_EPISODE_DAYS", "42"))  # ~2 months; was 21
+ENV_REWARD_DRAWDOWN_PENALTY = float(os.getenv("ENV_REWARD_DRAWDOWN_PENALTY", "0.7"))  # 0.3-1.0; stronger = more defensive
 ENV_OBS_ROLLING_FEATURES = True  # Add rolling return 5d/21d and vol 21d per asset
 
 # Headless matplotlib
