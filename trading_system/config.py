@@ -5,15 +5,22 @@ Ollama URL, CUDA device, hyperparameters, cache paths.
 import os
 from pathlib import Path
 
-# Load .env if available
+# Paths (BASE_DIR first so we can load .env from project root)
+BASE_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = BASE_DIR.parent
+
+# Load .env from project root so it is found regardless of CWD
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    for _env_path in (_PROJECT_ROOT / ".env", Path.cwd() / ".env", BASE_DIR / ".env"):
+        if _env_path.exists():
+            load_dotenv(_env_path, override=True)
+            break
+    else:
+        load_dotenv(override=True)
 except ImportError:
     pass
 
-# Paths
-BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / "data" / "cache"
 FUNDAMENTAL_CACHE_DIR = CACHE_DIR / "fundamentals"
 NEWS_CACHE_DIR = CACHE_DIR / "news"
@@ -25,10 +32,25 @@ MODEL_DIR = BASE_DIR / "models"
 QUANTITATIVE_MODEL_DIR = MODEL_DIR / "quantitative"
 FUNDAMENTAL_MODEL_DIR = MODEL_DIR / "fundamental"
 REGIME_MODEL_DIR = MODEL_DIR / "regime"
+MOMENTUM_MODEL_DIR = MODEL_DIR / "momentum"
 META_LEARNER_MODEL_DIR = MODEL_DIR / "meta_learner"
+UNIVERSE_MODEL_DIR = MODEL_DIR / "universe"
+
+# Universe (autodiscovery)
+UNIVERSE_SOURCE = os.getenv("UNIVERSE_SOURCE", "config").lower()  # config | file | sp500
+UNIVERSE_FILE = os.getenv("UNIVERSE_FILE", "")  # Path to ticker list file when UNIVERSE_SOURCE=file
+TRADE_LIST_SIZE = int(os.getenv("TRADE_LIST_SIZE", "5"))  # Number of symbols autodiscovery selects (must match PPO n_assets)
+AUTODISCOVER_INTERVAL_DAYS = int(os.getenv("AUTODISCOVER_INTERVAL_DAYS", "7"))  # Run discovery every N days in paper/live
+
+# Momentum Specialist (short-horizon)
+MOMENTUM_WINDOW_DAYS = 60  # Rolling window for features and training
+MOMENTUM_FORWARD_DAYS = 5  # Forward return horizon for label
+MOMENTUM_N_ESTIMATORS = 100
+MOMENTUM_MAX_DEPTH = 4
+MOMENTUM_LEARNING_RATE = 0.05
 
 # Ensure directories exist
-for d in [CACHE_DIR, FUNDAMENTAL_CACHE_DIR, NEWS_CACHE_DIR, SPECIALIST_CACHE_DIR, OUTPUT_DIR, QUANTITATIVE_MODEL_DIR, FUNDAMENTAL_MODEL_DIR, REGIME_MODEL_DIR, META_LEARNER_MODEL_DIR]:
+for d in [CACHE_DIR, FUNDAMENTAL_CACHE_DIR, NEWS_CACHE_DIR, SPECIALIST_CACHE_DIR, OUTPUT_DIR, QUANTITATIVE_MODEL_DIR, FUNDAMENTAL_MODEL_DIR, REGIME_MODEL_DIR, MOMENTUM_MODEL_DIR, META_LEARNER_MODEL_DIR, UNIVERSE_MODEL_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # Ollama
@@ -42,6 +64,13 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 
 # Discord webhook
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+# Trading: fractional shares and starting capital
+FRACTIONAL = os.getenv("FRACTIONAL", "yes").lower() in ("1", "true", "yes")
+try:
+    STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", "100000").strip() or "100000")
+except (ValueError, TypeError):
+    STARTING_CAPITAL = 100000.0
 
 # Trade tickers (5 assets; override via TRADE_TICKERS=SPY,IWM,... in .env)
 # Default: ETFs chosen for active-trading fit (volatility, dispersion) vs strong-trend names.
@@ -61,7 +90,8 @@ RATE_LIMIT_REQUESTS_PER_MIN = 30
 YFINANCE_LOOKBACK_YEARS = 10
 
 # Device
-DEVICE = "cuda"  # Fallback to cpu if unavailable
+DEVICE = "cuda"  # Specialists (TFT, VAE): GPU when available
+PPO_DEVICE = os.getenv("PPO_DEVICE", "cpu")  # PPO meta-learner: CPU recommended by SB3 for MLP
 
 # TFT (Quantitative Specialist)
 TFT_HIDDEN_SIZE = 64
@@ -94,12 +124,15 @@ PPO_CLIP_RANGE = 0.2
 PPO_ENT_COEF = 0.01
 PPO_NET_ARCH: dict | list = None  # None = default; or {"pi": [64, 64], "vf": [64, 64]}
 PPO_TOTAL_TIMESTEPS = int(os.getenv("PPO_TOTAL_TIMESTEPS", "500000"))  # Try 1000000+ with --use-historical --use-tuned
+# CPU threads for PPO when device=cpu; 0 = use all available
+PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 
 # Environment
 ENV_ROLLING_SHARPE_DAYS = 252
 ENV_EPISODE_DAYS = int(os.getenv("ENV_EPISODE_DAYS", "42"))  # ~2 months; was 21
 ENV_REWARD_DRAWDOWN_PENALTY = float(os.getenv("ENV_REWARD_DRAWDOWN_PENALTY", "0.7"))  # 0.3-1.0; stronger = more defensive
 ENV_OBS_ROLLING_FEATURES = True  # Add rolling return 5d/21d and vol 21d per asset
+ENV_ALLOW_CASH_EXPOSURE = os.getenv("ENV_ALLOW_CASH_EXPOSURE", "true").lower() in ("1", "true", "yes")  # When True, sum(action) = total exposure (capped at 1); rest in cash
 
 # Headless matplotlib
 import matplotlib

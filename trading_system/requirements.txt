@@ -7,6 +7,7 @@ gymnasium>=0.29
 yfinance>=0.2
 ollama>=0.3
 xgboost>=2.0
+lightgbm>=4.0
 beautifulsoup4>=4.12
 requests>=2.31
 pandas>=2.0

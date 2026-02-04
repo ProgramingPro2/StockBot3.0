@@ -18,10 +18,12 @@ def save_performance_plot(
     filename: str = "performance.png",
     rebalance_dates: list | None = None,
     rebalance_direction: list | None = None,
+    rebalance_trades: list[list[tuple[str, float]]] | None = None,
 ) -> Path:
     """
     Save equity curve and optional returns to PNG.
     Optionally overlay rebalance markers (green = increase, red = decrease).
+    When rebalance_trades is provided, show ticker and +/- % for each trade above markers.
     No plt.show() - headless only.
     """
     fig, axes = plt.subplots(2 if returns is not None else 1, 1, figsize=(12, 6))
@@ -33,35 +35,84 @@ def save_performance_plot(
     axes[0].set_xlabel("Date")
     axes[0].grid(True, alpha=0.3)
 
+    def _fmt_trades(trades: list[tuple[str, float]]) -> str:
+        parts = []
+        for ticker, pct in trades:
+            sign = "+" if pct >= 0 else ""
+            parts.append(f"{ticker} {sign}{pct:.1f}%")
+        return ", ".join(parts)
+
     if rebalance_dates:
         directions = rebalance_direction if rebalance_direction and len(rebalance_direction) == len(rebalance_dates) else None
-        increase_dates, increase_vals = [], []
-        decrease_dates, decrease_vals = [], []
-        neutral_dates, neutral_vals = [], []
+        trades_per_date = rebalance_trades if rebalance_trades and len(rebalance_trades) == len(rebalance_dates) else None
+        increase_dates, increase_vals, increase_trades = [], [], []
+        decrease_dates, decrease_vals, decrease_trades = [], [], []
+        neutral_dates, neutral_vals, neutral_trades = [], [], []
         for i, d in enumerate(rebalance_dates):
             if d not in equity_curve.index:
                 continue
             val = equity_curve.loc[d]
+            trades_here = trades_per_date[i] if trades_per_date else []
             if directions is not None:
                 di = directions[i]
                 if di == 1 or di == "buy" or (isinstance(di, (int, float)) and di > 0):
                     increase_dates.append(d)
                     increase_vals.append(val)
+                    increase_trades.append(trades_here)
                 elif di == -1 or di == "sell" or (isinstance(di, (int, float)) and di < 0):
                     decrease_dates.append(d)
                     decrease_vals.append(val)
+                    decrease_trades.append(trades_here)
                 else:
                     neutral_dates.append(d)
                     neutral_vals.append(val)
+                    neutral_trades.append(trades_here)
             else:
                 neutral_dates.append(d)
                 neutral_vals.append(val)
+                neutral_trades.append(trades_here)
         if increase_dates:
             axes[0].scatter(increase_dates, increase_vals, c="green", marker="^", s=40, zorder=5, label="Rebalance (increase)")
+            for j, (d, v) in enumerate(zip(increase_dates, increase_vals)):
+                if j < len(increase_trades) and increase_trades[j]:
+                    label = _fmt_trades(increase_trades[j])
+                    axes[0].annotate(
+                        label,
+                        xy=(d, v),
+                        xytext=(0, 10),
+                        textcoords="offset points",
+                        ha="center",
+                        fontsize=7,
+                        alpha=0.9,
+                    )
         if decrease_dates:
             axes[0].scatter(decrease_dates, decrease_vals, c="red", marker="v", s=40, zorder=5, label="Rebalance (decrease)")
+            for j, (d, v) in enumerate(zip(decrease_dates, decrease_vals)):
+                if j < len(decrease_trades) and decrease_trades[j]:
+                    label = _fmt_trades(decrease_trades[j])
+                    axes[0].annotate(
+                        label,
+                        xy=(d, v),
+                        xytext=(0, -12),
+                        textcoords="offset points",
+                        ha="center",
+                        fontsize=7,
+                        alpha=0.9,
+                    )
         if neutral_dates:
             axes[0].scatter(neutral_dates, neutral_vals, c="gray", marker="|", s=80, zorder=5, label="Rebalance")
+            for j, (d, v) in enumerate(zip(neutral_dates, neutral_vals)):
+                if j < len(neutral_trades) and neutral_trades[j]:
+                    label = _fmt_trades(neutral_trades[j])
+                    axes[0].annotate(
+                        label,
+                        xy=(d, v),
+                        xytext=(0, 10),
+                        textcoords="offset points",
+                        ha="center",
+                        fontsize=7,
+                        alpha=0.9,
+                    )
         axes[0].legend(loc="best", fontsize=8)
 
     if returns is not None:

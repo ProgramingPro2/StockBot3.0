@@ -4,15 +4,32 @@ Modes: train, backtest, paper, live (multi-asset: TRADE_TICKERS).
 """
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
+
+# Suppress known harmless warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*is an instance of `nn.Module` and is already saved during checkpointing.*",
+    module="lightning.pytorch.utilities.parsing",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*You are trying to run PPO on the GPU.*",
+)
 import pandas as pd
 
 from .config import (
+    ENV_ALLOW_CASH_EXPOSURE,
     ENV_OBS_ROLLING_FEATURES,
+    FRACTIONAL,
+    OUTPUT_DIR,
     SPECIALIST_CACHE_DIR,
     SPECIALIST_CACHE_MAX_AGE_HOURS,
+    STARTING_CAPITAL,
+    TRADE_LIST_SIZE,
     TRADE_TICKERS,
 )
 from .utils.logger import get_logger, is_debug, set_debug, setup_logger
@@ -31,8 +48,9 @@ def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = 
         q = out.get("quant_prob", 0.5)
         f = out.get("fund_score", 0.0)
         r = out.get("regime_flag", 0.5)
+        mom = out.get("momentum_score", 0.0)
         bad = []
-        for name, val in [("sentiment", s), ("quant_prob", q), ("fund_score", f), ("regime_flag", r)]:
+        for name, val in [("sentiment", s), ("quant_prob", q), ("fund_score", f), ("regime_flag", r), ("momentum_score", mom)]:
             try:
                 v = float(val)
                 if np.isnan(v) or np.isinf(v):
@@ -47,7 +65,9 @@ def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = 
             bad.append(f"fund_score={f}")
         if not (0 <= r <= 1):
             bad.append(f"regime_flag={r}")
-        msg = f"DEBUG | {t} | sentiment={s:.3f} quant_prob={q:.3f} fund_score={f:.3f} regime_flag={r:.3f}"
+        if not (-1 <= mom <= 1):
+            bad.append(f"momentum_score={mom}")
+        msg = f"DEBUG | {t} | sentiment={s:.3f} quant_prob={q:.3f} fund_score={f:.3f} regime_flag={r:.3f} momentum={mom:.3f}"
         if ENV_OBS_ROLLING_FEATURES:
             r5 = out.get("rolling_return_5d", 0.0)
             r21 = out.get("rolling_return_21d", 0.0)
@@ -93,7 +113,7 @@ def _rolling_features_from_ohlcv(close_series) -> dict:
 
 def _run_specialists(ticker: str = "SPY") -> dict:
     """Run all specialists and return dict of outputs. Uses cache on network failure."""
-    from .agents import get_sentiment, get_trend_probability, get_intrinsic_value_score, detect_regime
+    from .agents import get_sentiment, get_trend_probability, get_intrinsic_value_score, detect_regime, get_momentum_score
     from .data.loader import load_ohlcv
 
     sentiment, sentiment_conf, from_llm = get_sentiment(ticker)
@@ -104,12 +124,14 @@ def _run_specialists(ticker: str = "SPY") -> dict:
     spy = load_ohlcv("SPY")
     regime_result = detect_regime(spy)
     regime_flag = regime_result["flag"]
+    momentum_score = get_momentum_score(ticker)
 
     out = {
         "sentiment": sentiment,
         "quant_prob": quant_prob,
         "fund_score": fund_score,
         "regime_flag": regime_flag,
+        "momentum_score": momentum_score,
         "regime_name": regime_result["regime"],
     }
     if ENV_OBS_ROLLING_FEATURES:
@@ -124,6 +146,21 @@ def _run_specialists(ticker: str = "SPY") -> dict:
 def _position_used(position_pct: float) -> float:
     """Use 50% when policy outputs ~0 so backtest/paper/live have meaningful exposure."""
     return 0.5 if position_pct < 0.01 else position_pct
+
+
+def _exposure_and_weights(action: np.ndarray, allow_cash_exposure: bool) -> tuple[float, np.ndarray]:
+    """
+    Compute total exposure and normalized weights from raw action.
+    If allow_cash_exposure: exposure = min(1, sum(action)), weights = action / sum(action).
+    Else: exposure = 1.0 (100% invested), weights = action / sum(action).
+    """
+    action_sum = float(np.sum(action)) + 1e-8
+    if allow_cash_exposure:
+        exposure = min(1.0, action_sum)
+    else:
+        exposure = 1.0
+    weights = np.array(action, dtype=np.float64) / action_sum
+    return exposure, weights
 
 
 def _tickers_from_args(args: argparse.Namespace) -> list[str]:
@@ -164,6 +201,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     import numpy as np
 
     from .agents.fundamental import _ensure_model as ensure_fundamental
+    from .agents.momentum import _ensure_model as ensure_momentum
     from .agents.quantitative import _ensure_model as ensure_quantitative
     from .agents.regime import _ensure_model as ensure_regime
     from .meta_learner import PPOTrader
@@ -178,6 +216,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     ensure_quantitative(tickers, retrain=args.retrain)
     ensure_fundamental(tickers)
     ensure_regime(retrain=args.retrain)
+    ensure_momentum(tickers, retrain=args.retrain)
 
     historical_returns = None
     if getattr(args, "use_historical", False):
@@ -232,6 +271,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                     "quant_prob": float(np.random.uniform(0, 1)),
                     "fund_score": float(np.random.uniform(-1, 1)),
                     "regime_flag": float(np.random.uniform(0, 1)),
+                    "momentum_score": float(np.random.uniform(-1, 1)),
                     "regime_name": "Sideways",
                 }
                 if ENV_OBS_ROLLING_FEATURES:
@@ -264,8 +304,13 @@ def cmd_train(args: argparse.Namespace) -> None:
     logger.info("Training complete. Models saved.")
 
 
-def _backtest_stats(equity: pd.Series, strategy_returns: pd.Series, bh_returns: pd.Series) -> None:
-    """Log final backtest statistics (P/L, drawdown, etc.)."""
+def _backtest_stats(
+    equity: pd.Series,
+    strategy_returns: pd.Series,
+    bh_returns: pd.Series,
+    starting_capital: float | None = None,
+) -> None:
+    """Log final backtest statistics (P/L, drawdown, etc.). Optionally scale to starting_capital for dollar values."""
     total_return_pct = (float(equity.iloc[-1]) - 1.0) * 100
     n_days = len(equity)
     years = n_days / 252.0
@@ -290,6 +335,13 @@ def _backtest_stats(equity: pd.Series, strategy_returns: pd.Series, bh_returns: 
     bh_return_pct = (float(bh_equity.iloc[-1]) - 1.0) * 100
 
     logger.info("--- Backtest final stats ---")
+    if starting_capital is not None and starting_capital > 0:
+        final_value = float(equity.iloc[-1]) * starting_capital
+        pl_dollars = final_value - starting_capital
+        peak_value = float(cummax.max()) * starting_capital
+        max_dd_dollars = float(drawdown.min()) * peak_value  # negative
+        logger.info("Starting capital: $%.2f  Final value: $%.2f  P/L: $%+.2f", starting_capital, final_value, pl_dollars)
+        logger.info("Peak value: $%.2f  Max drawdown: $%.2f (%.2f%%)", peak_value, max_dd_dollars, max_dd_pct)
     logger.info("Total return (P/L): %.2f%%", total_return_pct)
     logger.info("CAGR: %.2f%%", cagr)
     logger.info("Max drawdown: %.2f%%", max_dd_pct)
@@ -307,7 +359,7 @@ def _proxy_specialists_from_returns(
 ) -> dict:
     """
     Derive proxy specialist outputs from rolling returns for backtest (no API).
-    Returns dict with sentiment, quant_prob, fund_score, regime_flag, and
+    Returns dict with sentiment, quant_prob, fund_score, regime_flag, momentum_score, and
     optional rolling_return_5d, rolling_return_21d, rolling_vol_21d.
     Uses momentum/mean-reversion as proxies for sentiment and fundamental.
     """
@@ -315,7 +367,7 @@ def _proxy_specialists_from_returns(
 
     lookback = returns.iloc[max(0, start - window) : start]
     if lookback.empty or lookback.isna().all():
-        out = {"sentiment": 0.0, "quant_prob": 0.5, "fund_score": 0.0, "regime_flag": 0.5}
+        out = {"sentiment": 0.0, "quant_prob": 0.5, "fund_score": 0.0, "regime_flag": 0.5, "momentum_score": 0.0}
         if ENV_OBS_ROLLING_FEATURES:
             out.update({"rolling_return_5d": 0.0, "rolling_return_21d": 0.0, "rolling_vol_21d": 0.0})
         return out
@@ -332,8 +384,9 @@ def _proxy_specialists_from_returns(
 
     sentiment_proxy = max(-0.5, min(0.5, mean_ret * 12))
     fund_score_proxy = max(-0.5, min(0.5, -mean_ret * 15))
+    momentum_proxy = max(-1, min(1, mean_ret * 15))
 
-    out = {"sentiment": sentiment_proxy, "quant_prob": quant_prob, "fund_score": fund_score_proxy, "regime_flag": regime_flag}
+    out = {"sentiment": sentiment_proxy, "quant_prob": quant_prob, "fund_score": fund_score_proxy, "regime_flag": regime_flag, "momentum_score": momentum_proxy}
     if ENV_OBS_ROLLING_FEATURES:
         ret_5d = float(lookback.tail(5).mean()) if len(lookback) >= 5 else mean_ret
         ret_21d = float(lookback.tail(21).mean()) if len(lookback) >= 21 else mean_ret
@@ -421,7 +474,9 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     strategy_returns = pd.Series(0.0, index=aligned.index, dtype=float)
     rebalance_dates: list = []
     rebalance_direction: list = []
+    rebalance_trades: list[list[tuple[str, float]]] = []
     prev_position_sum: float | None = None
+    prev_weights: np.ndarray | None = None
 
     for start in range(0, n, window):
         end = min(start + window, n)
@@ -432,39 +487,56 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         if is_debug():
             _verify_specialist_outputs(specialist_list, tickers)
         action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
-        action = np.array([_position_used(float(a)) for a in action])
-        position_sum = float(np.sum(action))
-        total = position_sum + 1e-8
-        weights = action / total
+        action = np.array(action, dtype=np.float64)
+        if not ENV_ALLOW_CASH_EXPOSURE:
+            action = np.array([_position_used(float(a)) for a in action])
+        exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
+        position_sum = exposure
+
+        trades: list[tuple[str, float]] = []
+        if prev_weights is None:
+            for i in range(n_assets):
+                if weights[i] > 1e-6:
+                    trades.append((tickers[i], float(weights[i] * 100)))
+        else:
+            for i in range(n_assets):
+                delta = weights[i] - prev_weights[i]
+                if abs(delta) > 1e-6:
+                    trades.append((tickers[i], float(delta * 100)))
 
         rebalance_dates.append(aligned.index[start])
         if prev_position_sum is not None:
             rebalance_direction.append(1 if position_sum > prev_position_sum else -1)
         else:
-            rebalance_direction.append(0)
+            rebalance_direction.append(1 if position_sum > 0 else 0)
+        rebalance_trades.append(trades)
         prev_position_sum = position_sum
+        prev_weights = weights.copy()
 
         for day in range(start, end):
-            day_ret = sum(
+            basket_ret = sum(
                 weights[i] * aligned[return_cols[i]].iloc[day]
                 for i in range(n_assets)
             )
+            day_ret = exposure * basket_ret
             strategy_returns.iloc[day] = day_ret
     strategy_returns = strategy_returns.fillna(0)
 
     equity = (1 + strategy_returns).cumprod()
+    equity_dollars = equity * STARTING_CAPITAL
     bh_returns = aligned[return_cols].mean(axis=1)
     bh_equity = (1 + bh_returns.fillna(0)).cumprod()
     returns = strategy_returns.dropna()
 
-    _backtest_stats(equity, returns, bh_returns)
+    _backtest_stats(equity, returns, bh_returns, starting_capital=STARTING_CAPITAL)
     plot_filename = f"backtest_portfolio_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
     path = save_performance_plot(
-        equity,
+        equity_dollars,
         returns,
         filename=plot_filename,
         rebalance_dates=rebalance_dates,
         rebalance_direction=rebalance_direction,
+        rebalance_trades=rebalance_trades,
     )
     logger.info("Saved plot to %s", path)
 
@@ -476,7 +548,12 @@ def cmd_paper(args: argparse.Namespace) -> None:
     from .broker import send_discord_notification
     from .meta_learner import PPOTrader
 
-    tickers = _tickers_from_args(args)
+    if getattr(args, "autodiscover", False):
+        from .universe import run_autodiscover
+        tickers = run_autodiscover(n=TRADE_LIST_SIZE)
+        logger.info("Autodiscover tickers: %s", tickers)
+    else:
+        tickers = _tickers_from_args(args)
     n_assets = len(tickers)
     if n_assets == 0:
         logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
@@ -484,7 +561,7 @@ def cmd_paper(args: argparse.Namespace) -> None:
     interval_sec = args.interval * 60
 
     trader = PPOTrader(n_assets=n_assets)
-    logger.info("Starting paper trading for %s (interval=%dm)", tickers, args.interval)
+    logger.info("Starting paper trading for %s (interval=%dm) [simulated capital $%.2f]", tickers, args.interval, STARTING_CAPITAL)
 
     while True:
         try:
@@ -494,18 +571,24 @@ def cmd_paper(args: argparse.Namespace) -> None:
             if is_debug():
                 _verify_specialist_outputs(specialist_list, tickers)
             action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
+            action = np.array(action, dtype=np.float64)
+            if not ENV_ALLOW_CASH_EXPOSURE:
+                action = np.array([_position_used(float(a)) for a in action])
+            exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
 
             for i, t in enumerate(tickers):
-                position_pct = _position_used(float(action[i]))
+                position_pct = float(weights[i])
                 out = specialist_list[i]
                 logger.info(
-                    "Paper | %s | Sentiment=%.2f Quant=%.2f Fund=%.2f Regime=%s | Position=%.1f%%",
+                    "Paper | %s | Sentiment=%.2f Quant=%.2f Fund=%.2f Regime=%s | Exposure=%.1f%% Weight=%.1f%% (capital=$%.2f)",
                     t,
                     out["sentiment"],
                     out["quant_prob"],
                     out["fund_score"],
                     out["regime_name"],
+                    exposure * 100,
                     position_pct * 100,
+                    STARTING_CAPITAL,
                 )
                 send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
 
@@ -525,7 +608,12 @@ def cmd_live(args: argparse.Namespace) -> None:
     from .broker import AlpacaBroker, send_discord_notification
     from .meta_learner import PPOTrader
 
-    tickers = _tickers_from_args(args)
+    if getattr(args, "autodiscover", False):
+        from .universe import run_autodiscover
+        tickers = run_autodiscover(n=TRADE_LIST_SIZE)
+        logger.info("Autodiscover tickers: %s", tickers)
+    else:
+        tickers = _tickers_from_args(args)
     n_assets = len(tickers)
     if n_assets == 0:
         logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
@@ -538,7 +626,7 @@ def cmd_live(args: argparse.Namespace) -> None:
         return
 
     trader = PPOTrader(n_assets=n_assets)
-    logger.info("Starting LIVE trading for %s (interval=%dm)", tickers, args.interval)
+    logger.info("Starting LIVE trading for %s (interval=%dm) [fractional=%s]", tickers, args.interval, FRACTIONAL)
 
     while True:
         try:
@@ -552,29 +640,65 @@ def cmd_live(args: argparse.Namespace) -> None:
             if is_debug():
                 _verify_specialist_outputs(specialist_list, tickers)
             action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
-            action = np.array([_position_used(float(a)) for a in action])
-            total = float(np.sum(action)) + 1e-8
-            weights = action / total
+            action = np.array(action, dtype=np.float64)
+            if not ENV_ALLOW_CASH_EXPOSURE:
+                action = np.array([_position_used(float(a)) for a in action])
+            exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
+            total_invested = cash * exposure
+
+            # For whole-share orders we need latest price per ticker
+            latest_prices: dict[str, float] = {}
+            if not FRACTIONAL:
+                from .data.loader import load_ohlcv
+                for t in tickers:
+                    df = load_ohlcv(t, lookback_years=1)
+                    if df is not None and not df.empty and "close" in df.columns:
+                        latest_prices[t] = float(df["close"].iloc[-1])
+                    else:
+                        latest_prices[t] = 0.0
 
             for i, t in enumerate(tickers):
-                target_value = cash * weights[i]
+                target_value = total_invested * weights[i]
                 current_pos = broker.get_position(t)
                 current_value = float(current_pos.get("market_value", 0))
                 outputs = specialist_list[i]
-                position_pct = weights[i]
+                position_pct = float(weights[i])
 
                 if target_value > current_value + 100:
                     notional = target_value - current_value
-                    order = broker.place_order(t, notional=notional, side="buy")
-                    if order:
-                        logger.info("BUY %s: $%.2f", t, notional)
-                        send_discord_notification(t, "BUY", position_pct, outputs, order)
+                    if FRACTIONAL:
+                        order = broker.place_order(t, notional=notional, side="buy")
+                        if order:
+                            logger.info("BUY %s: $%.2f", t, notional)
+                            send_discord_notification(t, "BUY", position_pct, outputs, order)
+                    else:
+                        price = latest_prices.get(t) or 0.0
+                        if price > 0:
+                            qty = max(1, int(round(notional / price)))
+                            order = broker.place_order(t, qty=qty, side="buy")
+                            if order:
+                                logger.info("BUY %s: %d shares @ ~$%.2f", t, qty, price)
+                                send_discord_notification(t, "BUY", position_pct, outputs, order)
+                        else:
+                            logger.warning("No price for %s; skipping buy", t)
                 elif current_value > target_value + 100:
                     notional = current_value - target_value
-                    order = broker.place_order(t, notional=notional, side="sell")
-                    if order:
-                        logger.info("SELL %s: $%.2f", t, notional)
-                        send_discord_notification(t, "SELL", position_pct, outputs, order)
+                    if FRACTIONAL:
+                        order = broker.place_order(t, notional=notional, side="sell")
+                        if order:
+                            logger.info("SELL %s: $%.2f", t, notional)
+                            send_discord_notification(t, "SELL", position_pct, outputs, order)
+                    else:
+                        current_qty = float(current_pos.get("qty", 0))
+                        price = latest_prices.get(t) or 0.0
+                        if price > 0 and current_qty > 0:
+                            qty = min(int(current_qty), max(1, int(round(notional / price))))
+                            order = broker.place_order(t, qty=qty, side="sell")
+                            if order:
+                                logger.info("SELL %s: %d shares @ ~$%.2f", t, qty, price)
+                                send_discord_notification(t, "SELL", position_pct, outputs, order)
+                        else:
+                            logger.warning("No position or price for %s; skipping sell", t)
                 else:
                     logger.info("HOLD %s | Position=%.1f%%", t, position_pct * 100)
                     send_discord_notification(t, "HOLD", position_pct, outputs)
@@ -665,13 +789,55 @@ def cmd_test(args: argparse.Namespace) -> None:
                 specialist_list = [_run_specialists(t) for t in tickers]
                 trader = PPOTrader(n_assets=n_assets)
                 action = trader.predict(specialist_outputs_by_asset=specialist_list)
-                action = np.array([_position_used(float(a)) for a in action])
-                total = float(np.sum(action)) + 1e-8
-                weights = action / total
+                action = np.array(action, dtype=np.float64)
+                if not ENV_ALLOW_CASH_EXPOSURE:
+                    action = np.array([_position_used(float(a)) for a in action])
+                exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
                 for i, t in enumerate(tickers):
-                    logger.info("  %s: sentiment=%.2f target_weight=%.1f%%", t, specialist_list[i]["sentiment"], weights[i] * 100)
+                    logger.info("  %s: sentiment=%.2f exposure=%.1f%% target_weight=%.1f%%", t, specialist_list[i]["sentiment"], exposure * 100, weights[i] * 100)
 
     logger.info("--- Test complete ---")
+
+
+def cmd_autodiscover(args: argparse.Namespace) -> None:
+    """Run autodiscovery once: score universe, select top N, print and optionally save list."""
+    from .universe import run_autodiscover
+
+    n = getattr(args, "n", None) or TRADE_LIST_SIZE
+    tickers = run_autodiscover(n=n)
+    logger.info("Autodiscover top %d: %s", len(tickers), tickers)
+    if getattr(args, "save", False):
+        path = OUTPUT_DIR / "current_trade_list.txt"
+        path.write_text("\n".join(tickers))
+        logger.info("Saved to %s", path)
+    if not getattr(args, "quiet", False):
+        for t in tickers:
+            print(t)
+
+
+def cmd_train_universe(args: argparse.Namespace) -> None:
+    """Train universe ScorerModel from historical aligned returns (top quartile forward return = 1)."""
+    from .universe.train_scorer import train_scorer_from_returns
+
+    tickers = _tickers_from_args(args)
+    if not tickers:
+        logger.error("No tickers specified; use --tickers or set TRADE_TICKERS")
+        return
+    _, returns_array = _load_aligned_returns(tickers, lookback_years=3)
+    if returns_array is None:
+        logger.error("Could not load aligned returns for %s", tickers)
+        return
+    n_assets = len(tickers)
+    logger.info("Training universe scorer on %d tickers, %d days", n_assets, returns_array.shape[0])
+    train_scorer_from_returns(
+        returns_array,
+        n_assets=n_assets,
+        forward_days=getattr(args, "forward_days", 21),
+        n_estimators=getattr(args, "n_estimators", 100),
+        max_depth=getattr(args, "max_depth", 4),
+        learning_rate=getattr(args, "learning_rate", 0.05),
+    )
+    logger.info("Universe scorer saved. Run 'autodiscover' or paper/live --autodiscover to use it.")
 
 
 def main() -> None:
@@ -707,13 +873,31 @@ def main() -> None:
     _add_debug(paper_p)
     paper_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     paper_p.add_argument("--interval", type=int, default=60, help="Minutes between decisions")
+    paper_p.add_argument("--autodiscover", action="store_true", help="Run universe autodiscovery to get trade list (top N by scorer)")
     paper_p.set_defaults(func=cmd_paper)
 
     live_p = sub.add_parser("live", help="Live trading with Alpaca")
     _add_debug(live_p)
     live_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     live_p.add_argument("--interval", type=int, default=60, help="Minutes between decisions")
+    live_p.add_argument("--autodiscover", action="store_true", help="Run universe autodiscovery to get trade list (top N by scorer)")
     live_p.set_defaults(func=cmd_live)
+
+    autodiscover_p = sub.add_parser("autodiscover", help="Run autodiscovery once: score universe, select top N, print or save list")
+    _add_debug(autodiscover_p)
+    autodiscover_p.add_argument("--n", type=int, default=None, help="Number of tickers to select (default: TRADE_LIST_SIZE)")
+    autodiscover_p.add_argument("--save", action="store_true", help="Save list to outputs/current_trade_list.txt")
+    autodiscover_p.add_argument("--quiet", action="store_true", help="Do not print tickers to stdout")
+    autodiscover_p.set_defaults(func=cmd_autodiscover)
+
+    train_universe_p = sub.add_parser("train-universe", help="Train universe ScorerModel from historical returns (top quartile = 1)")
+    _add_debug(train_universe_p)
+    train_universe_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers for training data (default: TRADE_TICKERS)")
+    train_universe_p.add_argument("--forward-days", type=int, default=21, help="Forward return horizon for label")
+    train_universe_p.add_argument("--n-estimators", type=int, default=100, help="GradientBoosting n_estimators")
+    train_universe_p.add_argument("--max-depth", type=int, default=4, help="GradientBoosting max_depth")
+    train_universe_p.add_argument("--learning-rate", type=float, default=0.05, help="GradientBoosting learning_rate")
+    train_universe_p.set_defaults(func=cmd_train_universe)
 
     test_p = sub.add_parser("test", help="Run minimal verification across all modes (sentiment, backtest, paper, train, tune, live)")
     _add_debug(test_p)

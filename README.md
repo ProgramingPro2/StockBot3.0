@@ -127,7 +127,7 @@ Runs a loop that polls data, runs specialists for all tickers, and logs position
 python -m trading_system live --interval 60
 ```
 
-Places real orders for all tickers; cash is allocated by normalizing PPO position weights. Use `--tickers` to override the list.
+Places real orders for all tickers; when `ENV_ALLOW_CASH_EXPOSURE` is true (default), only `cash * exposure` is invested (exposure = min(1, sum of PPO actions)); the rest stays in cash. Use `--tickers` to override the list, or `--autodiscover` to resolve the list via universe autodiscovery.
 
 **WARNING**: This places REAL orders via Alpaca. Use paper trading URL in `.env` for testing:
 
@@ -166,5 +166,24 @@ Edit `trading_system/config.py` for:
 - TFT, XGBoost, VAE, PPO hyperparameters
 - `ENV_REWARD_DRAWDOWN_PENALTY`: Penalty for drawdown in PPO reward (default: 0.5)
 - `ENV_OBS_ROLLING_FEATURES`: Include rolling return/volatility in observations (default: true)
+- `ENV_ALLOW_CASH_EXPOSURE`: When true (default), sum of PPO actions = total market exposure (capped at 1); rest stays in cash. When false, weights are normalized to 100% invested.
+- **Universe (autodiscovery)**: `UNIVERSE_SOURCE` (config | file | sp500), `UNIVERSE_FILE` (path when source=file), `TRADE_LIST_SIZE` (default 5), `AUTODISCOVER_INTERVAL_DAYS` (default 7)
 
 Use `python -m trading_system tune` for automatic PPO hyperparameter optimization instead of manual config edits. Changing the number of tickers requires retraining the PPO (saved policy has fixed input/output dimensions).
+
+### Universe Autodiscovery
+
+To let the system pick the trade list from a larger universe:
+
+1. Set `UNIVERSE_SOURCE=file` and `UNIVERSE_FILE` to a path with one ticker per line, or `UNIVERSE_SOURCE=sp500` to use S&P 500 (cached).
+2. Train the universe ScorerModel from historical returns (top quartile forward return = 1):
+   ```bash
+   python -m trading_system train-universe --tickers SPY,IWM,XLE,XLF,EEM,AAPL,MSFT,...
+   ```
+3. Run discovery once: `python -m trading_system autodiscover --save` (saves to `outputs/current_trade_list.txt`).
+4. Use `--autodiscover` with paper or live to resolve the trade list at start:
+   ```bash
+   python -m trading_system paper --autodiscover --interval 60
+   python -m trading_system live --autodiscover --interval 60
+   ```
+   When `UNIVERSE_SOURCE=config`, behavior is unchanged: trade list = TRADE_TICKERS or `--tickers`.

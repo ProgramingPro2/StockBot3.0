@@ -31,7 +31,11 @@ from .env import HistoricalTradingEnv
 PPO_TUNE_PARAMS_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_best.json"
 
 
-def _get_device() -> str:
+def _get_ppo_device() -> str:
+    """PPO uses CPU (SB3 recommends CPU for MLP policy)."""
+    from ..config import PPO_DEVICE
+    if PPO_DEVICE == "cuda" and torch.cuda.is_available():
+        return "cuda"
     return "cpu"
 
 
@@ -117,7 +121,7 @@ def run_tuning(
             clip_range=params["clip_range"],
             ent_coef=params["ent_coef"],
             policy_kwargs=params["policy_kwargs"],
-            device=_get_device(),
+            device=_get_ppo_device(),
             verbose=0,
         )
 

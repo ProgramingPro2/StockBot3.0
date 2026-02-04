@@ -13,6 +13,7 @@ from stable_baselines3 import PPO
 from ..config import (
     ENV_OBS_ROLLING_FEATURES,
     META_LEARNER_MODEL_DIR,
+    PPO_CPU_THREADS,
     PPO_BATCH_SIZE,
     PPO_CLIP_RANGE,
     PPO_ENT_COEF,
@@ -26,8 +27,11 @@ from ..config import (
 from .env import HistoricalTradingEnv, TradingEnv
 
 
-def _get_device() -> str:
-    """PPO with MlpPolicy runs better on CPU per stable_baselines3 docs."""
+def _get_ppo_device() -> str:
+    """PPO uses CPU (SB3 recommends CPU for MLP policy)."""
+    from ..config import PPO_DEVICE
+    if PPO_DEVICE == "cuda" and torch.cuda.is_available():
+        return "cuda"
     return "cpu"
 
 
@@ -43,7 +47,7 @@ class PPOTrader:
             path = META_LEARNER_MODEL_DIR / "ppo_trader.zip"
             if path.exists():
                 try:
-                    self.model = PPO.load(str(path), env=self.env, device=_get_device())
+                    self.model = PPO.load(str(path), env=self.env, device=_get_ppo_device())
                 except Exception:
                     self.model = None
 
@@ -70,6 +74,7 @@ class PPOTrader:
                     "quant_prob": float(np.random.uniform(0, 1)),
                     "fund_score": float(np.random.uniform(-1, 1)),
                     "regime_flag": float(np.random.uniform(0, 1)),
+                    "momentum_score": float(np.random.uniform(-1, 1)),
                 }
                 for _ in range(self.n_assets)
             ]
@@ -105,6 +110,9 @@ class PPOTrader:
 
             env = SpecialistWrapper(n_assets=self.n_assets)
 
+        if _get_ppo_device() == "cpu":
+            torch.set_num_threads(PPO_CPU_THREADS)
+
         if self.model is None:
             policy_kwargs = kwargs.pop("policy_kwargs", None) or PPO_NET_ARCH
             if policy_kwargs is None:
@@ -121,7 +129,7 @@ class PPOTrader:
                 clip_range=kwargs.pop("clip_range", PPO_CLIP_RANGE),
                 ent_coef=kwargs.pop("ent_coef", PPO_ENT_COEF),
                 policy_kwargs=policy_kwargs,
-                device=_get_device(),
+                device=_get_ppo_device(),
                 verbose=1,
                 **kwargs,
             )
@@ -165,6 +173,7 @@ class PPOTrader:
             parts.append(float(s.get("quant_prob", 0.5)))
             parts.append(float(s.get("fund_score", 0.0)))
             parts.append(float(s.get("regime_flag", 0.5)))
+            parts.append(float(s.get("momentum_score", 0.0)))
             parts.append(float(holdings[i]))
             if ENV_OBS_ROLLING_FEATURES:
                 parts.append(float(s.get("rolling_return_5d", 0.0)))
@@ -176,8 +185,8 @@ class PPOTrader:
         action_clipped = np.clip(action, 0, 1)
 
         if debug:
-            per_asset = 5 + (3 if ENV_OBS_ROLLING_FEATURES else 0)
-            names = ["sentiment", "quant_prob", "fund_score", "regime_flag", "holdings"]
+            per_asset = 6 + (3 if ENV_OBS_ROLLING_FEATURES else 0)
+            names = ["sentiment", "quant_prob", "fund_score", "regime_flag", "momentum_score", "holdings"]
             if ENV_OBS_ROLLING_FEATURES:
                 names.extend(["rolling_return_5d", "rolling_return_21d", "rolling_vol_21d"])
             parts = []

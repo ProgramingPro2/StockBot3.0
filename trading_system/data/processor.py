@@ -87,3 +87,36 @@ def prepare_regime_features(spy_df: pd.DataFrame, window: int = 20) -> pd.DataFr
     feature_cols = ["return", "vol", "return_5d", "return_20d", "volume_ratio"]
     df = df.dropna()
     return df[feature_cols]
+
+
+def add_momentum_features(df: pd.DataFrame, window: int = 20, rsi_period: int = 14) -> pd.DataFrame:
+    """
+    Add short-horizon features for Momentum Specialist: return_5d, return_20d, RSI, ATR.
+    Expects OHLCV with columns open, high, low, close, (volume optional).
+    Modifies df in place and returns it.
+    """
+    if df.empty or "close" not in df.columns:
+        return df
+    df = df.copy()
+    df["return_1d"] = df["close"].pct_change()
+    df["return_5d"] = df["close"].pct_change(5)
+    df["return_20d"] = df["close"].pct_change(window)
+    # RSI
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta).where(delta < 0, 0.0)
+    avg_gain = gain.rolling(rsi_period, min_periods=1).mean()
+    avg_loss = loss.rolling(rsi_period, min_periods=1).mean()
+    rs = avg_gain / (avg_loss + 1e-10)
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].clip(0, 100)
+    # ATR
+    high = df["high"] if "high" in df.columns else df["close"]
+    low = df["low"] if "low" in df.columns else df["close"]
+    tr = np.maximum(high - low, np.maximum(abs(high - df["close"].shift(1)), abs(low - df["close"].shift(1))))
+    df["atr"] = tr.rolling(rsi_period, min_periods=1).mean()
+    df["atr"] = df["atr"].replace(0, np.nan).bfill().fillna(0.01)
+    df["return_1d"] = df["return_1d"].fillna(0)
+    df["return_5d"] = df["return_5d"].fillna(0)
+    df["return_20d"] = df["return_20d"].fillna(0)
+    return df

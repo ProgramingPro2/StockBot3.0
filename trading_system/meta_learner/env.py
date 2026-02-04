@@ -1,6 +1,6 @@
 """
 Custom Gymnasium environment for the RL meta-learner.
-Observation: per-asset [sentiment, quant_prob, fund_score, regime_flag, holdings]
+Observation: per-asset [sentiment, quant_prob, fund_score, regime_flag, momentum_score, holdings]
   + optional [rolling_return_5d, rolling_return_21d, rolling_vol_21d].
 Action: position size % per asset
 Reward: portfolio Sharpe ratio over rolling window, minus drawdown penalty
@@ -19,16 +19,16 @@ from ..config import (
 
 def _proxy_specialists_from_returns_np(
     returns: np.ndarray, start: int, window: int = 21
-) -> tuple[float, float, float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float, float, float]:
     """
     Derive proxy specialist outputs from rolling returns (numpy, no pandas).
-    Returns (sentiment, quant_prob, fund_score, regime_flag,
+    Returns (sentiment, quant_prob, fund_score, regime_flag, momentum_score,
              rolling_return_5d, rolling_return_21d, rolling_vol_21d).
     """
     lookback = returns[max(0, start - window) : start]
     lookback = lookback[~np.isnan(lookback)]
     if len(lookback) == 0:
-        return 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.01
+        return 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.0, 0.01
 
     mean_ret = float(np.mean(lookback))
     std_ret = float(np.std(lookback))
@@ -41,6 +41,7 @@ def _proxy_specialists_from_returns_np(
     regime_flag = 0.5 + vol_norm
     sentiment_proxy = float(np.clip(mean_ret * 12, -0.5, 0.5))
     fund_score_proxy = float(np.clip(-mean_ret * 15, -0.5, 0.5))
+    momentum_proxy = float(np.clip(mean_ret * 15, -1, 1))
 
     ret_5d = float(np.mean(lookback[-5:])) if len(lookback) >= 5 else mean_ret
     ret_21d = float(np.mean(lookback[-21:])) if len(lookback) >= 21 else mean_ret
@@ -53,12 +54,12 @@ def _proxy_specialists_from_returns_np(
     ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
     vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
 
-    return sentiment_proxy, quant_prob, fund_score_proxy, regime_flag, ret_5d_norm, ret_21d_norm, vol_21d_norm
+    return sentiment_proxy, quant_prob, fund_score_proxy, regime_flag, momentum_proxy, ret_5d_norm, ret_21d_norm, vol_21d_norm
 
 
 def _obs_features_per_asset() -> int:
     """Number of observation features per asset."""
-    base = 5  # sentiment, quant_prob, fund_score, regime_flag, holdings
+    base = 6  # sentiment, quant_prob, fund_score, regime_flag, momentum_score, holdings
     if ENV_OBS_ROLLING_FEATURES:
         return base + 3  # rolling_return_5d, rolling_return_21d, rolling_vol_21d
     return base
@@ -183,6 +184,7 @@ class TradingEnv(gym.Env):
             parts.append(float(s.get("quant_prob", 0.5)))
             parts.append(float(s.get("fund_score", 0.0)))
             parts.append(float(s.get("regime_flag", 0.5)))
+            parts.append(float(s.get("momentum_score", 0.0)))
             parts.append(float(holdings[i]))
             if ENV_OBS_ROLLING_FEATURES:
                 if self._rolling_returns is not None and self._rolling_vols is not None:
@@ -318,13 +320,14 @@ class HistoricalTradingEnv(gym.Env):
         parts: list[float] = []
         for i in range(self.n_assets):
             ret_series = self.returns_array[: self._cursor, i]
-            s, q, f, r, ret_5d, ret_21d, vol_21d = _proxy_specialists_from_returns_np(
+            s, q, f, r, mom, ret_5d, ret_21d, vol_21d = _proxy_specialists_from_returns_np(
                 ret_series, len(ret_series), window=21
             )
             parts.append(s)
             parts.append(q)
             parts.append(f)
             parts.append(r)
+            parts.append(mom)
             parts.append(float(self._holdings[i]) if self._holdings is not None else 0.0)
             if ENV_OBS_ROLLING_FEATURES:
                 parts.extend([ret_5d, ret_21d, vol_21d])
