@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import optuna
+from optuna.trial import TrialState
 import torch
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
@@ -29,6 +30,7 @@ from .env import HistoricalTradingEnv
 
 
 PPO_TUNE_PARAMS_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_best.json"
+PPO_TUNE_STUDY_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_study.db"
 
 
 def _get_ppo_device() -> str:
@@ -153,8 +155,25 @@ def run_tuning(
     sampler = TPESampler(n_startup_trials=5, seed=42)
     pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=max(n_evaluations // 3, 1))
 
-    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
-    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+        pruner=pruner,
+        storage=storage,
+        study_name="ppo_tune",
+        load_if_exists=True,
+    )
+    if len(study.trials) == 0:
+        prev = _previous_best_to_enqueue()
+        if prev is not None:
+            study.enqueue_trial(prev)
+
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, callbacks=[_save_best_params])
+
+    if study.best_trial is None:
+        return load_tuned_params() or {}
 
     raw = study.best_trial.params
     best_value = float(study.best_value)
@@ -172,7 +191,6 @@ def run_tuning(
     if not math.isnan(best_value):
         best["best_value"] = best_value
 
-    META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     with open(PPO_TUNE_PARAMS_PATH, "w") as f:
         json.dump(best, f, indent=2)
 
@@ -185,6 +203,71 @@ def _net_arch_from_name(arch: str) -> dict:
     if arch == "medium":
         return {"net_arch": {"pi": [128, 128], "vf": [128, 128]}}
     return {"net_arch": {"pi": [64, 64], "vf": [64, 64]}}
+
+
+def _net_arch_to_name(policy_kwargs: dict) -> str:
+    """Map policy_kwargs net_arch dict back to categorical name for enqueue_trial."""
+    na = (policy_kwargs or {}).get("net_arch") or {}
+    pi = na.get("pi") or []
+    vf = na.get("vf") or []
+    if pi == [64] and vf == [64]:
+        return "tiny"
+    if pi == [128, 128] and vf == [128, 128]:
+        return "medium"
+    return "small"
+
+
+def _previous_best_to_enqueue() -> dict[str, Any] | None:
+    """Build params dict for enqueue_trial from ppo_tune_best.json, or None."""
+    if not PPO_TUNE_PARAMS_PATH.exists():
+        return None
+    try:
+        with open(PPO_TUNE_PARAMS_PATH) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    pk = data.get("policy_kwargs")
+    if not isinstance(pk, dict):
+        return None
+    keys = ("learning_rate", "n_steps", "batch_size", "n_epochs", "gamma", "gae_lambda", "clip_range", "ent_coef")
+    if any(data.get(k) is None for k in keys):
+        return None
+    net_arch = _net_arch_to_name(pk)
+    return {
+        "learning_rate": data["learning_rate"],
+        "n_steps": data["n_steps"],
+        "batch_size": data["batch_size"],
+        "n_epochs": data["n_epochs"],
+        "gamma": data["gamma"],
+        "gae_lambda": data["gae_lambda"],
+        "clip_range": data["clip_range"],
+        "ent_coef": data["ent_coef"],
+        "net_arch": net_arch,
+    }
+
+
+def _save_best_params(study: optuna.Study, trial: optuna.Trial) -> None:
+    """Callback: save ppo_tune_best.json whenever this trial is the new best."""
+    if study.best_trial is not trial:
+        return
+    raw = trial.params
+    best_value = float(study.best_value)
+    best = {
+        "learning_rate": raw["learning_rate"],
+        "n_steps": raw["n_steps"],
+        "batch_size": raw["batch_size"],
+        "n_epochs": raw["n_epochs"],
+        "gamma": raw["gamma"],
+        "gae_lambda": raw["gae_lambda"],
+        "clip_range": raw["clip_range"],
+        "ent_coef": raw["ent_coef"],
+        "policy_kwargs": _net_arch_from_name(raw.get("net_arch", "small")),
+    }
+    if not math.isnan(best_value):
+        best["best_value"] = best_value
+    META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PPO_TUNE_PARAMS_PATH, "w") as f:
+        json.dump(best, f, indent=2)
 
 
 def load_tuned_params() -> dict[str, Any] | None:

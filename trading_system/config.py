@@ -42,6 +42,11 @@ UNIVERSE_FILE = os.getenv("UNIVERSE_FILE", "")  # Path to ticker list file when 
 TRADE_LIST_SIZE = int(os.getenv("TRADE_LIST_SIZE", "5"))  # Number of symbols autodiscovery selects (must match PPO n_assets)
 AUTODISCOVER_INTERVAL_DAYS = int(os.getenv("AUTODISCOVER_INTERVAL_DAYS", "7"))  # Run discovery every N days in paper/live
 
+# Mean-Reversion, Volatility, Earnings/Event Risk Specialists (rule-based)
+EVENT_RISK_LOOKBACK_DAYS = 21  # Days before earnings to ramp event_risk_score
+VOLATILITY_WINDOW_DAYS = 21  # Short window for realized vol
+VOLATILITY_REF_WINDOW_DAYS = 252  # Long window for vol normalization
+
 # Momentum Specialist (short-horizon)
 MOMENTUM_WINDOW_DAYS = 60  # Rolling window for features and training
 MOMENTUM_FORWARD_DAYS = 5  # Forward return horizon for label
@@ -115,7 +120,8 @@ VAE_REGIME_CLUSTERS = 4  # Bull, Bear, Sideways, Crash
 
 # PPO (Meta-Learner)
 PPO_LEARNING_RATE = 3e-4
-PPO_N_STEPS = 2048
+# When using --use-tuned, n_steps is capped at this value for faster training (tune often picks 4096)
+PPO_N_STEPS = int(os.getenv("PPO_N_STEPS", "2048"))
 PPO_BATCH_SIZE = 64
 PPO_N_EPOCHS = 10
 PPO_GAMMA = 0.99
@@ -124,6 +130,8 @@ PPO_CLIP_RANGE = 0.2
 PPO_ENT_COEF = 0.01
 PPO_NET_ARCH: dict | list = None  # None = default; or {"pi": [64, 64], "vf": [64, 64]}
 PPO_TOTAL_TIMESTEPS = int(os.getenv("PPO_TOTAL_TIMESTEPS", "500000"))  # Try 1000000+ with --use-historical --use-tuned
+# Save checkpoint every N timesteps during training (0 = disable)
+PPO_CHECKPOINT_FREQ = int(os.getenv("PPO_CHECKPOINT_FREQ", "100000"))
 # CPU threads for PPO when device=cpu; 0 = use all available
 PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 

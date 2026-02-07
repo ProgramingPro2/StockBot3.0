@@ -17,18 +17,68 @@ from ..config import (
 )
 
 
+def _proxy_specialists_vectorized(returns_2d: np.ndarray) -> np.ndarray:
+    """
+    Vectorized version: returns_2d shape (window, n_assets).
+    Returns shape (n_assets, 11): sentiment, quant_prob, fund_score, regime_flag,
+    momentum, mean_reversion, volatility, event_risk, ret_5d_norm, ret_21d_norm, vol_21d_norm per asset.
+    """
+    # returns_2d may have NaNs; use nanmean/nanstd for robustness
+    mean_ret = np.nanmean(returns_2d, axis=0).astype(np.float32)
+    std_ret = np.nanstd(returns_2d, axis=0).astype(np.float32)
+    std_ret = np.where(std_ret < 1e-8, 0.01, std_ret)
+
+    sentiment = np.clip(mean_ret * 12, -0.5, 0.5)
+    trend = np.clip(mean_ret * 20, -0.5, 0.5)
+    quant_prob = 0.5 + trend
+    fund_score = np.clip(-mean_ret * 15, -0.5, 0.5)
+    vol_norm = np.clip((std_ret - 0.01) * 50, -0.5, 0.5)
+    regime_flag = 0.5 + vol_norm
+    momentum = np.clip(mean_ret * 15, -1, 1)
+    mean_reversion = np.clip(-mean_ret * 20, -0.5, 0.5)
+    volatility = np.clip((vol_norm + 1.0) / 2.0, 0.0, 1.0)
+    event_risk = np.zeros_like(mean_ret, dtype=np.float32)
+
+    n = returns_2d.shape[0]
+    ret_5d = np.nanmean(returns_2d[-5:] if n >= 5 else returns_2d, axis=0)
+    ret_21d = np.nanmean(returns_2d[-21:] if n >= 21 else returns_2d, axis=0)
+    vol_21d = np.nanstd(returns_2d[-21:] if n >= 21 else returns_2d, axis=0)
+    vol_21d = np.where(vol_21d < 1e-8, 0.01, vol_21d)
+
+    ret_5d_norm = np.clip(ret_5d * 50, -1, 1)
+    ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
+    vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
+
+    return np.column_stack(
+        (
+            sentiment,
+            quant_prob,
+            fund_score,
+            regime_flag,
+            momentum,
+            mean_reversion,
+            volatility,
+            event_risk,
+            ret_5d_norm,
+            ret_21d_norm,
+            vol_21d_norm,
+        )
+    )
+
+
 def _proxy_specialists_from_returns_np(
     returns: np.ndarray, start: int, window: int = 21
-) -> tuple[float, float, float, float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float, float, float, float, float, float]:
     """
     Derive proxy specialist outputs from rolling returns (numpy, no pandas).
     Returns (sentiment, quant_prob, fund_score, regime_flag, momentum_score,
+             mean_reversion, volatility, event_risk,
              rolling_return_5d, rolling_return_21d, rolling_vol_21d).
     """
     lookback = returns[max(0, start - window) : start]
     lookback = lookback[~np.isnan(lookback)]
     if len(lookback) == 0:
-        return 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.0, 0.01
+        return 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.01
 
     mean_ret = float(np.mean(lookback))
     std_ret = float(np.std(lookback))
@@ -42,6 +92,9 @@ def _proxy_specialists_from_returns_np(
     sentiment_proxy = float(np.clip(mean_ret * 12, -0.5, 0.5))
     fund_score_proxy = float(np.clip(-mean_ret * 15, -0.5, 0.5))
     momentum_proxy = float(np.clip(mean_ret * 15, -1, 1))
+    mean_reversion_proxy = float(np.clip(-mean_ret * 20, -0.5, 0.5))
+    volatility_proxy = float(np.clip((vol_norm + 1.0) / 2.0, 0.0, 1.0))
+    event_risk_proxy = 0.0
 
     ret_5d = float(np.mean(lookback[-5:])) if len(lookback) >= 5 else mean_ret
     ret_21d = float(np.mean(lookback[-21:])) if len(lookback) >= 21 else mean_ret
@@ -49,17 +102,28 @@ def _proxy_specialists_from_returns_np(
     if vol_21d < 1e-8:
         vol_21d = 0.01
 
-    # Normalize for obs: clip to roughly [-1, 1]
     ret_5d_norm = np.clip(ret_5d * 50, -1, 1)
     ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
     vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
 
-    return sentiment_proxy, quant_prob, fund_score_proxy, regime_flag, momentum_proxy, ret_5d_norm, ret_21d_norm, vol_21d_norm
+    return (
+        sentiment_proxy,
+        quant_prob,
+        fund_score_proxy,
+        regime_flag,
+        momentum_proxy,
+        mean_reversion_proxy,
+        volatility_proxy,
+        event_risk_proxy,
+        ret_5d_norm,
+        ret_21d_norm,
+        vol_21d_norm,
+    )
 
 
 def _obs_features_per_asset() -> int:
     """Number of observation features per asset."""
-    base = 6  # sentiment, quant_prob, fund_score, regime_flag, momentum_score, holdings
+    base = 9  # sentiment, quant_prob, fund_score, regime_flag, momentum_score, mean_reversion, volatility, event_risk, holdings
     if ENV_OBS_ROLLING_FEATURES:
         return base + 3  # rolling_return_5d, rolling_return_21d, rolling_vol_21d
     return base
@@ -185,6 +249,9 @@ class TradingEnv(gym.Env):
             parts.append(float(s.get("fund_score", 0.0)))
             parts.append(float(s.get("regime_flag", 0.5)))
             parts.append(float(s.get("momentum_score", 0.0)))
+            parts.append(float(s.get("mean_reversion_score", 0.0)))
+            parts.append(float(s.get("volatility_score", 0.5)))
+            parts.append(float(s.get("event_risk_score", 0.0)))
             parts.append(float(holdings[i]))
             if ENV_OBS_ROLLING_FEATURES:
                 if self._rolling_returns is not None and self._rolling_vols is not None:
@@ -317,21 +384,26 @@ class HistoricalTradingEnv(gym.Env):
         return obs, reward, terminated, truncated, {"return": portfolio_return}
 
     def _get_obs(self) -> np.ndarray:
-        parts: list[float] = []
-        for i in range(self.n_assets):
-            ret_series = self.returns_array[: self._cursor, i]
-            s, q, f, r, mom, ret_5d, ret_21d, vol_21d = _proxy_specialists_from_returns_np(
-                ret_series, len(ret_series), window=21
-            )
-            parts.append(s)
-            parts.append(q)
-            parts.append(f)
-            parts.append(r)
-            parts.append(mom)
-            parts.append(float(self._holdings[i]) if self._holdings is not None else 0.0)
-            if ENV_OBS_ROLLING_FEATURES:
-                parts.extend([ret_5d, ret_21d, vol_21d])
-        obs = np.array(parts, dtype=np.float32)
+        window = 21
+        start_idx = max(0, self._cursor - window)
+        returns_window = self.returns_array[start_idx : self._cursor, :]  # (window, n_assets)
+        if returns_window.size == 0:
+            features = np.zeros((self.n_assets, 11), dtype=np.float32)
+            features[:, 1] = 0.5
+            features[:, 3] = 0.5
+            features[:, 6] = 0.5
+            features[:, 10] = 0.01
+        else:
+            features = _proxy_specialists_vectorized(returns_window)  # (n_assets, 11)
+
+        holdings = self._holdings if self._holdings is not None else np.zeros(self.n_assets, dtype=np.float32)
+        if ENV_OBS_ROLLING_FEATURES:
+            per_asset = np.column_stack(
+                (features[:, :8], holdings, features[:, 8:11])
+            )  # (n_assets, 12)
+        else:
+            per_asset = np.column_stack((features[:, :8], holdings))  # (n_assets, 9)
+        obs = per_asset.flatten().astype(np.float32)
         return np.clip(obs, -1, 1)
 
     def render(self) -> None:

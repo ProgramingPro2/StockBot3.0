@@ -2,10 +2,17 @@
 CLI entry point for The Boardroom trading system.
 Modes: train, backtest, paper, live (multi-asset: TRADE_TICKERS).
 """
+from __future__ import annotations
+
 import argparse
 import json
+import sys
 import warnings
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .meta_learner import PPOTrader
 
 import numpy as np
 
@@ -25,6 +32,7 @@ from .config import (
     ENV_ALLOW_CASH_EXPOSURE,
     ENV_OBS_ROLLING_FEATURES,
     FRACTIONAL,
+    META_LEARNER_MODEL_DIR,
     OUTPUT_DIR,
     SPECIALIST_CACHE_DIR,
     SPECIALIST_CACHE_MAX_AGE_HOURS,
@@ -49,8 +57,20 @@ def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = 
         f = out.get("fund_score", 0.0)
         r = out.get("regime_flag", 0.5)
         mom = out.get("momentum_score", 0.0)
+        mr = out.get("mean_reversion_score", 0.0)
+        vol = out.get("volatility_score", 0.5)
+        evt = out.get("event_risk_score", 0.0)
         bad = []
-        for name, val in [("sentiment", s), ("quant_prob", q), ("fund_score", f), ("regime_flag", r), ("momentum_score", mom)]:
+        for name, val in [
+            ("sentiment", s),
+            ("quant_prob", q),
+            ("fund_score", f),
+            ("regime_flag", r),
+            ("momentum_score", mom),
+            ("mean_reversion_score", mr),
+            ("volatility_score", vol),
+            ("event_risk_score", evt),
+        ]:
             try:
                 v = float(val)
                 if np.isnan(v) or np.isinf(v):
@@ -67,7 +87,13 @@ def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = 
             bad.append(f"regime_flag={r}")
         if not (-1 <= mom <= 1):
             bad.append(f"momentum_score={mom}")
-        msg = f"DEBUG | {t} | sentiment={s:.3f} quant_prob={q:.3f} fund_score={f:.3f} regime_flag={r:.3f} momentum={mom:.3f}"
+        if not (-1 <= mr <= 1):
+            bad.append(f"mean_reversion_score={mr}")
+        if not (0 <= vol <= 1):
+            bad.append(f"volatility_score={vol}")
+        if not (0 <= evt <= 1):
+            bad.append(f"event_risk_score={evt}")
+        msg = f"DEBUG | {t} | sentiment={s:.3f} quant_prob={q:.3f} fund_score={f:.3f} regime_flag={r:.3f} momentum={mom:.3f} mean_rev={mr:.3f} vol={vol:.3f} event={evt:.3f}"
         if ENV_OBS_ROLLING_FEATURES:
             r5 = out.get("rolling_return_5d", 0.0)
             r21 = out.get("rolling_return_21d", 0.0)
@@ -113,7 +139,16 @@ def _rolling_features_from_ohlcv(close_series) -> dict:
 
 def _run_specialists(ticker: str = "SPY") -> dict:
     """Run all specialists and return dict of outputs. Uses cache on network failure."""
-    from .agents import get_sentiment, get_trend_probability, get_intrinsic_value_score, detect_regime, get_momentum_score
+    from .agents import (
+        get_sentiment,
+        get_trend_probability,
+        get_intrinsic_value_score,
+        detect_regime,
+        get_momentum_score,
+        get_mean_reversion_score,
+        get_volatility_score,
+        get_event_risk_score,
+    )
     from .data.loader import load_ohlcv
 
     sentiment, sentiment_conf, from_llm = get_sentiment(ticker)
@@ -125,6 +160,9 @@ def _run_specialists(ticker: str = "SPY") -> dict:
     regime_result = detect_regime(spy)
     regime_flag = regime_result["flag"]
     momentum_score = get_momentum_score(ticker)
+    mean_reversion_score = get_mean_reversion_score(ticker)
+    volatility_score = get_volatility_score(ticker)
+    event_risk_score = get_event_risk_score(ticker)
 
     out = {
         "sentiment": sentiment,
@@ -132,6 +170,9 @@ def _run_specialists(ticker: str = "SPY") -> dict:
         "fund_score": fund_score,
         "regime_flag": regime_flag,
         "momentum_score": momentum_score,
+        "mean_reversion_score": mean_reversion_score,
+        "volatility_score": volatility_score,
+        "event_risk_score": event_risk_score,
         "regime_name": regime_result["regime"],
     }
     if ENV_OBS_ROLLING_FEATURES:
@@ -168,6 +209,20 @@ def _tickers_from_args(args: argparse.Namespace) -> list[str]:
     if getattr(args, "tickers", None):
         return [s.strip().upper() for s in args.tickers.split(",") if s.strip()]
     return list(TRADE_TICKERS)
+
+
+def _list_meta_models() -> list[tuple[Path, float]]:
+    """Return (path, mtime) for each ppo_trader*.zip in META_LEARNER_MODEL_DIR, newest first."""
+    paths = list(META_LEARNER_MODEL_DIR.glob("ppo_trader*.zip"))
+    return sorted(((p, p.stat().st_mtime) for p in paths), key=lambda x: -x[1])
+
+
+def _resolve_backtest_model_path(path_str: str) -> Path | None:
+    """Resolve --model value to an absolute Path; if not absolute, look under META_LEARNER_MODEL_DIR."""
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = META_LEARNER_MODEL_DIR / p.name
+    return p if p.exists() else None
 
 
 def _load_aligned_returns(tickers: list[str], lookback_years: int = 3):
@@ -272,6 +327,9 @@ def cmd_train(args: argparse.Namespace) -> None:
                     "fund_score": float(np.random.uniform(-1, 1)),
                     "regime_flag": float(np.random.uniform(0, 1)),
                     "momentum_score": float(np.random.uniform(-1, 1)),
+                    "mean_reversion_score": 0.0,
+                    "volatility_score": 0.5,
+                    "event_risk_score": 0.0,
                     "regime_name": "Sideways",
                 }
                 if ENV_OBS_ROLLING_FEATURES:
@@ -285,23 +343,149 @@ def cmd_train(args: argparse.Namespace) -> None:
                 out_list.append(fallback)
         return out_list
 
-    specialist_fn()
+    initial_specialist_outputs = specialist_fn()
     ppo_kwargs = None
     if getattr(args, "use_tuned", False):
+        from .config import PPO_N_STEPS
         from .meta_learner.tuner import load_tuned_params
         ppo_kwargs = load_tuned_params()
         if ppo_kwargs:
+            # Cap n_steps so training stays fast; tuned often uses 4096 which is ~2x slower
+            tuned_n = ppo_kwargs.get("n_steps")
+            if tuned_n is not None and tuned_n > PPO_N_STEPS:
+                ppo_kwargs["n_steps"] = PPO_N_STEPS
             logger.info("Using tuned hyperparameters from previous tune run")
         else:
             logger.warning("No tuned params found; run 'tune' first")
 
-    trader.train(
+    specialist_fn_for_train = (
+        (lambda: initial_specialist_outputs) if historical_returns is None else specialist_fn
+    )
+    dated_path = trader.train(
         total_timesteps=args.timesteps,
-        specialist_fn=specialist_fn,
+        specialist_fn=specialist_fn_for_train,
         historical_returns=historical_returns,
         ppo_kwargs=ppo_kwargs,
     )
     logger.info("Training complete. Models saved.")
+
+    if args.timesteps >= 1_000_000:
+        from datetime import datetime
+
+        from .broker.discord_notifier import send_training_complete_embed
+        from .utils.plotting import save_performance_plot
+
+        result = _run_backtest(tickers, trader)
+        if result is not None:
+            equity, returns, bh_returns, equity_dollars, rebalance_dates, rebalance_direction, rebalance_trades = result
+            stats = _compute_backtest_stats(equity, returns, bh_returns, STARTING_CAPITAL)
+            plot_filename = f"training_complete_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+            plot_path = save_performance_plot(
+                equity_dollars,
+                returns,
+                filename=plot_filename,
+                rebalance_dates=rebalance_dates,
+                rebalance_direction=rebalance_direction,
+                rebalance_trades=rebalance_trades,
+            )
+            dated_name = dated_path.name if dated_path else None
+            if send_training_complete_embed(args.timesteps, stats, plot_path, dated_name):
+                logger.info("Sent training-complete notification to Discord")
+            else:
+                logger.debug("Discord webhook not configured or send failed")
+        else:
+            logger.warning("Skipping training-complete Discord notification: insufficient backtest data")
+
+
+def cmd_benchmark_device(args: argparse.Namespace) -> None:
+    """Run a short PPO burst on CPU and GPU (if available) and report timings to compare speed."""
+    import torch
+
+    from .meta_learner.ppo_trader import benchmark_device
+
+    tickers = _tickers_from_args(args)
+    n_assets = len(tickers) if tickers else len(TRADE_TICKERS)
+    if n_assets == 0:
+        n_assets = 5
+        tickers = list(TRADE_TICKERS)[:5]
+
+    timesteps = getattr(args, "timesteps", 20_000)
+    use_historical = getattr(args, "use_historical", False)
+
+    logger.info("Device benchmark: PyTorch %s | CUDA available: %s", torch.__version__, torch.cuda.is_available())
+    if torch.cuda.is_available():
+        logger.info("GPU: %s", torch.cuda.get_device_name(0))
+
+    historical_returns = None
+    if use_historical and tickers:
+        _, returns_array = _load_aligned_returns(tickers)
+        if returns_array is not None:
+            historical_returns = returns_array
+            logger.info("Using historical returns (%d days, %d assets)", len(returns_array), returns_array.shape[1])
+    if historical_returns is None:
+        logger.info("Using synthetic env for benchmark (use --use-historical to match train setup)")
+
+    logger.info("Running PPO for %d timesteps on each device...", timesteps)
+    results = benchmark_device(
+        n_assets=n_assets,
+        timesteps=timesteps,
+        historical_returns=historical_returns,
+        specialist_fn=None,
+    )
+
+    cpu_sec = results.get("cpu")
+    cuda_sec = results.get("cuda")
+    logger.info("--- Device benchmark results ---")
+    logger.info("CPU:  %s sec (%.1f steps/sec)", f"{cpu_sec:.2f}" if cpu_sec is not None else "N/A", timesteps / cpu_sec if cpu_sec else 0)
+    if cuda_sec is not None:
+        logger.info("GPU:  %s sec (%.1f steps/sec)", f"{cuda_sec:.2f}", timesteps / cuda_sec)
+        if cpu_sec is not None and cpu_sec > 0:
+            ratio = cuda_sec / cpu_sec
+            if ratio < 1.0:
+                logger.info("GPU is %.2fx faster than CPU. Set PPO_DEVICE=cuda in .env for training.", 1.0 / ratio)
+            else:
+                logger.info("CPU is %.2fx faster than GPU. Keep PPO_DEVICE=cpu (default).", ratio)
+    else:
+        logger.info("GPU: not available (CUDA not detected)")
+    logger.info("--------------------------------")
+
+
+def _compute_backtest_stats(
+    equity: pd.Series,
+    strategy_returns: pd.Series,
+    bh_returns: pd.Series,
+    starting_capital: float | None = None,
+) -> dict:
+    """Compute backtest statistics; return dict for logging or Discord."""
+    total_return_pct = (float(equity.iloc[-1]) - 1.0) * 100
+    n_days = len(equity)
+    years = n_days / 252.0
+    cagr = (float(equity.iloc[-1]) ** (1 / max(years, 0.01)) - 1.0) * 100 if years > 0 else 0.0
+    cummax = equity.cummax()
+    drawdown = (equity - cummax) / cummax
+    max_dd_pct = float(drawdown.min()) * 100
+    vol_ann = float(strategy_returns.std() * (252 ** 0.5)) * 100
+    sharpe = float(strategy_returns.mean() / (strategy_returns.std() + 1e-8) * (252 ** 0.5))
+    win_rate = float((strategy_returns > 0).sum() / max(len(strategy_returns), 1)) * 100
+    bh_equity = (1 + bh_returns.fillna(0)).cumprod()
+    bh_return_pct = (float(bh_equity.iloc[-1]) - 1.0) * 100
+    stats = {
+        "total_return_pct": total_return_pct,
+        "cagr": cagr,
+        "max_dd_pct": max_dd_pct,
+        "vol_ann": vol_ann,
+        "sharpe": sharpe,
+        "win_rate": win_rate,
+        "n_days": n_days,
+        "bh_return_pct": bh_return_pct,
+        "vs_bh": total_return_pct - bh_return_pct,
+    }
+    if starting_capital is not None and starting_capital > 0:
+        stats["final_value"] = float(equity.iloc[-1]) * starting_capital
+        stats["pl_dollars"] = stats["final_value"] - starting_capital
+        stats["peak_value"] = float(cummax.max()) * starting_capital
+        stats["max_dd_dollars"] = float(drawdown.min()) * stats["peak_value"]
+    return stats
 
 
 def _backtest_stats(
@@ -311,46 +495,20 @@ def _backtest_stats(
     starting_capital: float | None = None,
 ) -> None:
     """Log final backtest statistics (P/L, drawdown, etc.). Optionally scale to starting_capital for dollar values."""
-    total_return_pct = (float(equity.iloc[-1]) - 1.0) * 100
-    n_days = len(equity)
-    years = n_days / 252.0
-    cagr = (float(equity.iloc[-1]) ** (1 / max(years, 0.01)) - 1.0) * 100 if years > 0 else 0.0
-
-    # Max drawdown
-    cummax = equity.cummax()
-    drawdown = (equity - cummax) / cummax
-    max_dd_pct = float(drawdown.min()) * 100
-
-    # Volatility (annualized)
-    vol_ann = float(strategy_returns.std() * (252 ** 0.5)) * 100
-
-    # Sharpe (annualized)
-    sharpe = strategy_returns.mean() / (strategy_returns.std() + 1e-8) * (252 ** 0.5)
-
-    # Win rate (fraction of days with positive strategy return)
-    win_rate = float((strategy_returns > 0).sum() / max(len(strategy_returns), 1)) * 100
-
-    # Buy-and-hold comparison
-    bh_equity = (1 + bh_returns.fillna(0)).cumprod()
-    bh_return_pct = (float(bh_equity.iloc[-1]) - 1.0) * 100
-
+    stats = _compute_backtest_stats(equity, strategy_returns, bh_returns, starting_capital)
     logger.info("--- Backtest final stats ---")
-    if starting_capital is not None and starting_capital > 0:
-        final_value = float(equity.iloc[-1]) * starting_capital
-        pl_dollars = final_value - starting_capital
-        peak_value = float(cummax.max()) * starting_capital
-        max_dd_dollars = float(drawdown.min()) * peak_value  # negative
-        logger.info("Starting capital: $%.2f  Final value: $%.2f  P/L: $%+.2f", starting_capital, final_value, pl_dollars)
-        logger.info("Peak value: $%.2f  Max drawdown: $%.2f (%.2f%%)", peak_value, max_dd_dollars, max_dd_pct)
-    logger.info("Total return (P/L): %.2f%%", total_return_pct)
-    logger.info("CAGR: %.2f%%", cagr)
-    logger.info("Max drawdown: %.2f%%", max_dd_pct)
-    logger.info("Volatility (ann.): %.2f%%", vol_ann)
-    logger.info("Sharpe ratio: %.3f", sharpe)
-    logger.info("Win rate (days): %.1f%%", win_rate)
-    logger.info("Trading days: %d", n_days)
-    logger.info("Buy-and-hold return: %.2f%%", bh_return_pct)
-    logger.info("Strategy vs B&H: %+.2f%%", total_return_pct - bh_return_pct)
+    if starting_capital is not None and starting_capital > 0 and "final_value" in stats:
+        logger.info("Starting capital: $%.2f  Final value: $%.2f  P/L: $%+.2f", starting_capital, stats["final_value"], stats["pl_dollars"])
+        logger.info("Peak value: $%.2f  Max drawdown: $%.2f (%.2f%%)", stats["peak_value"], stats["max_dd_dollars"], stats["max_dd_pct"])
+    logger.info("Total return (P/L): %.2f%%", stats["total_return_pct"])
+    logger.info("CAGR: %.2f%%", stats["cagr"])
+    logger.info("Max drawdown: %.2f%%", stats["max_dd_pct"])
+    logger.info("Volatility (ann.): %.2f%%", stats["vol_ann"])
+    logger.info("Sharpe ratio: %.3f", stats["sharpe"])
+    logger.info("Win rate (days): %.1f%%", stats["win_rate"])
+    logger.info("Trading days: %d", stats["n_days"])
+    logger.info("Buy-and-hold return: %.2f%%", stats["bh_return_pct"])
+    logger.info("Strategy vs B&H: %+.2f%%", stats["vs_bh"])
     logger.info("----------------------------")
 
 
@@ -359,7 +517,8 @@ def _proxy_specialists_from_returns(
 ) -> dict:
     """
     Derive proxy specialist outputs from rolling returns for backtest (no API).
-    Returns dict with sentiment, quant_prob, fund_score, regime_flag, momentum_score, and
+    Returns dict with sentiment, quant_prob, fund_score, regime_flag, momentum_score,
+    mean_reversion_score, volatility_score, event_risk_score, and
     optional rolling_return_5d, rolling_return_21d, rolling_vol_21d.
     Uses momentum/mean-reversion as proxies for sentiment and fundamental.
     """
@@ -367,7 +526,16 @@ def _proxy_specialists_from_returns(
 
     lookback = returns.iloc[max(0, start - window) : start]
     if lookback.empty or lookback.isna().all():
-        out = {"sentiment": 0.0, "quant_prob": 0.5, "fund_score": 0.0, "regime_flag": 0.5, "momentum_score": 0.0}
+        out = {
+            "sentiment": 0.0,
+            "quant_prob": 0.5,
+            "fund_score": 0.0,
+            "regime_flag": 0.5,
+            "momentum_score": 0.0,
+            "mean_reversion_score": 0.0,
+            "volatility_score": 0.5,
+            "event_risk_score": 0.0,
+        }
         if ENV_OBS_ROLLING_FEATURES:
             out.update({"rolling_return_5d": 0.0, "rolling_return_21d": 0.0, "rolling_vol_21d": 0.0})
         return out
@@ -385,8 +553,20 @@ def _proxy_specialists_from_returns(
     sentiment_proxy = max(-0.5, min(0.5, mean_ret * 12))
     fund_score_proxy = max(-0.5, min(0.5, -mean_ret * 15))
     momentum_proxy = max(-1, min(1, mean_ret * 15))
+    mean_reversion_proxy = max(-0.5, min(0.5, -mean_ret * 20))
+    volatility_proxy = max(0.0, min(1.0, (vol_norm + 0.5)))
+    event_risk_proxy = 0.0
 
-    out = {"sentiment": sentiment_proxy, "quant_prob": quant_prob, "fund_score": fund_score_proxy, "regime_flag": regime_flag, "momentum_score": momentum_proxy}
+    out = {
+        "sentiment": sentiment_proxy,
+        "quant_prob": quant_prob,
+        "fund_score": fund_score_proxy,
+        "regime_flag": regime_flag,
+        "momentum_score": momentum_proxy,
+        "mean_reversion_score": mean_reversion_proxy,
+        "volatility_score": volatility_proxy,
+        "event_risk_score": event_risk_proxy,
+    }
     if ENV_OBS_ROLLING_FEATURES:
         ret_5d = float(lookback.tail(5).mean()) if len(lookback) >= 5 else mean_ret
         ret_21d = float(lookback.tail(21).mean()) if len(lookback) >= 21 else mean_ret
@@ -397,6 +577,90 @@ def _proxy_specialists_from_returns(
         out["rolling_return_21d"] = max(-1, min(1, ret_21d * 50))
         out["rolling_vol_21d"] = max(-1, min(1, (vol_21d - 0.01) * 50))
     return out
+
+
+def _run_backtest(
+    tickers: list[str],
+    trader: PPOTrader,
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, list, list, list[list[tuple[str, float]]]] | None:
+    """
+    Load aligned data, run backtest loop with trader. Return (equity, strategy_returns, bh_returns,
+    equity_dollars, rebalance_dates, rebalance_direction, rebalance_trades) or None if insufficient data.
+    """
+    from .data.loader import load_ohlcv
+
+    dfs: list[pd.DataFrame] = []
+    for t in tickers:
+        df = load_ohlcv(t, lookback_years=3)
+        if df.empty or len(df) < 252:
+            return None
+        df = df[["close"]].copy()
+        df.columns = [t]
+        df["return_" + t] = df[t].pct_change()
+        dfs.append(df)
+    aligned = dfs[0]
+    for df in dfs[1:]:
+        aligned = aligned.join(df, how="inner")
+    aligned = aligned.dropna(how="all").tail(252 * 2)
+    if len(aligned) < 252:
+        return None
+
+    n_assets = len(tickers)
+    return_cols = ["return_" + t for t in tickers]
+    n = len(aligned)
+    window = 21
+    strategy_returns = pd.Series(0.0, index=aligned.index, dtype=float)
+    rebalance_dates: list = []
+    rebalance_direction: list = []
+    rebalance_trades: list[list[tuple[str, float]]] = []
+    prev_position_sum: float | None = None
+    prev_weights: np.ndarray | None = None
+
+    for start in range(0, n, window):
+        specialist_list = [
+            _proxy_specialists_from_returns(aligned[ret_col], start, window)
+            for ret_col in return_cols
+        ]
+        action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
+        action = np.array(action, dtype=np.float64)
+        if not ENV_ALLOW_CASH_EXPOSURE:
+            action = np.array([_position_used(float(a)) for a in action])
+        exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
+        position_sum = exposure
+        trades: list[tuple[str, float]] = []
+        if prev_weights is None:
+            for i in range(n_assets):
+                if weights[i] > 1e-6:
+                    trades.append((tickers[i], float(weights[i] * 100)))
+        else:
+            for i in range(n_assets):
+                delta = weights[i] - prev_weights[i]
+                if abs(delta) > 1e-6:
+                    trades.append((tickers[i], float(delta * 100)))
+        rebalance_dates.append(aligned.index[start])
+        if prev_position_sum is not None:
+            rebalance_direction.append(1 if position_sum > prev_position_sum else -1)
+        else:
+            rebalance_direction.append(1 if position_sum > 0 else 0)
+        rebalance_trades.append(trades)
+        prev_position_sum = position_sum
+        prev_weights = weights.copy()
+        for day in range(start, min(start + window, n)):
+            basket_ret = sum(weights[i] * aligned[return_cols[i]].iloc[day] for i in range(n_assets))
+            strategy_returns.iloc[day] = exposure * basket_ret
+    strategy_returns = strategy_returns.fillna(0)
+    equity = (1 + strategy_returns).cumprod()
+    equity_dollars = equity * STARTING_CAPITAL
+    bh_returns = aligned[return_cols].mean(axis=1)
+    return (
+        equity,
+        strategy_returns.dropna(),
+        bh_returns,
+        equity_dollars,
+        rebalance_dates,
+        rebalance_direction,
+        rebalance_trades,
+    )
 
 
 def cmd_tune(args: argparse.Namespace) -> None:
@@ -433,9 +697,6 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     """Backtest portfolio (5 tickers) with trained models; save performance plot."""
     from datetime import datetime
 
-    import numpy as np
-
-    from .data.loader import load_ohlcv
     from .meta_learner import PPOTrader
     from .utils.plotting import save_performance_plot
 
@@ -445,88 +706,48 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
         return
 
-    logger.info("Running portfolio backtest for %s...", tickers)
-
-    dfs: list[pd.DataFrame] = []
-    for t in tickers:
-        df = load_ohlcv(t, lookback_years=3)
-        if df.empty or len(df) < 252:
-            logger.error("Insufficient data for backtest: %s", t)
+    model_path: Path | None = None
+    if getattr(args, "model", None):
+        model_path = _resolve_backtest_model_path(args.model)
+        if model_path is None:
+            logger.error("Model not found: %s", args.model)
             return
-        df = df[["close"]].copy()
-        df.columns = [t]
-        df["return_" + t] = df[t].pct_change()
-        dfs.append(df)
+    elif sys.stdin.isatty():
+        models = _list_meta_models()
+        if not models:
+            logger.error("No PPO models found in %s. Run 'train' first.", META_LEARNER_MODEL_DIR)
+            return
+        print("Available models (newest first):")
+        for i, (p, mtime) in enumerate(models, 1):
+            ts = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            print("  %d. %s  (%s)" % (i, p.name, ts))
+        try:
+            raw = input("Select model (1-%d or path): " % len(models)).strip()
+        except EOFError:
+            raw = ""
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(models):
+                model_path = models[idx - 1][0]
+        elif raw:
+            model_path = _resolve_backtest_model_path(raw)
+        if model_path is None and raw:
+            logger.warning("Invalid selection; using default model.")
+    else:
+        default_path = META_LEARNER_MODEL_DIR / "ppo_trader.zip"
+        if default_path.exists():
+            logger.info("Using default model: %s", default_path.name)
+        else:
+            logger.warning("Default model %s not found; backtest may use no/empty policy.", default_path.name)
 
-    aligned = dfs[0]
-    for df in dfs[1:]:
-        aligned = aligned.join(df, how="inner")
-    aligned = aligned.dropna(how="all").tail(252 * 2)
-    if len(aligned) < 252:
-        logger.error("Insufficient aligned data for backtest")
+    trader = PPOTrader(n_assets=n_assets, model_path=model_path) if model_path else PPOTrader(n_assets=n_assets)
+
+    logger.info("Running portfolio backtest for %s...", tickers)
+    result = _run_backtest(tickers, trader)
+    if result is None:
+        logger.error("Insufficient data for backtest")
         return
-
-    return_cols = ["return_" + t for t in tickers]
-    n = len(aligned)
-    window = 21
-    trader = PPOTrader(n_assets=n_assets)
-
-    strategy_returns = pd.Series(0.0, index=aligned.index, dtype=float)
-    rebalance_dates: list = []
-    rebalance_direction: list = []
-    rebalance_trades: list[list[tuple[str, float]]] = []
-    prev_position_sum: float | None = None
-    prev_weights: np.ndarray | None = None
-
-    for start in range(0, n, window):
-        end = min(start + window, n)
-        specialist_list: list[dict] = []
-        for t, ret_col in zip(tickers, return_cols):
-            ret_series = aligned[ret_col]
-            specialist_list.append(_proxy_specialists_from_returns(ret_series, start, window))
-        if is_debug():
-            _verify_specialist_outputs(specialist_list, tickers)
-        action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
-        action = np.array(action, dtype=np.float64)
-        if not ENV_ALLOW_CASH_EXPOSURE:
-            action = np.array([_position_used(float(a)) for a in action])
-        exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
-        position_sum = exposure
-
-        trades: list[tuple[str, float]] = []
-        if prev_weights is None:
-            for i in range(n_assets):
-                if weights[i] > 1e-6:
-                    trades.append((tickers[i], float(weights[i] * 100)))
-        else:
-            for i in range(n_assets):
-                delta = weights[i] - prev_weights[i]
-                if abs(delta) > 1e-6:
-                    trades.append((tickers[i], float(delta * 100)))
-
-        rebalance_dates.append(aligned.index[start])
-        if prev_position_sum is not None:
-            rebalance_direction.append(1 if position_sum > prev_position_sum else -1)
-        else:
-            rebalance_direction.append(1 if position_sum > 0 else 0)
-        rebalance_trades.append(trades)
-        prev_position_sum = position_sum
-        prev_weights = weights.copy()
-
-        for day in range(start, end):
-            basket_ret = sum(
-                weights[i] * aligned[return_cols[i]].iloc[day]
-                for i in range(n_assets)
-            )
-            day_ret = exposure * basket_ret
-            strategy_returns.iloc[day] = day_ret
-    strategy_returns = strategy_returns.fillna(0)
-
-    equity = (1 + strategy_returns).cumprod()
-    equity_dollars = equity * STARTING_CAPITAL
-    bh_returns = aligned[return_cols].mean(axis=1)
-    bh_equity = (1 + bh_returns.fillna(0)).cumprod()
-    returns = strategy_returns.dropna()
+    equity, returns, bh_returns, equity_dollars, rebalance_dates, rebalance_direction, rebalance_trades = result
 
     _backtest_stats(equity, returns, bh_returns, starting_capital=STARTING_CAPITAL)
     plot_filename = f"backtest_portfolio_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
@@ -856,6 +1077,12 @@ def main() -> None:
     train_p.add_argument("--use-tuned", action="store_true", help="Use hyperparameters from previous 'tune' run")
     train_p.set_defaults(func=cmd_train)
 
+    benchmark_p = sub.add_parser("benchmark-device", help="Compare PPO training speed: CPU vs GPU (short run, no model saved)")
+    benchmark_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: TRADE_TICKERS)")
+    benchmark_p.add_argument("--timesteps", type=int, default=20_000, help="Timesteps per device (default: 20000)")
+    benchmark_p.add_argument("--use-historical", action="store_true", help="Use historical returns env (matches train with --use-historical)")
+    benchmark_p.set_defaults(func=cmd_benchmark_device)
+
     tune_p = sub.add_parser("tune", help="Run Optuna hyperparameter tuning for PPO")
     _add_debug(tune_p)
     tune_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
@@ -867,6 +1094,7 @@ def main() -> None:
     back_p = sub.add_parser("backtest", help="Backtest portfolio with trained models")
     _add_debug(back_p)
     back_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
+    back_p.add_argument("--model", type=str, default=None, help="PPO model file (e.g. ppo_trader_2026-02-07.zip). If omitted and TTY, prompt to choose.")
     back_p.set_defaults(func=cmd_backtest)
 
     paper_p = sub.add_parser("paper", help="Paper trading loop")

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Boardroom is a hierarchical multi-agent trading system. Five specialist agents analyze the market independently (per ticker). Their outputs are fed into a PPO meta-learner that decides position sizing for a configurable list of symbols (default: 5 stocks).
+The Boardroom is a hierarchical multi-agent trading system. Eight specialist agents analyze the market independently (per ticker). Their outputs are fed into a PPO meta-learner that decides position sizing for a configurable list of symbols (default: 5 stocks).
 
 The system trades a configurable list of tickers (see `TRADE_TICKERS` in config; default: SPY, AAPL, MSFT, GOOGL, NVDA). Override via `--tickers SPY,AAPL,...` on the CLI. Training, backtest, paper, and live all use this list.
 
@@ -16,6 +16,9 @@ yfinance (OHLCV, fundamentals, news) per ticker
     +---> Fundamental Specialist (XGBoost) --> intrinsic_value_score
     +---> Regime Specialist (VAE on SPY) --> regime, regime_flag (shared)
     +---> Momentum Specialist (LightGBM) --> momentum_score (short-horizon)
+    +---> Mean-Reversion Specialist (rule-based) --> mean_reversion_score (oversold/overbought)
+    +---> Volatility Specialist (rule-based) --> volatility_score (per-asset risk)
+    +---> Earnings/Event Risk Specialist (rule-based) --> event_risk_score (days to earnings)
     |
     v
 Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
@@ -58,10 +61,31 @@ Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
 - **Output**: momentum_score [-1, 1] (short-term trend strength/direction)
 - **Logic**: Train on TRADE_TICKERS; target = forward 5d return clipped to [-1, 1]; one scalar per ticker
 
+### Mean-Reversion Specialist
+
+- **Model**: Rule-based (RSI + Z-score)
+- **Input**: OHLCV from yfinance
+- **Output**: mean_reversion_score [-1, 1] (oversold=1, overbought=-1)
+- **Logic**: RSI and Z-score of price vs 20d SMA; no training required
+
+### Volatility Specialist
+
+- **Model**: Rule-based (rolling realized vol)
+- **Input**: OHLCV from yfinance
+- **Output**: volatility_score [0, 1] (higher = higher recent volatility)
+- **Logic**: 21d vol vs 252d vol ratio; no training required
+
+### Earnings/Event Risk Specialist
+
+- **Model**: Rule-based (calendar)
+- **Input**: Earnings dates from yfinance get_earnings_dates()
+- **Output**: event_risk_score [0, 1] (higher = closer to next earnings)
+- **Logic**: Ramp from 0 when >21 days away to 1 when 0-3 days before; no training required
+
 ## Meta-Learner
 
 - **Model**: PPO (stable-baselines3)
-- **Observation**: Per-asset specialist features + holdings + optional rolling features. Length = 9 \* n_assets when `ENV_OBS_ROLLING_FEATURES` is true: for each asset (sentiment, quant_prob, fund_score, regime_flag, momentum_score, holdings, rolling_return_5d, rolling_return_21d, rolling_vol_21d). Example: 45-dim for 5 assets.
+- **Observation**: Per-asset specialist features + holdings + optional rolling features. Length = 12 \* n_assets when `ENV_OBS_ROLLING_FEATURES` is true: for each asset (sentiment, quant_prob, fund_score, regime_flag, momentum_score, mean_reversion_score, volatility_score, event_risk_score, holdings, rolling_return_5d, rolling_return_21d, rolling_vol_21d). Example: 60-dim for 5 assets.
 - **Action**: Position size % per asset [0, 1]; n_assets outputs (e.g. 5). When `ENV_ALLOW_CASH_EXPOSURE` is true, the **sum** of actions is interpreted as total market exposure (capped at 1); the rest stays in cash (0 return).
 - **Reward**: Portfolio rolling Sharpe ratio minus drawdown penalty (configurable via `ENV_REWARD_DRAWDOWN_PENALTY`).
 - **Training**: Two modes: synthetic `TradingEnv` (random returns) or `HistoricalTradingEnv` (real OHLCV returns). Use `--use-historical` for real data.
@@ -78,7 +102,7 @@ trading_system/
   config.py         - Configuration (loads from .env)
   main.py           - CLI: train, tune, backtest, paper, live
   data/             - Loader, news scraper, processor
-  agents/           - sentiment, quantitative, fundamental, regime, momentum
+  agents/           - sentiment, quantitative, fundamental, regime, momentum, mean_reversion, volatility, earnings_event
   meta_learner/     - Gym env (TradingEnv, HistoricalTradingEnv), PPO trader, Optuna tuner
   universe/         - Universe provider, features, ScorerModel, selector, autodiscover pipeline
   broker/           - Alpaca integration, Discord notifications

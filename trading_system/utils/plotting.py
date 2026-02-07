@@ -26,7 +26,8 @@ def save_performance_plot(
     When rebalance_trades is provided, show ticker and +/- % for each trade above markers.
     No plt.show() - headless only.
     """
-    fig, axes = plt.subplots(2 if returns is not None else 1, 1, figsize=(12, 6))
+    n_axes = 2 if returns is not None else 1
+    fig, axes = plt.subplots(n_axes, 1, figsize=(16, 5 * n_axes))
     if returns is None:
         axes = [axes]
 
@@ -79,10 +80,10 @@ def save_performance_plot(
                     axes[0].annotate(
                         label,
                         xy=(d, v),
-                        xytext=(0, 10),
+                        xytext=(0, 14),
                         textcoords="offset points",
                         ha="center",
-                        fontsize=7,
+                        fontsize=8,
                         alpha=0.9,
                     )
         if decrease_dates:
@@ -93,10 +94,10 @@ def save_performance_plot(
                     axes[0].annotate(
                         label,
                         xy=(d, v),
-                        xytext=(0, -12),
+                        xytext=(0, -16),
                         textcoords="offset points",
                         ha="center",
-                        fontsize=7,
+                        fontsize=8,
                         alpha=0.9,
                     )
         if neutral_dates:
@@ -107,13 +108,17 @@ def save_performance_plot(
                     axes[0].annotate(
                         label,
                         xy=(d, v),
-                        xytext=(0, 10),
+                        xytext=(0, 14),
                         textcoords="offset points",
                         ha="center",
-                        fontsize=7,
+                        fontsize=8,
                         alpha=0.9,
                     )
         axes[0].legend(loc="best", fontsize=8)
+        # Leave vertical room so rebalance labels (increase above, decrease below) are not clipped
+        ymin, ymax = axes[0].get_ylim()
+        pad = max((ymax - ymin) * 0.12, (equity_curve.max() - equity_curve.min()) * 0.05)
+        axes[0].set_ylim(ymin - pad, ymax + pad)
 
     if returns is not None:
         axes[1].hist(returns.dropna(), bins=50, edgecolor="black", alpha=0.7)
@@ -123,7 +128,7 @@ def save_performance_plot(
 
     plt.tight_layout()
     out_path = OUTPUT_DIR / filename
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
     plt.close()
     return out_path
 
