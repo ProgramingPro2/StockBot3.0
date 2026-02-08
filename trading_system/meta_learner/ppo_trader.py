@@ -31,7 +31,7 @@ from ..config import (
     PPO_NET_ARCH,
     PPO_N_STEPS,
 )
-from .env import HistoricalTradingEnv, TradingEnv
+from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
 
 
 def _get_ppo_device() -> str:
@@ -84,13 +84,16 @@ class PPOTrader:
         total_timesteps: int = 500_000,
         specialist_fn=None,
         historical_returns: np.ndarray | None = None,
+        historical_ratio: float = 0.0,
         ppo_kwargs: dict[str, Any] | None = None,
     ) -> Path | None:
         """
         Train PPO on simulated or historical episodes.
         specialist_fn: callable() -> list[dict] of length n_assets; each dict has
             sentiment, quant_prob, fund_score, regime_flag.
-        historical_returns: if provided, shape (n_days, n_assets), use HistoricalTradingEnv.
+        historical_returns: if provided, shape (n_days, n_assets), used for HistoricalTradingEnv.
+        historical_ratio: fraction of episodes on historical data (0.0 = synthetic only,
+            1.0 = historical only, 0.5 = 50/50 mixed).
         ppo_kwargs: optional overrides for PPO hyperparameters (e.g. from tuning).
         """
         import numpy as np
@@ -118,12 +121,7 @@ class PPOTrader:
                 "Training with tuned params (baseline eval reward: %.4f)", best_value
             )
 
-        if historical_returns is not None:
-            env = HistoricalTradingEnv(
-                returns_array=historical_returns,
-                n_assets=self.n_assets,
-            )
-        else:
+        def _make_synthetic_env():
             def _reset_fn():
                 if specialist_fn:
                     outputs = specialist_fn()
@@ -139,7 +137,33 @@ class PPOTrader:
                     opts.update(_reset_fn())
                     return super().reset(seed=seed, options=opts)
 
-            env = SpecialistWrapper(n_assets=self.n_assets)
+            return SpecialistWrapper(n_assets=self.n_assets)
+
+        if historical_returns is not None and historical_ratio >= 1.0:
+            env = HistoricalTradingEnv(
+                returns_array=historical_returns,
+                n_assets=self.n_assets,
+            )
+            logging.getLogger("boardroom").info("PPO training mode: 100%% historical")
+        elif historical_returns is not None and 0 < historical_ratio < 1:
+            historical_env = HistoricalTradingEnv(
+                returns_array=historical_returns,
+                n_assets=self.n_assets,
+            )
+            synthetic_env = _make_synthetic_env()
+            env = MixedDataEnv(
+                historical_env=historical_env,
+                synthetic_env=synthetic_env,
+                historical_ratio=historical_ratio,
+            )
+            logging.getLogger("boardroom").info(
+                "PPO training mode: mixed (%.0f%% historical, %.0f%% synthetic)",
+                historical_ratio * 100,
+                (1 - historical_ratio) * 100,
+            )
+        else:
+            env = _make_synthetic_env()
+            logging.getLogger("boardroom").info("PPO training mode: 100%% synthetic")
 
         device = _get_ppo_device()
         if device == "cpu":

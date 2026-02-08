@@ -2,6 +2,7 @@
 Discord webhook notifications for trades.
 """
 import json
+import math
 from pathlib import Path
 
 import requests
@@ -129,4 +130,55 @@ def send_training_complete_embed(
         return True
     except Exception as e:
         logger.warning("Discord training-complete notification failed: %s", e)
+        return False
+
+
+def send_hpo_complete_embed(
+    n_trials: int,
+    n_tickers: int,
+    timesteps_per_trial: int,
+    best_params: dict,
+    best_value: float | None = None,
+) -> bool:
+    """
+    Send an embedded Discord message for HPO (hyperparameter optimization) complete.
+    best_params: dict from run_tuning (learning_rate, n_steps, gamma, etc.).
+    best_value: best eval reward from Optuna study, if available.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return False
+
+    pk = best_params.get("policy_kwargs") or {}
+    net_arch = pk.get("net_arch") or {}
+    arch_str = str(net_arch) if net_arch else "default"
+
+    fields = [
+        {"name": "Trials", "value": str(n_trials), "inline": True},
+        {"name": "Tickers", "value": str(n_tickers), "inline": True},
+        {"name": "Timesteps/trial", "value": f"{timesteps_per_trial:,}", "inline": True},
+        {"name": "Best eval reward", "value": f"{best_value:.4f}" if best_value is not None and not math.isnan(best_value) else "N/A", "inline": True},
+        {"name": "Learning rate", "value": f"{best_params.get('learning_rate', 0):.2e}", "inline": True},
+        {"name": "n_steps", "value": str(best_params.get("n_steps", "")), "inline": True},
+        {"name": "gamma", "value": f"{best_params.get('gamma', 0):.4f}", "inline": True},
+        {"name": "Clip range", "value": f"{best_params.get('clip_range', 0):.3f}", "inline": True},
+        {"name": "Net arch", "value": arch_str, "inline": False},
+    ]
+
+    payload = {
+        "embeds": [
+            {
+                "title": "HPO complete",
+                "color": 0x9B59B6,
+                "fields": fields,
+                "footer": {"text": "The Boardroom Trading System"},
+            }
+        ]
+    }
+
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.warning("Discord HPO notification failed: %s", e)
         return False

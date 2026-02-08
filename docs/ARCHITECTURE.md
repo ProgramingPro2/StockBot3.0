@@ -88,7 +88,7 @@ Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
 - **Observation**: Per-asset specialist features + holdings + optional rolling features. Length = 12 \* n_assets when `ENV_OBS_ROLLING_FEATURES` is true: for each asset (sentiment, quant_prob, fund_score, regime_flag, momentum_score, mean_reversion_score, volatility_score, event_risk_score, holdings, rolling_return_5d, rolling_return_21d, rolling_vol_21d). Example: 60-dim for 5 assets.
 - **Action**: Position size % per asset [0, 1]; n_assets outputs (e.g. 5). When `ENV_ALLOW_CASH_EXPOSURE` is true, the **sum** of actions is interpreted as total market exposure (capped at 1); the rest stays in cash (0 return).
 - **Reward**: Portfolio rolling Sharpe ratio minus drawdown penalty (configurable via `ENV_REWARD_DRAWDOWN_PENALTY`).
-- **Training**: Two modes: synthetic `TradingEnv` (random returns) or `HistoricalTradingEnv` (real OHLCV returns). Use `--use-historical` for real data.
+- **Training**: Three modes: synthetic `TradingEnv` (random returns), `HistoricalTradingEnv` (real OHLCV returns), or `MixedDataEnv` (configurable blend). Use `--use-historical` for 100% historical, `--historical-ratio 0.7` for 70% historical / 30% synthetic, or `TRAIN_HISTORICAL_RATIO` in config. Mixed training lets the model learn both generalizable strategies and real market dynamics.
 - **Tuning**: Run `tune` for Optuna-based hyperparameter optimization; use `--use-tuned` when training.
 
 ### Variable Exposure and Cash
@@ -113,7 +113,7 @@ trading_system/
 
 ## Trading Modes
 
-**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` to train on real returns, `--use-tuned` to apply tuned hyperparameters.
+**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` for pure historical returns, `--historical-ratio 0.7` for mixed (70% historical, 30% synthetic), or `TRAIN_HISTORICAL_RATIO` in config. Use `--use-tuned` to apply tuned hyperparameters.
 
 **Tune**: Run Optuna hyperparameter tuning on historical data. Best params saved to `models/meta_learner/ppo_tune_best.json`.
 

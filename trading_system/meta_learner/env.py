@@ -411,3 +411,52 @@ class HistoricalTradingEnv(gym.Env):
 
     def close(self) -> None:
         pass
+
+
+class MixedDataEnv(gym.Env):
+    """
+    Trading environment that mixes historical and synthetic data.
+    On each reset(), randomly selects HistoricalTradingEnv or TradingEnv (with specialist_fn)
+    based on historical_ratio. Allows the model to learn both real market dynamics and
+    generalizable strategies from synthetic data.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        historical_env: HistoricalTradingEnv,
+        synthetic_env: TradingEnv,
+        historical_ratio: float,
+    ):
+        super().__init__()
+        if not 0 <= historical_ratio <= 1:
+            raise ValueError("historical_ratio must be in [0, 1]")
+        self.historical_env = historical_env
+        self.synthetic_env = synthetic_env
+        self.historical_ratio = historical_ratio
+        self._current = historical_env
+
+        self.observation_space = historical_env.observation_space
+        self.action_space = historical_env.action_space
+        self.np_random = np.random.default_rng()
+
+    def reset(
+        self, seed: int | None = None, options: dict | None = None
+    ) -> tuple[np.ndarray, dict]:
+        super().reset(seed=seed)
+        if self.np_random.random() < self.historical_ratio:
+            self._current = self.historical_env
+        else:
+            self._current = self.synthetic_env
+        return self._current.reset(seed=seed, options=options)
+
+    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
+        return self._current.step(action)
+
+    def render(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.historical_env.close()
+        self.synthetic_env.close()

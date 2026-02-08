@@ -135,6 +135,9 @@ PPO_CHECKPOINT_FREQ = int(os.getenv("PPO_CHECKPOINT_FREQ", "100000"))
 # CPU threads for PPO when device=cpu; 0 = use all available
 PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 
+# PPO training: fraction of episodes on historical vs synthetic data (0.0 = synthetic only, 1.0 = historical only)
+TRAIN_HISTORICAL_RATIO = float(os.getenv("TRAIN_HISTORICAL_RATIO", "0.0"))
+
 # Environment
 ENV_ROLLING_SHARPE_DAYS = 252
 ENV_EPISODE_DAYS = int(os.getenv("ENV_EPISODE_DAYS", "42"))  # ~2 months; was 21

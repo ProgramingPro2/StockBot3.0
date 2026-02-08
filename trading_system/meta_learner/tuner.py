@@ -95,7 +95,7 @@ def run_tuning(
     n_timesteps: int = 100_000,
     n_evaluations: int = 5,
     n_eval_episodes: int = 5,
-    timeout: int | None = 3600,
+    timeout: int | None = None,
 ) -> dict[str, Any]:
     """
     Run Optuna hyperparameter tuning.

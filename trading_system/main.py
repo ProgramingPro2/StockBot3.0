@@ -37,6 +37,7 @@ from .config import (
     SPECIALIST_CACHE_DIR,
     SPECIALIST_CACHE_MAX_AGE_HOURS,
     STARTING_CAPITAL,
+    TRAIN_HISTORICAL_RATIO,
     TRADE_LIST_SIZE,
     TRADE_TICKERS,
 )
@@ -273,14 +274,23 @@ def cmd_train(args: argparse.Namespace) -> None:
     ensure_regime(retrain=args.retrain)
     ensure_momentum(tickers, retrain=args.retrain)
 
+    historical_ratio = getattr(args, "historical_ratio", None)
+    if historical_ratio is not None:
+        pass
+    elif getattr(args, "use_historical", False):
+        historical_ratio = 1.0
+    else:
+        historical_ratio = TRAIN_HISTORICAL_RATIO
+
     historical_returns = None
-    if getattr(args, "use_historical", False):
+    if historical_ratio > 0:
         _, returns_array = _load_aligned_returns(tickers)
         if returns_array is not None:
             historical_returns = returns_array
             logger.info("Using historical returns for PPO training (%d days)", len(returns_array))
         else:
             logger.warning("Could not load historical data; falling back to synthetic env")
+            historical_ratio = 0.0
 
     logger.info("Training meta-learner (PPO)...")
     trader = PPOTrader(n_assets=n_assets, load=not args.retrain)
@@ -365,6 +375,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         total_timesteps=args.timesteps,
         specialist_fn=specialist_fn_for_train,
         historical_returns=historical_returns,
+        historical_ratio=historical_ratio,
         ppo_kwargs=ppo_kwargs,
     )
     logger.info("Training complete. Models saved.")
@@ -687,6 +698,18 @@ def cmd_tune(args: argparse.Namespace) -> None:
         timeout=args.timeout if args.timeout > 0 else None,
     )
     logger.info("Tuning complete. Best params saved to %s", PPO_TUNE_PARAMS_PATH)
+    try:
+        from .broker.discord_notifier import send_hpo_complete_embed
+        if send_hpo_complete_embed(
+            n_trials=args.n_trials,
+            n_tickers=n_assets,
+            timesteps_per_trial=args.timesteps,
+            best_params=best,
+            best_value=best.get("best_value"),
+        ):
+            logger.info("Sent HPO-complete notification to Discord")
+    except Exception as exc:
+        logger.debug("Discord webhook not configured or HPO notification failed: %s", exc)
     for k, v in best.items():
         if k != "policy_kwargs":
             logger.info("  %s: %s", k, v)
@@ -1073,7 +1096,8 @@ def main() -> None:
     train_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     train_p.add_argument("--retrain", action="store_true", help="Force retrain specialists")
     train_p.add_argument("--timesteps", type=int, default=500_000, help="PPO timesteps")
-    train_p.add_argument("--use-historical", action="store_true", help="Train PPO on real historical returns instead of synthetic")
+    train_p.add_argument("--use-historical", action="store_true", help="Train PPO on real historical returns only (equivalent to --historical-ratio 1.0)")
+    train_p.add_argument("--historical-ratio", type=float, default=None, help="Fraction of episodes on historical vs synthetic data (0.0-1.0). Overrides config TRAIN_HISTORICAL_RATIO. 0.5 = 50%% historical, 50%% synthetic.")
     train_p.add_argument("--use-tuned", action="store_true", help="Use hyperparameters from previous 'tune' run")
     train_p.set_defaults(func=cmd_train)
 
@@ -1088,7 +1112,7 @@ def main() -> None:
     tune_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
     tune_p.add_argument("--n-trials", type=int, default=50, help="Number of Optuna trials")
     tune_p.add_argument("--timesteps", type=int, default=100_000, help="PPO timesteps per trial")
-    tune_p.add_argument("--timeout", type=int, default=3600, help="Max seconds for tuning (None = no limit)")
+    tune_p.add_argument("--timeout", type=int, default=0, help="Max seconds for tuning (0 = no limit, default)")
     tune_p.set_defaults(func=cmd_tune)
 
     back_p = sub.add_parser("backtest", help="Backtest portfolio with trained models")

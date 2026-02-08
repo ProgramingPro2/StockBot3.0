@@ -46,6 +46,8 @@ ollama pull gpt-oss:20b
    DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
    ```
 
+Discord notifications are sent for: trades (paper/live), training complete (runs >1M steps), and HPO complete (after `tune` finishes).
+
 ## Usage
 
 Run from the **project root** (`StockBot3.0`), not from inside `trading_system/`:
@@ -79,10 +81,11 @@ Options:
 - `--tickers`: Comma-separated tickers (default: config `TRADE_TICKERS`)
 - `--retrain`: Force retrain specialists (default: false)
 - `--timesteps`: PPO training timesteps (default: 500000)
-- `--use-historical`: Train PPO on real historical returns instead of synthetic (recommended)
+- `--use-historical`: Train PPO on real historical returns only (equivalent to `--historical-ratio 1.0`)
+- `--historical-ratio`: Fraction of episodes on historical vs synthetic data (0.0-1.0). 0.5 = 50% historical, 50% synthetic. Use mixed training to learn both real market dynamics and generalizable strategies.
 - `--use-tuned`: Use hyperparameters from a previous `tune` run
 
-Training runs specialists (TFT on all tickers, fundamental/regime as before) and the PPO meta-learner. Use `--use-historical` to align training with backtest (real market dynamics instead of synthetic returns).
+Training runs specialists (TFT on all tickers, fundamental/regime as before) and the PPO meta-learner. Use `--use-historical` for pure historical data, or `--historical-ratio 0.7` for 70% historical / 30% synthetic. Set `TRAIN_HISTORICAL_RATIO` in `.env` for a default ratio.
 
 ### Hyperparameter Tuning (Optuna)
 
@@ -97,12 +100,14 @@ Options:
 - `--tickers`: Comma-separated tickers (default: config `TRADE_TICKERS`)
 - `--n-trials`: Number of Optuna trials (default: 50)
 - `--timesteps`: PPO timesteps per trial (default: 100000)
-- `--timeout`: Max seconds for tuning; use 0 for no limit (default: 3600)
+- `--timeout`: Max seconds for tuning; 0 = no limit (default)
 
 Best parameters are saved to `trading_system/models/meta_learner/ppo_tune_best.json`. Then train with them:
 
 ```bash
 python -m trading_system train --use-historical --use-tuned --timesteps 500000
+# Or mixed training (70% historical, 30% synthetic):
+python -m trading_system train --historical-ratio 0.7 --use-tuned --timesteps 500000
 ```
 
 ### Backtest
@@ -164,6 +169,7 @@ Edit `trading_system/config.py` for:
 - `OLLAMA_URL`, `OLLAMA_MODEL`
 - `DEVICE` (cuda/cpu)
 - TFT, XGBoost, VAE, PPO hyperparameters
+- `TRAIN_HISTORICAL_RATIO`: Fraction of PPO episodes on historical vs synthetic data (0.0-1.0; default: 0.0). Overridden by `--historical-ratio` or `--use-historical`.
 - `ENV_REWARD_DRAWDOWN_PENALTY`: Penalty for drawdown in PPO reward (default: 0.5)
 - `ENV_OBS_ROLLING_FEATURES`: Include rolling return/volatility in observations (default: true)
 - `ENV_ALLOW_CASH_EXPOSURE`: When true (default), sum of PPO actions = total market exposure (capped at 1); rest stays in cash. When false, weights are normalized to 100% invested.
