@@ -82,7 +82,7 @@ Options:
 - `--retrain`: Force retrain specialists (default: false)
 - `--timesteps`: PPO training timesteps (default: 500000)
 - `--use-historical`: Train PPO on real historical returns only (equivalent to `--historical-ratio 1.0`)
-- `--historical-ratio`: Fraction of episodes on historical vs synthetic data (0.0-1.0). 0.5 = 50% historical, 50% synthetic. Use mixed training to learn both real market dynamics and generalizable strategies.
+- `--historical-ratio`: Fraction of episodes on historical vs synthetic data. For mixed mode use 0.1-0.9 (HPO samples this range). 0 = synthetic only, 1 = historical only.
 - `--use-tuned`: Use hyperparameters from a previous `tune` run
 
 Training runs specialists (TFT on all tickers, fundamental/regime as before) and the PPO meta-learner. Use `--use-historical` for pure historical data, or `--historical-ratio 0.7` for 70% historical / 30% synthetic. Set `TRAIN_HISTORICAL_RATIO` in `.env` for a default ratio.
@@ -102,7 +102,7 @@ Options:
 - `--timesteps`: PPO timesteps per trial (default: 100000)
 - `--timeout`: Max seconds for tuning; 0 = no limit (default)
 
-Best parameters are saved to `trading_system/models/meta_learner/ppo_tune_best.json`. Then train with them:
+Best parameters are saved to `trading_system/models/meta_learner/ppo_tune_best.json`, including `historical_ratio` (tuned). Then train with them:
 
 ```bash
 python -m trading_system train --use-historical --use-tuned --timesteps 500000

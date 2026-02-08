@@ -80,6 +80,7 @@ def send_training_complete_embed(
     stats: dict,
     plot_path: Path,
     dated_model_name: str | None = None,
+    historical_ratio: float | None = None,
 ) -> bool:
     """
     Send an embedded Discord message for training complete (runs over 1M steps).
@@ -101,6 +102,8 @@ def send_training_complete_embed(
         {"name": "B&H return", "value": f"{stats.get('bh_return_pct', 0):.2f}%", "inline": True},
         {"name": "Strategy vs B&H", "value": f"{stats.get('vs_bh', 0):+.2f}%", "inline": True},
     ]
+    if historical_ratio is not None:
+        fields.append({"name": "Historical ratio", "value": f"{historical_ratio:.2f}", "inline": True})
     if dated_model_name:
         fields.append({"name": "Dated model", "value": dated_model_name, "inline": False})
 
@@ -161,6 +164,7 @@ def send_hpo_complete_embed(
         {"name": "n_steps", "value": str(best_params.get("n_steps", "")), "inline": True},
         {"name": "gamma", "value": f"{best_params.get('gamma', 0):.4f}", "inline": True},
         {"name": "Clip range", "value": f"{best_params.get('clip_range', 0):.3f}", "inline": True},
+        {"name": "Historical ratio", "value": f"{best_params.get('historical_ratio', 1.0):.2f}", "inline": True},
         {"name": "Net arch", "value": arch_str, "inline": False},
     ]
 

@@ -282,6 +282,14 @@ def cmd_train(args: argparse.Namespace) -> None:
     else:
         historical_ratio = TRAIN_HISTORICAL_RATIO
 
+    user_set_ratio = (getattr(args, "historical_ratio", None) is not None) or getattr(args, "use_historical", False)
+    if not user_set_ratio and getattr(args, "use_tuned", False):
+        from .meta_learner.tuner import load_tuned_params
+        tuned = load_tuned_params()
+        if tuned and "historical_ratio" in tuned:
+            historical_ratio = tuned["historical_ratio"]
+            logger.info("Using historical_ratio from tuned params: %.2f", historical_ratio)
+
     historical_returns = None
     if historical_ratio > 0:
         _, returns_array = _load_aligned_returns(tickers)
@@ -360,7 +368,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         from .meta_learner.tuner import load_tuned_params
         ppo_kwargs = load_tuned_params()
         if ppo_kwargs:
-            # Cap n_steps so training stays fast; tuned often uses 4096 which is ~2x slower
+            ppo_kwargs = dict(ppo_kwargs)
+            ppo_kwargs.pop("historical_ratio", None)
+            ppo_kwargs.pop("best_value", None)
             tuned_n = ppo_kwargs.get("n_steps")
             if tuned_n is not None and tuned_n > PPO_N_STEPS:
                 ppo_kwargs["n_steps"] = PPO_N_STEPS
@@ -400,7 +410,10 @@ def cmd_train(args: argparse.Namespace) -> None:
                 rebalance_trades=rebalance_trades,
             )
             dated_name = dated_path.name if dated_path else None
-            if send_training_complete_embed(args.timesteps, stats, plot_path, dated_name):
+            if send_training_complete_embed(
+                args.timesteps, stats, plot_path, dated_name,
+                historical_ratio=historical_ratio,
+            ):
                 logger.info("Sent training-complete notification to Discord")
             else:
                 logger.debug("Discord webhook not configured or send failed")
@@ -1097,7 +1110,7 @@ def main() -> None:
     train_p.add_argument("--retrain", action="store_true", help="Force retrain specialists")
     train_p.add_argument("--timesteps", type=int, default=500_000, help="PPO timesteps")
     train_p.add_argument("--use-historical", action="store_true", help="Train PPO on real historical returns only (equivalent to --historical-ratio 1.0)")
-    train_p.add_argument("--historical-ratio", type=float, default=None, help="Fraction of episodes on historical vs synthetic data (0.0-1.0). Overrides config TRAIN_HISTORICAL_RATIO. 0.5 = 50%% historical, 50%% synthetic.")
+    train_p.add_argument("--historical-ratio", type=float, default=None, help="Fraction of episodes on historical vs synthetic data. For mixed mode use 0.1-0.9. 0 = synthetic only, 1 = historical only.")
     train_p.add_argument("--use-tuned", action="store_true", help="Use hyperparameters from previous 'tune' run")
     train_p.set_defaults(func=cmd_train)
 

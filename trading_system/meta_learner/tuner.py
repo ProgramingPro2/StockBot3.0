@@ -26,7 +26,9 @@ from ..config import (
     PPO_N_EPOCHS,
     PPO_N_STEPS,
 )
-from .env import HistoricalTradingEnv
+import numpy as np
+
+from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
 
 
 PPO_TUNE_PARAMS_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_best.json"
@@ -42,7 +44,7 @@ def _get_ppo_device() -> str:
 
 
 def sample_ppo_params(trial: optuna.Trial) -> dict[str, Any]:
-    """Sample PPO hyperparameters for a trial."""
+    """Sample PPO and env hyperparameters for a trial."""
     return {
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
         "n_steps": trial.suggest_categorical("n_steps", [1024, 2048, 4096]),
@@ -53,6 +55,7 @@ def sample_ppo_params(trial: optuna.Trial) -> dict[str, Any]:
         "clip_range": trial.suggest_float("clip_range", 0.1, 0.3),
         "ent_coef": trial.suggest_float("ent_coef", 1e-4, 0.1, log=True),
         "policy_kwargs": _sample_net_arch(trial),
+        "historical_ratio": trial.suggest_float("historical_ratio", 0.1, 0.9),
     }
 
 
@@ -103,10 +106,53 @@ def run_tuning(
     """
     eval_freq = max(n_timesteps // n_evaluations, 1)
 
+    def _default_specialist_fn():
+        return [
+            {
+                "sentiment": float(np.random.uniform(-1, 1)),
+                "quant_prob": float(np.random.uniform(0, 1)),
+                "fund_score": float(np.random.uniform(-1, 1)),
+                "regime_flag": float(np.random.uniform(0, 1)),
+                "momentum_score": float(np.random.uniform(-1, 1)),
+                "mean_reversion_score": float(np.random.uniform(-1, 1)),
+                "volatility_score": float(np.random.uniform(0, 1)),
+                "event_risk_score": float(np.random.uniform(0, 1)),
+            }
+            for _ in range(n_assets)
+        ]
+
+    def _make_synthetic_env():
+        def _reset_fn():
+            outputs = _default_specialist_fn()
+            return {"specialist_outputs": outputs}
+
+        class SpecialistWrapper(TradingEnv):
+            def reset(self, seed=None, options=None):
+                opts = options or {}
+                opts.update(_reset_fn())
+                return super().reset(seed=seed, options=opts)
+
+        return SpecialistWrapper(n_assets=n_assets)
+
     def objective(trial: optuna.Trial) -> float:
         params = sample_ppo_params(trial)
+        historical_ratio = params.pop("historical_ratio")
 
-        env = HistoricalTradingEnv(returns_array=returns_array, n_assets=n_assets)
+        if historical_ratio >= 1.0:
+            env = HistoricalTradingEnv(returns_array=returns_array, n_assets=n_assets)
+        elif historical_ratio > 0:
+            historical_env = HistoricalTradingEnv(
+                returns_array=returns_array, n_assets=n_assets
+            )
+            synthetic_env = _make_synthetic_env()
+            env = MixedDataEnv(
+                historical_env=historical_env,
+                synthetic_env=synthetic_env,
+                historical_ratio=historical_ratio,
+            )
+        else:
+            env = _make_synthetic_env()
+
         env = Monitor(env)
         eval_env = HistoricalTradingEnv(returns_array=returns_array, n_assets=n_assets)
         eval_env = Monitor(eval_env)
@@ -187,6 +233,7 @@ def run_tuning(
         "clip_range": raw["clip_range"],
         "ent_coef": raw["ent_coef"],
         "policy_kwargs": _net_arch_from_name(raw.get("net_arch", "small")),
+        "historical_ratio": raw.get("historical_ratio", 1.0),
     }
     if not math.isnan(best_value):
         best["best_value"] = best_value
@@ -233,7 +280,7 @@ def _previous_best_to_enqueue() -> dict[str, Any] | None:
     if any(data.get(k) is None for k in keys):
         return None
     net_arch = _net_arch_to_name(pk)
-    return {
+    result = {
         "learning_rate": data["learning_rate"],
         "n_steps": data["n_steps"],
         "batch_size": data["batch_size"],
@@ -244,6 +291,9 @@ def _previous_best_to_enqueue() -> dict[str, Any] | None:
         "ent_coef": data["ent_coef"],
         "net_arch": net_arch,
     }
+    if "historical_ratio" in data:
+        result["historical_ratio"] = data["historical_ratio"]
+    return result
 
 
 def _save_best_params(study: optuna.Study, trial: optuna.Trial) -> None:
@@ -262,6 +312,7 @@ def _save_best_params(study: optuna.Study, trial: optuna.Trial) -> None:
         "clip_range": raw["clip_range"],
         "ent_coef": raw["ent_coef"],
         "policy_kwargs": _net_arch_from_name(raw.get("net_arch", "small")),
+        "historical_ratio": raw.get("historical_ratio", 1.0),
     }
     if not math.isnan(best_value):
         best["best_value"] = best_value

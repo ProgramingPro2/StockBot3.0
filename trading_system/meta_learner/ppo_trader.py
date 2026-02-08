@@ -146,6 +146,7 @@ class PPOTrader:
             )
             logging.getLogger("boardroom").info("PPO training mode: 100%% historical")
         elif historical_returns is not None and 0 < historical_ratio < 1:
+            historical_ratio = max(0.1, min(0.9, historical_ratio))
             historical_env = HistoricalTradingEnv(
                 returns_array=historical_returns,
                 n_assets=self.n_assets,
