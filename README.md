@@ -146,6 +146,41 @@ For live trading, change to:
 ALPACA_BASE_URL=https://api.alpaca.markets
 ```
 
+### Schedule (run on startup)
+
+The scheduler is a **systemd-like supervisor**: it keeps live/paper processes running only during a time window (e.g. 9:30 AM–5 PM weekdays), restarts them if they exit in-window, and stops them outside the window. One-shot jobs (train, backtest) run at cron times. Config: `config/schedule.yaml`.
+
+**Config schema** (`config/schedule.yaml`):
+
+- **timezone**: e.g. `America/New_York` (used for window and cron).
+- **services**: Time-window "units" (live or paper). Each has `id`, `type`, `window` (`start`, `end`, `weekdays`), `options`, and optional `log` path. Example: `weekday_live` with window 09:30–17:00 Mon–Fri; child output goes to `trading_system/outputs/scheduler_weekday_live.log`.
+- **jobs**: Cron one-shot jobs (train, backtest) with `id`, `type`, `when` (cron), `options`.
+
+**Commands**:
+
+```bash
+# Run scheduler daemon in foreground (time-window services + cron one-shots)
+python -m trading_system schedule run
+# Or: schedule run --config /path/to/schedule.yaml
+
+# Show service status (in window, running, pid, log path)
+python -m trading_system schedule status
+
+# Start a service immediately, ignoring the window (for testing)
+python -m trading_system schedule run-now weekday_live
+
+# Stop a running service by id
+python -m trading_system schedule stop weekday_live
+
+# Install as systemd user service (run on login; Linux only)
+python -m trading_system schedule install --config config/schedule.yaml
+
+# Remove the service
+python -m trading_system schedule uninstall
+```
+
+For start at boot without being logged in, run once: `loginctl enable-linger $USER`. The install command writes a user unit to `~/.config/systemd/user/trading_system_schedule.service` and enables/starts it. Daemon stdout/stderr go to `trading_system/outputs/schedule.log`; each service's child process logs to its `log` path (e.g. `scheduler_weekday_live.log`).
+
 ## Data Sources
 
 Market data sources are **free**:

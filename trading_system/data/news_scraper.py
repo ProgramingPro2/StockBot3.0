@@ -64,8 +64,6 @@ def fetch_news(ticker: str, max_items: int = 20) -> list[NewsItem]:
         except Exception as e:
             logger.debug("Failed to cache news for %s: %s", ticker, e)
 
-    _throttle()
-
     def _parse_news(raw: list) -> list[NewsItem]:
         items = []
         for item in raw[:max_items]:
@@ -76,26 +74,35 @@ def fetch_news(ticker: str, max_items: int = 20) -> list[NewsItem]:
             items.append(NewsItem(title=title, summary=summary, published=published))
         return items
 
-    try:
-        raw = None
-        yf_ticker = yf.Ticker(ticker)
-        raw = yf_ticker.news
-        if not raw:
-            try:
-                search = yf.Search(ticker, news_count=max_items)
-                raw = search.news if hasattr(search, "news") else None
-            except Exception:
-                raw = None
-        if not raw:
-            return _load_cache()
+    for attempt in range(3):
+        try:
+            _throttle()
+            raw = None
+            yf_ticker = yf.Ticker(ticker)
+            raw = yf_ticker.news
+            if not raw:
+                try:
+                    search = yf.Search(ticker, news_count=max_items)
+                    raw = search.news if hasattr(search, "news") else None
+                except Exception:
+                    raw = None
+            if not raw:
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+                return _load_cache()
 
-        items = _parse_news(raw)
-        if items:
-            _save_cache(items)
-        return items
-    except Exception as e:
-        logger.warning("Failed to fetch news for %s: %s. Using cache.", ticker, e)
-        return _load_cache()
+            items = _parse_news(raw)
+            if items:
+                _save_cache(items)
+            return items
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1 + attempt)
+            else:
+                logger.warning("Failed to fetch news for %s after 3 attempts: %s. Using cache.", ticker, e)
+                return _load_cache()
+    return _load_cache()
 
 
 def news_to_text(news: list[NewsItem]) -> str:

@@ -3,6 +3,8 @@ Earnings/Event Risk Specialist: Calendar-based event risk score.
 Higher when closer to next earnings date.
 Rule-based; no training required.
 """
+import io
+import contextlib
 from datetime import datetime, timezone
 
 import yfinance as yf
@@ -21,7 +23,8 @@ def get_event_risk_score(ticker: str) -> float:
     """
     try:
         t = yf.Ticker(ticker.upper())
-        dates_df = t.get_earnings_dates(limit=4)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            dates_df = t.get_earnings_dates(limit=4)
         if dates_df is None or dates_df.empty:
             return 0.0
 

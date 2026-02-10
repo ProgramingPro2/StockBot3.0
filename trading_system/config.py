@@ -67,6 +67,9 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2")
 
+# PPO model for live: path to .zip (absolute or relative to META_LEARNER_MODEL_DIR). Empty = ppo_trader.zip
+LIVE_PPO_MODEL_PATH = os.getenv("LIVE_PPO_MODEL_PATH", "").strip()
+
 # Discord webhook
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 

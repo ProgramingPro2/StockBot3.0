@@ -136,6 +136,51 @@ def send_training_complete_embed(
         return False
 
 
+def send_live_start_embed(
+    tickers: list[str],
+    interval_min: int,
+    model_path: Path | str | None,
+    fractional: bool,
+    cash: float | None = None,
+) -> bool:
+    """
+    Send an embedded Discord message when the live trading program starts.
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return False
+
+    ticker_str = ", ".join(tickers) if len(tickers) <= 10 else ", ".join(tickers[:8]) + f"... (+{len(tickers) - 8} more)"
+    model_str = str(model_path) if model_path else "ppo_trader.zip"
+
+    fields = [
+        {"name": "Tickers", "value": ticker_str, "inline": False},
+        {"name": "Interval", "value": f"{interval_min} min", "inline": True},
+        {"name": "Model", "value": model_str, "inline": True},
+        {"name": "Fractional", "value": "Yes" if fractional else "No", "inline": True},
+    ]
+    if cash is not None:
+        fields.append({"name": "Account cash", "value": f"${cash:,.2f}", "inline": True})
+
+    payload = {
+        "embeds": [
+            {
+                "title": "Live trading started",
+                "color": 0x0066CC,
+                "fields": fields,
+                "footer": {"text": "The Boardroom Trading System"},
+            }
+        ]
+    }
+
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.warning("Discord live-start notification failed: %s", e)
+        return False
+
+
 def send_hpo_complete_embed(
     n_trials: int,
     n_tickers: int,

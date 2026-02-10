@@ -95,12 +95,24 @@ Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
 
 When `ENV_ALLOW_CASH_EXPOSURE` is true (default): allocation uses raw action sum as total market exposure (capped at 1.0). Strategy return = exposure _ (weighted basket return); remainder of capital stays in cash. In live trading, only `cash _ exposure` is invested; the rest remains in the account. When false, behavior is unchanged: weights are normalized to sum to 1 (100% invested).
 
+## Scheduler
+
+The scheduler daemon behaves like a small service manager:
+
+- **Time-window services**: Each configured service (e.g. `weekday_live`) has a window (`start`, `end`, `weekdays`) in a given timezone. The daemon loop (every 60s) checks the current time: if in window and the process is not running, it starts it (or restarts after exit, with a short delay); if outside window and the process is running, it stops it. Child stdout/stderr are written to the service's `log` path (e.g. `trading_system/outputs/scheduler_weekday_live.log`).
+- **One-shot jobs**: Train and backtest run at cron times via a background APScheduler thread; they are subprocess runs that complete and exit.
+- **CLI**: `schedule run` (daemon), `schedule status` (in-window, running, pid, log path), `schedule run-now <id>`, `schedule stop <id>`, `schedule install` / `uninstall` (systemd user service).
+
+Config lives in `config/schedule.yaml` (timezone, services, jobs). See README "Schedule (run on startup)" for the YAML schema and commands.
+
 ## File Structure
 
 ```
 trading_system/
   config.py         - Configuration (loads from .env)
-  main.py           - CLI: train, tune, backtest, paper, live
+  main.py           - CLI: train, tune, backtest, paper, live, schedule
+  scheduler.py      - Time-window supervisor + cron one-shot jobs
+  scheduler_systemd.py - Install/uninstall systemd user service (Linux)
   data/             - Loader, news scraper, processor
   agents/           - sentiment, quantitative, fundamental, regime, momentum, mean_reversion, volatility, earnings_event
   meta_learner/     - Gym env (TradingEnv, HistoricalTradingEnv), PPO trader, Optuna tuner
@@ -108,7 +120,9 @@ trading_system/
   broker/           - Alpaca integration, Discord notifications
   utils/            - Logger, plotting (headless)
   models/           - Saved checkpoints (including models/universe/ for scorer)
-  outputs/          - Plots, logs, current_trade_list.txt (when autodiscover --save)
+  outputs/          - Plots, logs, schedule.log (daemon), scheduler_<id>.log (per service), current_trade_list.txt (when autodiscover --save)
+config/
+  schedule.yaml     - Scheduler config (timezone, services, jobs)
 ```
 
 ## Trading Modes

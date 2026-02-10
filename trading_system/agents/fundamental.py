@@ -2,6 +2,7 @@
 Fundamental Specialist: XGBoost classifier for intrinsic value.
 """
 import json
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -65,20 +66,31 @@ def _extract_features(ticker: str) -> dict[str, float]:
         except Exception as e:
             logger.debug("Failed to cache fundamentals for %s: %s", ticker, e)
 
-    # Try yfinance
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info
-        out = {}
-        for k in FEATURE_KEYS:
-            v = info.get(k)
-            if v is not None and not isinstance(v, str):
-                out[k] = float(v)
-        if out:
-            _save_cache(out)
-            return out
-    except Exception as e:
-        logger.warning("yfinance fundamental fetch failed for %s: %s. Trying cache.", ticker, e)
+    # Try yfinance with retries for transient SSL/network errors
+    for attempt in range(3):
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info
+            if info is None:
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+                break
+            out = {}
+            for k in FEATURE_KEYS:
+                v = info.get(k)
+                if v is not None and not isinstance(v, str):
+                    out[k] = float(v)
+            if out:
+                _save_cache(out)
+                return out
+            if attempt < 2:
+                time.sleep(1 + attempt)
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1 + attempt)
+            else:
+                logger.warning("yfinance fundamental fetch failed for %s after 3 attempts: %s. Trying cache.", ticker, e)
 
     # Fallback to cache (even if stale)
     cached = _load_cache()

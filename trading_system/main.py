@@ -1,6 +1,6 @@
 """
 CLI entry point for The Boardroom trading system.
-Modes: train, backtest, paper, live (multi-asset: TRADE_TICKERS).
+Modes: train, backtest, paper, live (multi-asset: TRADE_TICKERS), schedule (time-window live/paper + cron train/backtest).
 """
 from __future__ import annotations
 
@@ -29,9 +29,11 @@ warnings.filterwarnings(
 import pandas as pd
 
 from .config import (
+    BASE_DIR,
     ENV_ALLOW_CASH_EXPOSURE,
     ENV_OBS_ROLLING_FEATURES,
     FRACTIONAL,
+    LIVE_PPO_MODEL_PATH,
     META_LEARNER_MODEL_DIR,
     OUTPUT_DIR,
     SPECIALIST_CACHE_DIR,
@@ -861,6 +863,7 @@ def cmd_paper(args: argparse.Namespace) -> None:
 def cmd_live(args: argparse.Namespace) -> None:
     """Live trading with Alpaca: poll data, run specialists for all tickers, place orders."""
     import time
+    from datetime import date
 
     from .broker import AlpacaBroker, send_discord_notification
     from .meta_learner import PPOTrader
@@ -882,14 +885,45 @@ def cmd_live(args: argparse.Namespace) -> None:
         logger.error("Alpaca client not initialized. Check API keys in config.py or .env")
         return
 
-    trader = PPOTrader(n_assets=n_assets)
-    logger.info("Starting LIVE trading for %s (interval=%dm) [fractional=%s]", tickers, args.interval, FRACTIONAL)
+    model_path = Path(LIVE_PPO_MODEL_PATH) if LIVE_PPO_MODEL_PATH else None
+    trader = PPOTrader(n_assets=n_assets, model_path=model_path)
+    logger.info("Starting LIVE trading for %s (interval=%dm) [fractional=%s] model=%s", tickers, args.interval, FRACTIONAL, model_path or "ppo_trader.zip")
+
+    try:
+        from .broker.discord_notifier import send_live_start_embed
+        account = broker.get_account()
+        cash = float(account.get("cash", 0))
+        if send_live_start_embed(tickers, args.interval, model_path, FRACTIONAL, cash):
+            logger.info("Sent live-start summary to Discord")
+    except Exception as exc:
+        logger.debug("Discord live-start notification skipped: %s", exc)
+
+    bought_today: set[str] = set()
+    last_trading_date: date | None = None
 
     while True:
         try:
+            today = date.today()
+            if last_trading_date is not None and today != last_trading_date:
+                bought_today.clear()
+            last_trading_date = today
+
             account = broker.get_account()
             cash = float(account.get("cash", 0))
             logger.info("Account cash: $%.2f", cash)
+
+            # Log Alpaca's actual positions (source of truth)
+            alpaca_positions = broker.get_all_positions()
+            if alpaca_positions:
+                for pos in alpaca_positions:
+                    logger.info(
+                        "Alpaca position %s | qty=%.6g market_value=$%.2f",
+                        pos["symbol"],
+                        pos["qty"],
+                        pos["market_value"],
+                    )
+            else:
+                logger.debug("Alpaca positions: none")
 
             specialist_list: list[dict] = []
             for t in tickers:
@@ -901,7 +935,15 @@ def cmd_live(args: argparse.Namespace) -> None:
             if not ENV_ALLOW_CASH_EXPOSURE:
                 action = np.array([_position_used(float(a)) for a in action])
             exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
-            total_invested = cash * exposure
+            # No margin: only invest when cash is positive; long-only so never target short
+            if cash <= 0:
+                logger.warning("Account on margin (cash=%.2f); not placing buy orders", cash)
+            total_invested = max(0.0, cash * exposure) if cash > 0 else 0.0
+
+            if not broker.is_market_open():
+                logger.info("Market closed (Alpaca clock); skipping orders this cycle")
+                time.sleep(interval_sec)
+                continue
 
             # For whole-share orders we need latest price per ticker
             latest_prices: dict[str, float] = {}
@@ -922,43 +964,74 @@ def cmd_live(args: argparse.Namespace) -> None:
                 position_pct = float(weights[i])
 
                 if target_value > current_value + 100:
-                    notional = target_value - current_value
-                    if FRACTIONAL:
-                        order = broker.place_order(t, notional=notional, side="buy")
-                        if order:
-                            logger.info("BUY %s: $%.2f", t, notional)
-                            send_discord_notification(t, "BUY", position_pct, outputs, order)
+                    if cash <= 0:
+                        logger.debug("HOLD %s: skip buy (no margin)", t)
                     else:
-                        price = latest_prices.get(t) or 0.0
-                        if price > 0:
-                            qty = max(1, int(round(notional / price)))
-                            order = broker.place_order(t, qty=qty, side="buy")
+                        notional = target_value - current_value
+                        if FRACTIONAL:
+                            order = broker.place_order(t, notional=notional, side="buy")
                             if order:
-                                logger.info("BUY %s: %d shares @ ~$%.2f", t, qty, price)
+                                bought_today.add(t)
+                                logger.info("BUY %s: $%.2f", t, notional)
                                 send_discord_notification(t, "BUY", position_pct, outputs, order)
                         else:
-                            logger.warning("No price for %s; skipping buy", t)
+                            price = latest_prices.get(t) or 0.0
+                            if price > 0:
+                                qty = max(1, int(round(notional / price)))
+                                order = broker.place_order(t, qty=qty, side="buy")
+                                if order:
+                                    bought_today.add(t)
+                                    logger.info("BUY %s: %d shares @ ~$%.2f", t, qty, price)
+                                    send_discord_notification(t, "BUY", position_pct, outputs, order)
+                            else:
+                                logger.warning("No price for %s; skipping buy", t)
                 elif current_value > target_value + 100:
-                    notional = current_value - target_value
-                    if FRACTIONAL:
-                        order = broker.place_order(t, notional=notional, side="sell")
-                        if order:
-                            logger.info("SELL %s: $%.2f", t, notional)
-                            send_discord_notification(t, "SELL", position_pct, outputs, order)
+                    if t in bought_today:
+                        logger.info("HOLD %s: skip sell (bought today, avoid day trade)", t)
+                    elif current_value <= 0:
+                        logger.debug("HOLD %s: no long position to reduce (current_value=%.2f)", t, current_value)
                     else:
-                        current_qty = float(current_pos.get("qty", 0))
-                        price = latest_prices.get(t) or 0.0
-                        if price > 0 and current_qty > 0:
-                            qty = min(int(current_qty), max(1, int(round(notional / price))))
-                            order = broker.place_order(t, qty=qty, side="sell")
-                            if order:
-                                logger.info("SELL %s: %d shares @ ~$%.2f", t, qty, price)
-                                send_discord_notification(t, "SELL", position_pct, outputs, order)
+                        notional = min(current_value - target_value, current_value)
+                        if notional < 1.0:
+                            logger.debug("HOLD %s: sell amount below $1", t)
                         else:
-                            logger.warning("No position or price for %s; skipping sell", t)
+                            # If selling most of position (>= 95%), close full position to avoid rounding issues
+                            sell_all = notional >= current_value * 0.95
+                            if sell_all:
+                                if broker.close_position(t):
+                                    logger.info("SELL ALL %s (was $%.2f)", t, current_value)
+                                    send_discord_notification(
+                                        t, "SELL", position_pct, outputs,
+                                        {"close_position": True, "notional": current_value, "status": "closed"},
+                                    )
+                                else:
+                                    logger.warning("Failed to close position %s", t)
+                            elif FRACTIONAL:
+                                order = broker.place_order(t, notional=notional, side="sell")
+                                if order:
+                                    logger.info("SELL %s: $%.2f", t, notional)
+                                    send_discord_notification(t, "SELL", position_pct, outputs, order)
+                            else:
+                                current_qty = float(current_pos.get("qty", 0))
+                                price = latest_prices.get(t) or 0.0
+                                if price > 0 and current_qty > 0:
+                                    would_sell_qty = min(int(current_qty), max(1, int(round(notional / price))))
+                                    if would_sell_qty >= current_qty * 0.95:
+                                        if broker.close_position(t):
+                                            logger.info("SELL ALL %s (was %d shares)", t, int(current_qty))
+                                            send_discord_notification(
+                                                t, "SELL", position_pct, outputs,
+                                                {"close_position": True, "notional": current_value, "status": "closed"},
+                                            )
+                                    else:
+                                        order = broker.place_order(t, qty=would_sell_qty, side="sell")
+                                        if order:
+                                            logger.info("SELL %s: %d shares @ ~$%.2f", t, would_sell_qty, price)
+                                            send_discord_notification(t, "SELL", position_pct, outputs, order)
+                                else:
+                                    logger.warning("No position or price for %s; skipping sell", t)
                 else:
                     logger.info("HOLD %s | Position=%.1f%%", t, position_pct * 100)
-                    send_discord_notification(t, "HOLD", position_pct, outputs)
 
             time.sleep(interval_sec)
         except KeyboardInterrupt:
@@ -1097,12 +1170,105 @@ def cmd_train_universe(args: argparse.Namespace) -> None:
     logger.info("Universe scorer saved. Run 'autodiscover' or paper/live --autodiscover to use it.")
 
 
+def cmd_schedule(args: argparse.Namespace) -> None:
+    """Dispatch schedule run / status / run-now / stop / install / uninstall."""
+    action = getattr(args, "schedule_action", None) or "run"
+    config_path = Path(args.config).resolve()
+    if action == "run":
+        from .scheduler import run_scheduler
+        run_scheduler(config_path)
+    elif action == "status":
+        from .scheduler import status as schedule_status
+        info = schedule_status(config_path)
+        tz = info.get("timezone") or "?"
+        print(f"Timezone: {tz}")
+        for sid, s in info.get("services", {}).items():
+            w = s.get("window", {})
+            win_str = f"{w.get('start', '?')}-{w.get('end', '?')} weekdays {w.get('weekdays', [])}"
+            in_win = "yes" if s.get("in_window") else "no"
+            running = s.get("running")
+            pid = s.get("pid")
+            run_str = f"running (pid {pid})" if (running and pid) else "not running"
+            log_path = s.get("log_path", "?")
+            print(f"  {sid}: window {win_str}; in window: {in_win}; {run_str}; log: {log_path}")
+    elif action == "run-now":
+        from .scheduler import run_job_now
+        job_id = getattr(args, "job_id", None) or ""
+        if not job_id:
+            logger.error("schedule run-now requires a service id (e.g. weekday_live)")
+            raise SystemExit(1)
+        try:
+            run_job_now(config_path, job_id)
+        except ValueError as e:
+            logger.error("%s", e)
+            raise SystemExit(1)
+    elif action == "stop":
+        from .scheduler import stop_service
+        job_id = getattr(args, "job_id", None) or ""
+        if not job_id:
+            logger.error("schedule stop requires a service id (e.g. weekday_live)")
+            raise SystemExit(1)
+        stop_service(job_id)
+        logger.info("Stopped service %s", job_id)
+    elif action == "install":
+        cmd_schedule_install(args)
+    elif action == "uninstall":
+        cmd_schedule_uninstall(args)
+    else:
+        logger.error("Unknown schedule action: %s", action)
+        raise SystemExit(1)
+
+
+def cmd_schedule_install(args: argparse.Namespace) -> None:
+    """Install systemd user service so the scheduler runs on startup (Linux only)."""
+    from .scheduler_systemd import install as systemd_install
+    config_path = Path(args.config).resolve()
+    project_root = BASE_DIR.parent
+    systemd_install(config_path, project_root, sys.executable)
+
+
+def cmd_schedule_uninstall(args: argparse.Namespace) -> None:
+    """Remove systemd user service (Linux only)."""
+    from .scheduler_systemd import uninstall as systemd_uninstall
+    systemd_uninstall()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="The Boardroom - Hierarchical Multi-Agent Trading System")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     def _add_debug(p):
         p.add_argument("--debug", action="store_true", help="Enable debug logging: specialist verification, obs/action dump")
+
+    default_schedule = BASE_DIR.parent / "config" / "schedule.yaml"
+    schedule_p = sub.add_parser("schedule", help="Run scheduler daemon or install/uninstall for startup (train/backtest/live per config)")
+    schedule_p.add_argument("--config", type=str, default=str(default_schedule), help="Path to schedule YAML (default: config/schedule.yaml)")
+    schedule_sub = schedule_p.add_subparsers(dest="schedule_action")
+    schedule_p.set_defaults(func=cmd_schedule, schedule_action="run")
+    run_p = schedule_sub.add_parser("run", help="Run scheduler daemon (time-window services + cron one-shots)")
+    run_p.add_argument("--config", type=str, default=str(default_schedule), help="Path to schedule YAML")
+    status_p = schedule_sub.add_parser("status", help="Show service status (in window, running, pid, log path)")
+    status_p.add_argument("--config", type=str, default=str(default_schedule), help="Path to schedule YAML")
+    status_p.set_defaults(schedule_action="status")
+    install_p = schedule_sub.add_parser(
+        "install",
+        help="Install systemd user service for run on startup (Linux only). Use loginctl enable-linger $USER for start at boot without being logged in.",
+    )
+    install_p.add_argument("--config", type=str, default=str(default_schedule), help="Path to schedule YAML")
+    install_p.set_defaults(schedule_action="install")
+    uninstall_p = schedule_sub.add_parser("uninstall", help="Remove systemd user service (Linux only)")
+    uninstall_p.set_defaults(schedule_action="uninstall")
+    run_now_p = schedule_sub.add_parser(
+        "run-now",
+        help="Start a service by id immediately (ignore window). E.g. weekday_live.",
+    )
+    run_now_p.add_argument("job_id", type=str, help="Service id (e.g. weekday_live)")
+    run_now_p.add_argument("--config", type=str, default=str(default_schedule), help="Path to schedule YAML")
+    run_now_p.set_defaults(schedule_action="run-now")
+    stop_p = schedule_sub.add_parser("stop", help="Stop a running service by id")
+    stop_p.add_argument("job_id", type=str, help="Service id (e.g. weekday_live)")
+    stop_p.add_argument("--config", type=str, default=str(default_schedule), help="Path to schedule YAML")
+    stop_p.set_defaults(schedule_action="stop")
 
     train_p = sub.add_parser("train", help="Train specialists and meta-learner on TRADE_TICKERS")
     _add_debug(train_p)

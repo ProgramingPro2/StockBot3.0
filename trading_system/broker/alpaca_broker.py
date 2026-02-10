@@ -45,6 +45,36 @@ class AlpacaBroker:
             logger.error("Failed to get account: %s", e)
             return {}
 
+    def is_market_open(self) -> bool:
+        """Return True if the market is open (via Alpaca clock API)."""
+        if not self.client:
+            return False
+        try:
+            clock = self.client.get_clock()
+            return bool(clock.is_open)
+        except Exception as e:
+            logger.error("Failed to get market clock: %s", e)
+            return False
+
+    def get_all_positions(self) -> list[dict]:
+        """Get all open positions from Alpaca (source of truth for account holdings)."""
+        if not self.client:
+            return []
+        try:
+            positions = self.client.get_all_positions()
+            return [
+                {
+                    "symbol": p.symbol,
+                    "qty": float(p.qty),
+                    "market_value": float(p.market_value),
+                    "avg_entry_price": float(p.avg_entry_price),
+                }
+                for p in positions
+            ]
+        except Exception as e:
+            logger.error("Failed to get all positions: %s", e)
+            return []
+
     def get_position(self, ticker: str) -> dict:
         """Get current position for ticker."""
         if not self.client:
@@ -82,12 +112,22 @@ class AlpacaBroker:
         ticker = ticker.upper()
         order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
+        # For sell + notional, cap notional to slightly below position value so Alpaca's
+        # notional->shares conversion never exceeds available qty (avoids 40310000 errors).
+        if side.lower() == "sell" and notional is not None and notional > 0:
+            pos = self.get_position(ticker)
+            pos_value = float(pos.get("market_value", 0))
+            if pos_value > 0:
+                notional = min(notional, pos_value * 0.999)
+
         try:
             if order_type == "market":
+                # Alpaca requires notional to be limited to 2 decimal places
+                notional_rounded = round(notional, 2) if notional is not None else None
                 req = MarketOrderRequest(
                     symbol=ticker,
                     qty=qty,
-                    notional=notional,
+                    notional=notional_rounded,
                     side=order_side,
                     time_in_force=TimeInForce.DAY,
                 )

@@ -83,7 +83,7 @@ def load_ohlcv(
             _rate_limit()
             yf_ticker = yf.Ticker(ticker)
             df = yf_ticker.history(start=start, end=end, auto_adjust=True)
-            if df.empty:
+            if df is None or df.empty:
                 logger.warning("No data returned for %s", ticker)
                 return pd.DataFrame()
 

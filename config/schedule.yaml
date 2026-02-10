@@ -1,0 +1,33 @@
+# Scheduler config: systemd-like time-window services + cron one-shot jobs.
+# services: live/paper run only inside their window (start-end, weekdays); restarted if they exit.
+# jobs: one-shot train/backtest at cron times.
+# timezone: used for window and cron (e.g. America/New_York).
+# Commands: schedule run | schedule status | schedule run-now <service_id>
+
+timezone: America/New_York
+
+services:
+  - id: weekday_live
+    type: live
+    window:
+      start: "09:30"
+      end: "17:00"
+      weekdays: [1, 2, 3, 4, 5]
+    options:
+      interval: 60
+      autodiscover: false
+    log: trading_system/outputs/scheduler_weekday_live.log
+
+jobs:
+  - id: weekend_train
+    type: train
+    when: "0 0 * * 6"
+    options:
+      timesteps: 10000000
+      use_historical: true
+      use_tuned: true
+
+  - id: weekend_backtest
+    type: backtest
+    when: "0 8 * * 0"
+    options: {}
