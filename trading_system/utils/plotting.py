@@ -74,46 +74,46 @@ def save_performance_plot(
                 neutral_trades.append(trades_here)
         if increase_dates:
             axes[0].scatter(increase_dates, increase_vals, c="green", marker="^", s=40, zorder=5, label="Rebalance (increase)")
-            for j, (d, v) in enumerate(zip(increase_dates, increase_vals)):
-                if j < len(increase_trades) and increase_trades[j]:
-                    label = _fmt_trades(increase_trades[j])
-                    axes[0].annotate(
-                        label,
-                        xy=(d, v),
-                        xytext=(0, 14),
-                        textcoords="offset points",
-                        ha="center",
-                        fontsize=8,
-                        alpha=0.9,
-                    )
+            # for j, (d, v) in enumerate(zip(increase_dates, increase_vals)):
+            #     if j < len(increase_trades) and increase_trades[j]:
+            #         label = _fmt_trades(increase_trades[j])
+            #         axes[0].annotate(
+            #             label,
+            #             xy=(d, v),
+            #             xytext=(0, 14),
+            #             textcoords="offset points",
+            #             ha="center",
+            #             fontsize=8,
+            #             alpha=0.9,
+            #         )
         if decrease_dates:
             axes[0].scatter(decrease_dates, decrease_vals, c="red", marker="v", s=40, zorder=5, label="Rebalance (decrease)")
-            for j, (d, v) in enumerate(zip(decrease_dates, decrease_vals)):
-                if j < len(decrease_trades) and decrease_trades[j]:
-                    label = _fmt_trades(decrease_trades[j])
-                    axes[0].annotate(
-                        label,
-                        xy=(d, v),
-                        xytext=(0, -16),
-                        textcoords="offset points",
-                        ha="center",
-                        fontsize=8,
-                        alpha=0.9,
-                    )
+            # for j, (d, v) in enumerate(zip(decrease_dates, decrease_vals)):
+            #     if j < len(decrease_trades) and decrease_trades[j]:
+            #         label = _fmt_trades(decrease_trades[j])
+            #         axes[0].annotate(
+            #             label,
+            #             xy=(d, v),
+            #             xytext=(0, -16),
+            #             textcoords="offset points",
+            #             ha="center",
+            #             fontsize=8,
+            #             alpha=0.9,
+            #         )
         if neutral_dates:
             axes[0].scatter(neutral_dates, neutral_vals, c="gray", marker="|", s=80, zorder=5, label="Rebalance")
-            for j, (d, v) in enumerate(zip(neutral_dates, neutral_vals)):
-                if j < len(neutral_trades) and neutral_trades[j]:
-                    label = _fmt_trades(neutral_trades[j])
-                    axes[0].annotate(
-                        label,
-                        xy=(d, v),
-                        xytext=(0, 14),
-                        textcoords="offset points",
-                        ha="center",
-                        fontsize=8,
-                        alpha=0.9,
-                    )
+            # for j, (d, v) in enumerate(zip(neutral_dates, neutral_vals)):
+            #     if j < len(neutral_trades) and neutral_trades[j]:
+            #         label = _fmt_trades(neutral_trades[j])
+            #         axes[0].annotate(
+            #             label,
+            #             xy=(d, v),
+            #             xytext=(0, 14),
+            #             textcoords="offset points",
+            #             ha="center",
+            #             fontsize=8,
+            #             alpha=0.9,
+            #         )
         axes[0].legend(loc="best", fontsize=8)
         # Leave vertical room so rebalance labels (increase above, decrease below) are not clipped
         ymin, ymax = axes[0].get_ylim()

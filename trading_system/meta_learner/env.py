@@ -14,6 +14,8 @@ from ..config import (
     ENV_OBS_ROLLING_FEATURES,
     ENV_REWARD_DRAWDOWN_PENALTY,
     ENV_ROLLING_SHARPE_DAYS,
+    MIN_TRADE_NOTIONAL,
+    STARTING_CAPITAL,
 )
 
 
@@ -171,6 +173,7 @@ class TradingEnv(gym.Env):
 
         self._returns_history: list[float] = []
         self._equity_history: list[float] = []
+        self._holdings: np.ndarray = np.zeros(self.n_assets, dtype=np.float32)
         self._step_count = 0
         self._specialist_outputs: list[dict] | None = None
         self._rolling_returns: np.ndarray | None = None  # (n_assets, 21) per-asset
@@ -180,6 +183,7 @@ class TradingEnv(gym.Env):
         super().reset(seed=seed)
         self._returns_history = []
         self._equity_history = [1.0]
+        self._holdings = np.zeros(self.n_assets, dtype=np.float32)
         self._step_count = 0
         specialist = options.get("specialist_outputs", []) if options else []
         if isinstance(specialist, dict):
@@ -188,12 +192,28 @@ class TradingEnv(gym.Env):
         self._rolling_returns = np.full((self.n_assets, 21), np.nan, dtype=np.float32)
         self._rolling_vols = np.full(self.n_assets, 0.01, dtype=np.float32)
 
-        obs = self._get_obs(holdings=np.zeros(self.n_assets, dtype=np.float32))
+        obs = self._get_obs(holdings=self._holdings)
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         self._step_count += 1
         action = np.clip(action, 0, 1).astype(np.float32)
+
+        min_trade_equity = MIN_TRADE_NOTIONAL / STARTING_CAPITAL
+        equity = self._equity_history[-1]
+        effective_holdings = self._holdings.copy()
+        increased_this_step: set[int] = set()
+        for i in range(self.n_assets):
+            notional = abs(action[i] - self._holdings[i]) * equity
+            if action[i] > self._holdings[i] and notional >= min_trade_equity:
+                effective_holdings[i] = action[i]
+                increased_this_step.add(i)
+        for i in range(self.n_assets):
+            if action[i] < self._holdings[i] and i not in increased_this_step:
+                notional = abs(action[i] - self._holdings[i]) * equity
+                if notional >= min_trade_equity:
+                    effective_holdings[i] = action[i]
+        self._holdings = effective_holdings
 
         outputs = self._specialist_outputs or [{}] * self.n_assets
         returns_per_asset = np.zeros(self.n_assets, dtype=np.float32)
@@ -213,13 +233,12 @@ class TradingEnv(gym.Env):
                 if len(valid) >= 5:
                     self._rolling_vols[i] = max(0.01, float(np.std(valid)))
 
-        action_sum = float(np.sum(action)) + 1e-8
-        portfolio_return = float(np.dot(action, returns_per_asset) / action_sum)
+        eff_sum = float(np.sum(effective_holdings)) + 1e-8
+        portfolio_return = float(np.dot(effective_holdings, returns_per_asset) / eff_sum)
         self._returns_history.append(portfolio_return)
         self._equity_history.append(self._equity_history[-1] * (1 + portfolio_return))
 
-        holdings = action
-        obs = self._get_obs(holdings=holdings)
+        obs = self._get_obs(holdings=self._holdings)
 
         if len(self._returns_history) >= self.rolling_sharpe_days:
             recent = np.array(self._returns_history[-self.rolling_sharpe_days :])
@@ -350,15 +369,30 @@ class HistoricalTradingEnv(gym.Env):
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         self._step_in_episode += 1
         action = np.clip(action, 0, 1).astype(np.float32)
-        self._holdings = action
+
+        min_trade_equity = MIN_TRADE_NOTIONAL / STARTING_CAPITAL
+        equity = self._equity_history[-1]
+        effective_holdings = self._holdings.copy()
+        increased_this_step: set[int] = set()
+        for i in range(self.n_assets):
+            notional = abs(action[i] - self._holdings[i]) * equity
+            if action[i] > self._holdings[i] and notional >= min_trade_equity:
+                effective_holdings[i] = action[i]
+                increased_this_step.add(i)
+        for i in range(self.n_assets):
+            if action[i] < self._holdings[i] and i not in increased_this_step:
+                notional = abs(action[i] - self._holdings[i]) * equity
+                if notional >= min_trade_equity:
+                    effective_holdings[i] = action[i]
+        self._holdings = effective_holdings
 
         if self._cursor >= self.n_days:
             obs = self._get_obs()
             return obs, 0.0, True, False, {"return": 0.0}
 
         day_returns = self.returns_array[self._cursor]
-        action_sum = float(np.sum(action)) + 1e-8
-        portfolio_return = float(np.dot(action, day_returns) / action_sum)
+        eff_sum = float(np.sum(effective_holdings)) + 1e-8
+        portfolio_return = float(np.dot(effective_holdings, day_returns) / eff_sum)
         self._returns_history.append(portfolio_return)
         self._equity_history.append(self._equity_history[-1] * (1 + portfolio_return))
 

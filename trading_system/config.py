@@ -58,9 +58,10 @@ MOMENTUM_LEARNING_RATE = 0.05
 for d in [CACHE_DIR, FUNDAMENTAL_CACHE_DIR, NEWS_CACHE_DIR, SPECIALIST_CACHE_DIR, OUTPUT_DIR, QUANTITATIVE_MODEL_DIR, FUNDAMENTAL_MODEL_DIR, REGIME_MODEL_DIR, MOMENTUM_MODEL_DIR, META_LEARNER_MODEL_DIR, UNIVERSE_MODEL_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-# Ollama
+# Ollama (first model tried; fallbacks used if primary fails, e.g. not pulled)
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+OLLAMA_FALLBACK_MODELS = [m.strip() for m in os.getenv("OLLAMA_FALLBACK_MODELS", "llama3.2,llama2").split(",") if m.strip()]
 
 # Alpaca (live trading)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
@@ -79,6 +80,11 @@ try:
     STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", "100000").strip() or "100000")
 except (ValueError, TypeError):
     STARTING_CAPITAL = 100000.0
+# Minimum notional (dollars) to trigger a trade; used by live, backtest, and training envs
+try:
+    MIN_TRADE_NOTIONAL = float(os.getenv("MIN_TRADE_NOTIONAL", "100").strip() or "100")
+except (ValueError, TypeError):
+    MIN_TRADE_NOTIONAL = 100.0
 
 # Trade tickers (5 assets; override via TRADE_TICKERS=SPY,IWM,... in .env)
 # Default: ETFs chosen for active-trading fit (volatility, dispersion) vs strong-trend names.

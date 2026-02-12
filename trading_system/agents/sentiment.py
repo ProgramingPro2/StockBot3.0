@@ -2,12 +2,13 @@
 Narrative Specialist: LLM-based sentiment via Ollama.
 """
 import json
+import os
 import re
 import time
 
 from pydantic import BaseModel
 
-from ..config import OLLAMA_MODEL
+from ..config import OLLAMA_FALLBACK_MODELS, OLLAMA_MODEL, OLLAMA_URL
 from ..data.news_scraper import fetch_news, news_to_text
 from ..utils.logger import get_logger
 
@@ -18,7 +19,7 @@ class SentimentOutput(BaseModel):
     """Structured output from LLM."""
     sentiment_score: float  # -1 to 1
     confidence: float  # 0 to 1
-    reasoning: str
+    reasoning: str = ""
 
 
 def _extract_json(text: str) -> str | None:
@@ -71,18 +72,70 @@ def _extract_json(text: str) -> str | None:
     return None
 
 
+def _parse_sentiment_response(json_str: str) -> tuple[float, float] | None:
+    """Parse JSON to (score, confidence). Returns None on failure."""
+    try:
+        parsed = SentimentOutput.model_validate_json(json_str)
+        return max(-1, min(1, parsed.sentiment_score)), max(0, min(1, parsed.confidence))
+    except Exception:
+        pass
+    try:
+        data = json.loads(json_str)
+        if isinstance(data, dict):
+            score = float(data.get("sentiment_score", 0.0))
+            conf = float(data.get("confidence", 0.5))
+            return max(-1, min(1, score)), max(0, min(1, conf))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _models_to_try() -> list[str]:
+    """Primary model first, then fallbacks, no duplicates."""
+    seen = set()
+    out = []
+    for m in [OLLAMA_MODEL] + OLLAMA_FALLBACK_MODELS:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
 def get_sentiment(ticker: str) -> tuple[float, float, bool]:
     """
     Get sentiment score and confidence for a ticker.
     Returns (sentiment_score, confidence, from_llm) in [-1, 1], [0, 1], and bool.
     When from_llm is False, caller should use proxy sentiment instead.
     """
+    if "OLLAMA_HOST" not in os.environ and OLLAMA_URL:
+        host = OLLAMA_URL.replace("https://", "").replace("http://", "").strip()
+        if host:
+            os.environ.setdefault("OLLAMA_HOST", host)
+
     news = fetch_news(ticker)
     text = news_to_text(news)
+    num_items = len(news)
+    no_news_placeholder = "No recent news available for this ticker."
+    # Consider "real news" only if we have headline/summary text beyond the "[N]" labels
+    text_without_labels = re.sub(r"\[\d+\]\s*", "", text).strip()
+    has_real_news = num_items > 0 and text.strip() != no_news_placeholder and len(text_without_labels) > 20
+    first_headline = ""
+    for n in news:
+        if (n.title or "").strip() or (n.summary or "").strip():
+            first_headline = ((n.title or "") + " " + (n.summary or "")).strip()[:100]
+            break
+    preview = first_headline or ("(no headline text)" if num_items else "no items")
+    logger.info(
+        "Sentiment input for %s: %d news items, has_content=%s, preview=%s",
+        ticker,
+        num_items,
+        has_real_news,
+        preview[:100] + "..." if len(preview) > 100 else preview,
+    )
 
     prompt = f"""Analyze the following news about {ticker} and output a JSON object with exactly these keys:
-- sentiment_score: float from -1 (very bearish) to 1 (very bullish)
-- confidence: float from 0 (uncertain) to 1 (very confident)
+- sentiment_score: float in the range -1 to 1 (-1=very bearish, 0=neutral, 1=very bullish). Use 0 only when there is no news or the news is truly neutral. When headlines have a clear positive or negative tone, use a non-zero value (e.g. 0.3 for mildly bullish, -0.5 for bearish).
+- confidence: float from 0 to 1. Use 0 only when there is no news. When you have real headlines, set confidence based on how much relevant news there is (e.g. 0.5 for one headline, 0.8 for several clear items).
 - reasoning: brief explanation (one sentence)
 
 News:
@@ -90,47 +143,79 @@ News:
 
 Output valid JSON only. Example: {{"sentiment_score": 0.2, "confidence": 0.7, "reasoning": "Mixed signals"}}"""
 
-    for attempt in range(2):
-        for use_format in [True, False]:
-            try:
-                from ollama import chat
+    models = _models_to_try()
+    last_error: Exception | None = None
 
-                kwargs: dict = {"model": OLLAMA_MODEL, "messages": [{"role": "user", "content": prompt}]}
-                if use_format:
-                    kwargs["format"] = SentimentOutput.model_json_schema()
+    for model in models:
+        for attempt in range(2):
+            for use_format in [False, True]:
+                try:
+                    from ollama import chat
 
-                response = chat(**kwargs)
-
-                if hasattr(response, "message"):
-                    content = response.message.content or ""
-                elif isinstance(response, dict):
-                    content = response.get("message", {}).get("content", "") or ""
-                else:
-                    content = ""
-
-                raw = content.strip() if content else ""
-                json_str = _extract_json(raw) if raw else None
-
-                if not json_str:
+                    kwargs: dict = {"model": model, "messages": [{"role": "user", "content": prompt}]}
                     if use_format:
-                        continue
-                    raise ValueError("Empty or invalid JSON response")
+                        kwargs["format"] = SentimentOutput.model_json_schema()
 
-                parsed = SentimentOutput.model_validate_json(json_str)
-                score = max(-1, min(1, parsed.sentiment_score))
-                conf = max(0, min(1, parsed.confidence))
-                return score, conf, True
+                    response = chat(**kwargs)
 
-            except Exception as e:
-                if not use_format:
-                    if attempt < 1:
+                    if isinstance(response, str):
+                        content = response.strip()
+                    elif hasattr(response, "message"):
+                        content = (response.message.content or "").strip()
+                    elif isinstance(response, dict):
+                        content = (response.get("message", {}).get("content", "") or "").strip()
+                    else:
+                        content = ""
+
+                    if not content:
+                        if use_format:
+                            continue
+                        raise ValueError("Empty response from Ollama")
+
+                    json_str = _extract_json(content)
+                    if not json_str:
+                        if use_format:
+                            continue
+                        raise ValueError("Empty or invalid JSON response")
+
+                    result = _parse_sentiment_response(json_str)
+                    if result is None:
+                        if use_format:
+                            continue
+                        raise ValueError("Could not parse sentiment_score and confidence from JSON")
+
+                    score, conf = result
+                    if has_real_news and score == 0.0 and conf == 0.0:
+                        logger.info(
+                            "Sentiment from LLM for %s: score=%.2f confidence=%.2f (model returned neutral despite %d news items)",
+                            ticker,
+                            score,
+                            conf,
+                            num_items,
+                        )
+                    else:
+                        logger.info(
+                            "Sentiment from LLM for %s: score=%.2f confidence=%.2f model=%s",
+                            ticker,
+                            score,
+                            conf,
+                            model,
+                        )
+                    return score, conf, True
+
+                except Exception as e:
+                    last_error = e
+                    if not use_format and attempt < 1:
                         time.sleep(1)
-                        continue
-                    logger.warning("Ollama sentiment failed for %s: %s. Using proxy.", ticker, e)
-                    return 0.0, 0.5, False
-                continue
-        if attempt < 1:
-            time.sleep(1)
+                    if model != models[-1]:
+                        logger.debug("Ollama model %s failed for %s: %s, trying next.", model, ticker, e)
+                    continue
+            if attempt < 1:
+                time.sleep(1)
 
-    logger.warning("Ollama sentiment failed for %s (empty/invalid JSON). Using proxy.", ticker)
+    logger.warning(
+        "Ollama sentiment failed for %s (empty/invalid JSON). Last error: %s. Using proxy.",
+        ticker,
+        last_error,
+    )
     return 0.0, 0.5, False

@@ -24,7 +24,6 @@ jobs:
     when: "0 0 * * 6"
     options:
       timesteps: 10000000
-      use_historical: true
       use_tuned: true
 
   - id: weekend_backtest

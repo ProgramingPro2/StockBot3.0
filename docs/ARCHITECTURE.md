@@ -125,6 +125,16 @@ config/
   schedule.yaml     - Scheduler config (timezone, services, jobs)
 ```
 
+## Day-trading prevention
+
+The system enforces a single rule everywhere: **do not reduce a position in the same period it was increased**.
+
+- **Live**: A set `bought_today` records tickers that were bought on the current calendar day. When the PPO signals a sell (target value below current), the live loop skips the sell for that ticker if it is in `bought_today`. The set is cleared when the date changes.
+- **Backtest**: For each bar, a per-asset `last_buy_bar[i]` stores the bar index where asset `i` was last increased. A decrease (sell) is applied only when the dollar gap exceeds `MIN_TRADE_NOTIONAL` and `last_buy_bar[i] != current_bar`, so we never sell on the same bar we bought.
+- **Training (TradingEnv and HistoricalTradingEnv)**: In each `step()`, updates are applied in two phases: (1) apply all increases that meet the notional threshold and record those assets in `increased_this_step`; (2) apply decreases only for assets that meet the threshold and are not in `increased_this_step`. So the agent never reduces a position in the same step it increased it.
+
+This keeps behavior consistent across live, backtest, and training and avoids day-trade patterns.
+
 ## Trading Modes
 
 **Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` for pure historical returns, `--historical-ratio 0.7` for mixed (70% historical, 30% synthetic), or `TRAIN_HISTORICAL_RATIO` in config. Use `--use-tuned` to apply tuned hyperparameters.
