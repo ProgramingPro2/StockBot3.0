@@ -17,16 +17,15 @@ services:
       interval: 60
       autodiscover: false
     log: trading_system/outputs/scheduler_weekday_live.log
+#jobs:
+#  - id: weekend_train
+#    type: train
+#    when: "0 0 * * 6"
+#    options:
+#      timesteps: 10000000
+#      use_tuned: true
 
-jobs:
-  - id: weekend_train
-    type: train
-    when: "0 0 * * 6"
-    options:
-      timesteps: 10000000
-      use_tuned: true
-
-  - id: weekend_backtest
-    type: backtest
-    when: "0 8 * * 0"
-    options: {}
+#  - id: weekend_backtest
+#    type: backtest
+#    when: "0 8 * * 0"
+#    options: {}
