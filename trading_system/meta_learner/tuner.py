@@ -25,6 +25,8 @@ from ..config import (
     PPO_LEARNING_RATE,
     PPO_N_EPOCHS,
     PPO_N_STEPS,
+    TRAIN_HISTORICAL_RATIO,
+    TRAIN_HISTORICAL_RATIO_OVERRIDE,
 )
 import numpy as np
 
@@ -45,6 +47,10 @@ def _get_ppo_device() -> str:
 
 def sample_ppo_params(trial: optuna.Trial) -> dict[str, Any]:
     """Sample PPO and env hyperparameters for a trial."""
+    if TRAIN_HISTORICAL_RATIO_OVERRIDE:
+        historical_ratio = max(0.0, min(1.0, TRAIN_HISTORICAL_RATIO))
+    else:
+        historical_ratio = trial.suggest_float("historical_ratio", 0.1, 0.9)
     return {
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
         "n_steps": trial.suggest_categorical("n_steps", [1024, 2048, 4096]),
@@ -55,7 +61,7 @@ def sample_ppo_params(trial: optuna.Trial) -> dict[str, Any]:
         "clip_range": trial.suggest_float("clip_range", 0.1, 0.3),
         "ent_coef": trial.suggest_float("ent_coef", 1e-4, 0.1, log=True),
         "policy_kwargs": _sample_net_arch(trial),
-        "historical_ratio": trial.suggest_float("historical_ratio", 0.1, 0.9),
+        "historical_ratio": historical_ratio,
     }
 
 
@@ -117,6 +123,8 @@ def run_tuning(
                 "mean_reversion_score": float(np.random.uniform(-1, 1)),
                 "volatility_score": float(np.random.uniform(0, 1)),
                 "event_risk_score": float(np.random.uniform(0, 1)),
+                "relative_strength_score": float(np.random.uniform(-1, 1)),
+                "liquidity_score": float(np.random.uniform(0, 1)),
             }
             for _ in range(n_assets)
         ]

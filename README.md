@@ -206,10 +206,11 @@ Edit `trading_system/config.py` for:
 - `OLLAMA_URL`, `OLLAMA_MODEL`
 - `DEVICE` (cuda/cpu)
 - TFT, XGBoost, VAE, PPO hyperparameters
-- `TRAIN_HISTORICAL_RATIO`: Fraction of PPO episodes on historical vs synthetic data (0.0-1.0; default: 0.0). Overridden by `--historical-ratio` or `--use-historical`.
+- `TRAIN_HISTORICAL_RATIO`: Fraction of PPO episodes on historical vs synthetic data (0.0-1.0; default: 0.0). Overridden by `--historical-ratio` or `--use-historical`. When set in `.env`, this value is used as the fixed ratio for both training and tuning; the tuner will not search for a new value.
 - `ENV_REWARD_DRAWDOWN_PENALTY`: Penalty for drawdown in PPO reward (default: 0.5)
 - `ENV_OBS_ROLLING_FEATURES`: Include rolling return/volatility in observations (default: true)
 - `ENV_ALLOW_CASH_EXPOSURE`: When true (default), sum of PPO actions = total market exposure (capped at 1); rest stays in cash. When false, weights are normalized to 100% invested.
+- `RELATIVE_STRENGTH_BENCHMARK`: Benchmark symbol for relative strength specialist (default: SPY). Override in `.env` for sector-relative strength.
 - `MIN_TRADE_NOTIONAL`: Minimum dollar gap to trigger a trade (default: 100). Used in live, backtest, and training envs; trades below this size are skipped (HOLD).
 - **Universe (autodiscovery)**: `UNIVERSE_SOURCE` (config | file | sp500), `UNIVERSE_FILE` (path when source=file), `TRADE_LIST_SIZE` (default 5), `AUTODISCOVER_INTERVAL_DAYS` (default 7)
 

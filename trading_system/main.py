@@ -40,6 +40,7 @@ from .config import (
     OUTPUT_DIR,
     STARTING_CAPITAL,
     TRAIN_HISTORICAL_RATIO,
+    TRAIN_HISTORICAL_RATIO_OVERRIDE,
     TRADE_LIST_SIZE,
     TRADE_TICKERS,
 )
@@ -63,6 +64,8 @@ def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = 
         mr = out.get("mean_reversion_score", 0.0)
         vol = out.get("volatility_score", 0.5)
         evt = out.get("event_risk_score", 0.0)
+        rs = out.get("relative_strength_score", 0.0)
+        liq = out.get("liquidity_score", 0.5)
         bad = []
         for name, val in [
             ("sentiment", s),
@@ -73,6 +76,8 @@ def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = 
             ("mean_reversion_score", mr),
             ("volatility_score", vol),
             ("event_risk_score", evt),
+            ("relative_strength_score", rs),
+            ("liquidity_score", liq),
         ]:
             try:
                 v = float(val)
@@ -96,7 +101,11 @@ def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = 
             bad.append(f"volatility_score={vol}")
         if not (0 <= evt <= 1):
             bad.append(f"event_risk_score={evt}")
-        msg = f"DEBUG | {t} | sentiment={s:.3f} quant_prob={q:.3f} fund_score={f:.3f} regime_flag={r:.3f} momentum={mom:.3f} mean_rev={mr:.3f} vol={vol:.3f} event={evt:.3f}"
+        if not (-1 <= rs <= 1):
+            bad.append(f"relative_strength_score={rs}")
+        if not (0 <= liq <= 1):
+            bad.append(f"liquidity_score={liq}")
+        msg = f"DEBUG | {t} | sentiment={s:.3f} quant_prob={q:.3f} fund_score={f:.3f} regime_flag={r:.3f} momentum={mom:.3f} mean_rev={mr:.3f} vol={vol:.3f} event={evt:.3f} rs={rs:.3f} liq={liq:.3f}"
         if ENV_OBS_ROLLING_FEATURES:
             r5 = out.get("rolling_return_5d", 0.0)
             r21 = out.get("rolling_return_21d", 0.0)
@@ -151,6 +160,8 @@ def _run_specialists(ticker: str = "SPY") -> dict:
         get_mean_reversion_score,
         get_volatility_score,
         get_event_risk_score,
+        get_relative_strength_score,
+        get_liquidity_score,
     )
     from .data.loader import load_ohlcv
 
@@ -166,6 +177,8 @@ def _run_specialists(ticker: str = "SPY") -> dict:
     mean_reversion_score = get_mean_reversion_score(ticker)
     volatility_score = get_volatility_score(ticker)
     event_risk_score = get_event_risk_score(ticker)
+    relative_strength_score = get_relative_strength_score(ticker)
+    liquidity_score = get_liquidity_score(ticker)
 
     out = {
         "sentiment": sentiment,
@@ -176,6 +189,8 @@ def _run_specialists(ticker: str = "SPY") -> dict:
         "mean_reversion_score": mean_reversion_score,
         "volatility_score": volatility_score,
         "event_risk_score": event_risk_score,
+        "relative_strength_score": relative_strength_score,
+        "liquidity_score": liquidity_score,
         "regime_name": regime_result["regime"],
     }
     if ENV_OBS_ROLLING_FEATURES:
@@ -284,7 +299,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     else:
         historical_ratio = TRAIN_HISTORICAL_RATIO
 
-    user_set_ratio = (getattr(args, "historical_ratio", None) is not None) or getattr(args, "use_historical", False)
+    user_set_ratio = (getattr(args, "historical_ratio", None) is not None) or getattr(args, "use_historical", False) or TRAIN_HISTORICAL_RATIO_OVERRIDE
     if not user_set_ratio and getattr(args, "use_tuned", False):
         from .meta_learner.tuner import load_tuned_params
         tuned = load_tuned_params()
@@ -519,6 +534,8 @@ def _proxy_specialists_from_returns(
             "mean_reversion_score": 0.0,
             "volatility_score": 0.5,
             "event_risk_score": 0.0,
+            "relative_strength_score": 0.0,
+            "liquidity_score": 0.5,
         }
         if ENV_OBS_ROLLING_FEATURES:
             out.update({"rolling_return_5d": 0.0, "rolling_return_21d": 0.0, "rolling_vol_21d": 0.0})
@@ -550,6 +567,8 @@ def _proxy_specialists_from_returns(
         "mean_reversion_score": mean_reversion_proxy,
         "volatility_score": volatility_proxy,
         "event_risk_score": event_risk_proxy,
+        "relative_strength_score": 0.0,
+        "liquidity_score": 0.5,
     }
     if ENV_OBS_ROLLING_FEATURES:
         ret_5d = float(lookback.tail(5).mean()) if len(lookback) >= 5 else mean_ret

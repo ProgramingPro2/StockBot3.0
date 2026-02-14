@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Boardroom is a hierarchical multi-agent trading system. Eight specialist agents analyze the market independently (per ticker). Their outputs are fed into a PPO meta-learner that decides position sizing for a configurable list of symbols (default: 5 stocks).
+The Boardroom is a hierarchical multi-agent trading system. Ten specialist agents analyze the market independently (per ticker). Their outputs are fed into a PPO meta-learner that decides position sizing for a configurable list of symbols (default: 5 stocks).
 
 The system trades a configurable list of tickers (see `TRADE_TICKERS` in config; default: SPY, AAPL, MSFT, GOOGL, NVDA). Override via `--tickers SPY,AAPL,...` on the CLI. Training, backtest, paper, and live all use this list.
 
@@ -19,6 +19,8 @@ yfinance (OHLCV, fundamentals, news) per ticker
     +---> Mean-Reversion Specialist (rule-based) --> mean_reversion_score (oversold/overbought)
     +---> Volatility Specialist (rule-based) --> volatility_score (per-asset risk)
     +---> Earnings/Event Risk Specialist (rule-based) --> event_risk_score (days to earnings)
+    +---> Relative Strength Specialist (rule-based) --> relative_strength_score (vs benchmark 20d/60d)
+    +---> Liquidity Specialist (rule-based) --> liquidity_score [0,1] (volume percentile)
     |
     v
 Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
@@ -82,13 +84,27 @@ Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
 - **Output**: event_risk_score [0, 1] (higher = closer to next earnings)
 - **Logic**: Ramp from 0 when >21 days away to 1 when 0-3 days before; no training required
 
+### Relative Strength Specialist
+
+- **Model**: Rule-based (price returns vs benchmark)
+- **Input**: OHLCV for ticker and benchmark (default SPY; configurable via `RELATIVE_STRENGTH_BENCHMARK`)
+- **Output**: relative_strength_score [-1, 1] (negative = underperforming, positive = outperforming)
+- **Logic**: 20d and 60d total returns vs benchmark; average relative return scaled/clipped to [-1, 1]; complements momentum for rotation
+
+### Liquidity Specialist
+
+- **Model**: Rule-based (volume percentile)
+- **Input**: OHLCV volume from yfinance
+- **Output**: liquidity_score [0, 1] (higher = more liquid)
+- **Logic**: Percentile of current volume within last 20d/60d; helps meta-learner avoid oversizing illiquid names
+
 ## Meta-Learner
 
 - **Model**: PPO (stable-baselines3)
-- **Observation**: Per-asset specialist features + holdings + optional rolling features. Length = 12 \* n_assets when `ENV_OBS_ROLLING_FEATURES` is true: for each asset (sentiment, quant_prob, fund_score, regime_flag, momentum_score, mean_reversion_score, volatility_score, event_risk_score, holdings, rolling_return_5d, rolling_return_21d, rolling_vol_21d). Example: 60-dim for 5 assets.
+- **Observation**: Per-asset specialist features + holdings + optional rolling features. Length = 14 \* n_assets when `ENV_OBS_ROLLING_FEATURES` is true: for each asset (sentiment, quant_prob, fund_score, regime_flag, momentum_score, mean_reversion_score, volatility_score, event_risk_score, relative_strength_score, liquidity_score, holdings, rolling_return_5d, rolling_return_21d, rolling_vol_21d). Without rolling: 11 \* n_assets. Example: 70-dim for 5 assets with rolling.
 - **Action**: Position size % per asset [0, 1]; n_assets outputs (e.g. 5). When `ENV_ALLOW_CASH_EXPOSURE` is true, the **sum** of actions is interpreted as total market exposure (capped at 1); the rest stays in cash (0 return).
 - **Reward**: Portfolio rolling Sharpe ratio minus drawdown penalty (configurable via `ENV_REWARD_DRAWDOWN_PENALTY`).
-- **Training**: Three modes: synthetic `TradingEnv` (random returns), `HistoricalTradingEnv` (real OHLCV returns), or `MixedDataEnv` (configurable blend). Use `--use-historical` for 100% historical, `--historical-ratio 0.7` for 70% historical / 30% synthetic, or `TRAIN_HISTORICAL_RATIO` in config. Mixed training lets the model learn both generalizable strategies and real market dynamics.
+- **Training**: Three modes: synthetic `TradingEnv` (random returns), `HistoricalTradingEnv` (real OHLCV returns), or `MixedDataEnv` (configurable blend). Use `--use-historical` for 100% historical, `--historical-ratio 0.7` for 70% historical / 30% synthetic, or `TRAIN_HISTORICAL_RATIO` in config. When `TRAIN_HISTORICAL_RATIO` is set in `.env`, it is used as the fixed ratio for both training and tuning and the tuner will not search for it. Mixed training lets the model learn both generalizable strategies and real market dynamics.
 - **Tuning**: Run `tune` for Optuna-based hyperparameter optimization; use `--use-tuned` when training.
 
 ### Variable Exposure and Cash
@@ -114,7 +130,7 @@ trading_system/
   scheduler.py      - Time-window supervisor + cron one-shot jobs
   scheduler_systemd.py - Install/uninstall systemd user service (Linux)
   data/             - Loader, news scraper, processor
-  agents/           - sentiment, quantitative, fundamental, regime, momentum, mean_reversion, volatility, earnings_event
+  agents/           - sentiment, quantitative, fundamental, regime, momentum, mean_reversion, volatility, earnings_event, relative_strength, liquidity
   meta_learner/     - Gym env (TradingEnv, HistoricalTradingEnv), PPO trader, Optuna tuner
   universe/         - Universe provider, features, ScorerModel, selector, autodiscover pipeline
   broker/           - Alpaca integration, Discord notifications
@@ -137,7 +153,7 @@ This keeps behavior consistent across live, backtest, and training and avoids da
 
 ## Trading Modes
 
-**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` for pure historical returns, `--historical-ratio 0.7` for mixed (70% historical, 30% synthetic), or `TRAIN_HISTORICAL_RATIO` in config. Use `--use-tuned` to apply tuned hyperparameters.
+**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` for pure historical returns, `--historical-ratio 0.7` for mixed (70% historical, 30% synthetic), or `TRAIN_HISTORICAL_RATIO` in config. When `TRAIN_HISTORICAL_RATIO` is set in `.env`, it is used as the fixed ratio for both training and tuning. Use `--use-tuned` to apply tuned hyperparameters.
 
 **Tune**: Run Optuna hyperparameter tuning on historical data. Best params saved to `models/meta_learner/ppo_tune_best.json`.
 

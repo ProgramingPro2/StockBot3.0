@@ -54,6 +54,9 @@ MOMENTUM_N_ESTIMATORS = 100
 MOMENTUM_MAX_DEPTH = 4
 MOMENTUM_LEARNING_RATE = 0.05
 
+# Relative Strength Specialist (benchmark for outperformance score)
+RELATIVE_STRENGTH_BENCHMARK = os.getenv("RELATIVE_STRENGTH_BENCHMARK", "SPY").strip().upper() or "SPY"
+
 # Ensure directories exist
 for d in [CACHE_DIR, FUNDAMENTAL_CACHE_DIR, NEWS_CACHE_DIR, SPECIALIST_CACHE_DIR, OUTPUT_DIR, QUANTITATIVE_MODEL_DIR, FUNDAMENTAL_MODEL_DIR, REGIME_MODEL_DIR, MOMENTUM_MODEL_DIR, META_LEARNER_MODEL_DIR, UNIVERSE_MODEL_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -146,6 +149,8 @@ PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4
 
 # PPO training: fraction of episodes on historical vs synthetic data (0.0 = synthetic only, 1.0 = historical only)
 TRAIN_HISTORICAL_RATIO = float(os.getenv("TRAIN_HISTORICAL_RATIO", "0.0"))
+# When set in .env, use this ratio for both training and tuning; tuner will not search for historical_ratio
+TRAIN_HISTORICAL_RATIO_OVERRIDE = "TRAIN_HISTORICAL_RATIO" in os.environ
 
 # Environment
 ENV_ROLLING_SHARPE_DAYS = 252

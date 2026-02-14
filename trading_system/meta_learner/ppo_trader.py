@@ -266,6 +266,8 @@ class PPOTrader:
             parts.append(float(s.get("mean_reversion_score", 0.0)))
             parts.append(float(s.get("volatility_score", 0.5)))
             parts.append(float(s.get("event_risk_score", 0.0)))
+            parts.append(float(s.get("relative_strength_score", 0.0)))
+            parts.append(float(s.get("liquidity_score", 0.5)))
             parts.append(float(holdings[i]))
             if ENV_OBS_ROLLING_FEATURES:
                 parts.append(float(s.get("rolling_return_5d", 0.0)))
@@ -277,7 +279,7 @@ class PPOTrader:
         action_clipped = np.clip(action, 0, 1)
 
         if debug:
-            per_asset = 9 + (3 if ENV_OBS_ROLLING_FEATURES else 0)
+            per_asset = 11 + (3 if ENV_OBS_ROLLING_FEATURES else 0)
             names = [
                 "sentiment",
                 "quant_prob",
@@ -287,6 +289,8 @@ class PPOTrader:
                 "mean_reversion_score",
                 "volatility_score",
                 "event_risk_score",
+                "relative_strength_score",
+                "liquidity_score",
                 "holdings",
             ]
             if ENV_OBS_ROLLING_FEATURES:
@@ -328,6 +332,11 @@ def benchmark_device(
                 "fund_score": float(np.random.uniform(-1, 1)),
                 "regime_flag": float(np.random.uniform(0, 1)),
                 "momentum_score": float(np.random.uniform(-1, 1)),
+                "mean_reversion_score": float(np.random.uniform(-1, 1)),
+                "volatility_score": float(np.random.uniform(0, 1)),
+                "event_risk_score": float(np.random.uniform(0, 1)),
+                "relative_strength_score": float(np.random.uniform(-1, 1)),
+                "liquidity_score": float(np.random.uniform(0, 1)),
             }
             for _ in range(n_assets)
         ]

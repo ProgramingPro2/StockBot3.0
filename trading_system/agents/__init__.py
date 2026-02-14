@@ -7,6 +7,8 @@ from .momentum import get_momentum_score
 from .mean_reversion import get_mean_reversion_score
 from .volatility import get_volatility_score
 from .earnings_event import get_event_risk_score
+from .relative_strength import get_relative_strength_score
+from .liquidity import get_liquidity_score
 
 __all__ = [
     "get_sentiment",
@@ -17,4 +19,6 @@ __all__ = [
     "get_mean_reversion_score",
     "get_volatility_score",
     "get_event_risk_score",
+    "get_relative_strength_score",
+    "get_liquidity_score",
 ]
