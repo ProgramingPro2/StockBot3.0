@@ -362,6 +362,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         historical_returns=historical_returns,
         historical_ratio=historical_ratio,
         ppo_kwargs=ppo_kwargs,
+        n_envs=getattr(args, "n_envs", None),
     )
     logger.info("Training complete. Models saved.")
 
@@ -1278,6 +1279,7 @@ def main() -> None:
     train_p.add_argument("--use-historical", action="store_true", help="Train PPO on real historical returns only (equivalent to --historical-ratio 1.0)")
     train_p.add_argument("--historical-ratio", type=float, default=None, help="Fraction of episodes on historical vs synthetic data. For mixed mode use 0.1-0.9. 0 = synthetic only, 1 = historical only.")
     train_p.add_argument("--use-tuned", action="store_true", help="Use hyperparameters from previous 'tune' run")
+    train_p.add_argument("--n-envs", type=int, default=None, help="Parallel env count for SubprocVecEnv (default: PPO_N_ENVS)")
     train_p.set_defaults(func=cmd_train)
 
     benchmark_p = sub.add_parser("benchmark-device", help="Compare PPO training speed: CPU vs GPU (short run, no model saved)")

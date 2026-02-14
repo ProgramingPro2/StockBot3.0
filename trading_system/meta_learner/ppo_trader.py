@@ -5,16 +5,19 @@ Weights specialist opinions to decide position sizing.
 import logging
 import time
 from datetime import datetime
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # When training runs this many timesteps or more, an additional dated copy is saved.
 LONG_RUN_TIMESTEPS = 1_000_000
 
+import gymnasium as gym
 import numpy as np
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from ..config import (
     ENV_OBS_ROLLING_FEATURES,
@@ -29,9 +32,77 @@ from ..config import (
     PPO_LEARNING_RATE,
     PPO_N_EPOCHS,
     PPO_NET_ARCH,
+    PPO_N_ENVS,
     PPO_N_STEPS,
 )
 from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
+
+
+def _random_specialist_outputs(n_assets: int) -> list[dict]:
+    """Module-level random specialist outputs; picklable (no closure over self)."""
+    return [
+        {
+            "sentiment": float(np.random.uniform(-1, 1)),
+            "quant_prob": float(np.random.uniform(0, 1)),
+            "fund_score": float(np.random.uniform(-1, 1)),
+            "regime_flag": float(np.random.uniform(0, 1)),
+            "momentum_score": float(np.random.uniform(-1, 1)),
+            "mean_reversion_score": float(np.random.uniform(-1, 1)),
+            "volatility_score": float(np.random.uniform(0, 1)),
+            "event_risk_score": float(np.random.uniform(0, 1)),
+        }
+        for _ in range(n_assets)
+    ]
+
+
+class SpecialistWrapper(TradingEnv):
+    """
+    TradingEnv that injects specialist outputs on reset.
+    Module-level for picklability with SubprocVecEnv.
+    """
+
+    def __init__(self, n_assets: int, specialist_fn: Callable[[], list[dict]] | None = None):
+        super().__init__(n_assets=n_assets)
+        self._specialist_fn = specialist_fn
+
+    def reset(self, seed: int | None = None, options: dict | None = None):
+        opts = dict(options or {})
+        fn = self._specialist_fn or (lambda: _random_specialist_outputs(self.n_assets))
+        outputs = fn()
+        if isinstance(outputs, dict):
+            outputs = [outputs] * self.n_assets
+        outputs = (list(outputs) + [{}] * self.n_assets)[: self.n_assets]
+        opts["specialist_outputs"] = outputs
+        return super().reset(seed=seed, options=opts)
+
+
+def _make_env_fn(
+    mode: str,
+    historical_returns: np.ndarray | None,
+    n_assets: int,
+    historical_ratio: float,
+    specialist_fn: Callable[[], list[dict]] | None,
+    seed: int,
+) -> gym.Env:
+    """
+    Picklable factory that creates one env for SubprocVecEnv.
+    mode: "historical" | "mixed" | "synthetic"
+    """
+    if mode == "historical" and historical_returns is not None:
+        env = HistoricalTradingEnv(returns_array=historical_returns, n_assets=n_assets)
+    elif mode == "mixed" and historical_returns is not None and 0 < historical_ratio < 1:
+        hist_env = HistoricalTradingEnv(returns_array=historical_returns, n_assets=n_assets)
+        synth_env = SpecialistWrapper(n_assets=n_assets, specialist_fn=specialist_fn)
+        env = MixedDataEnv(
+            historical_env=hist_env,
+            synthetic_env=synth_env,
+            historical_ratio=historical_ratio,
+        )
+    else:
+        env = SpecialistWrapper(n_assets=n_assets, specialist_fn=specialist_fn)
+
+    env.reset(seed=seed)
+    return env
 
 
 def _get_ppo_device() -> str:
@@ -86,6 +157,7 @@ class PPOTrader:
         historical_returns: np.ndarray | None = None,
         historical_ratio: float = 0.0,
         ppo_kwargs: dict[str, Any] | None = None,
+        n_envs: int | None = None,
     ) -> Path | None:
         """
         Train PPO on simulated or historical episodes.
@@ -95,25 +167,8 @@ class PPOTrader:
         historical_ratio: fraction of episodes on historical data (0.0 = synthetic only,
             1.0 = historical only, 0.5 = 50/50 mixed).
         ppo_kwargs: optional overrides for PPO hyperparameters (e.g. from tuning).
+        n_envs: parallel env count for SubprocVecEnv; None = use PPO_N_ENVS.
         """
-        import numpy as np
-
-        def _default_specialist_fn():
-            return [
-                {
-                    "sentiment": float(np.random.uniform(-1, 1)),
-                    "quant_prob": float(np.random.uniform(0, 1)),
-                    "fund_score": float(np.random.uniform(-1, 1)),
-                    "regime_flag": float(np.random.uniform(0, 1)),
-                    "momentum_score": float(np.random.uniform(-1, 1)),
-                    "mean_reversion_score": float(np.random.uniform(-1, 1)),
-                    "volatility_score": float(np.random.uniform(0, 1)),
-                    "event_risk_score": float(np.random.uniform(0, 1)),
-                }
-                for _ in range(self.n_assets)
-            ]
-
-        specialist_fn = specialist_fn or _default_specialist_fn
         kwargs = dict(ppo_kwargs or {})
         best_value = kwargs.pop("best_value", None)
         if best_value is not None:
@@ -121,50 +176,50 @@ class PPOTrader:
                 "Training with tuned params (baseline eval reward: %.4f)", best_value
             )
 
-        def _make_synthetic_env():
-            def _reset_fn():
-                if specialist_fn:
-                    outputs = specialist_fn()
-                    if isinstance(outputs, dict):
-                        outputs = [outputs] * self.n_assets
-                    outputs = (list(outputs) + [{}] * self.n_assets)[: self.n_assets]
-                    return {"specialist_outputs": outputs}
-                return {}
-
-            class SpecialistWrapper(TradingEnv):
-                def reset(self, seed=None, options=None):
-                    opts = options or {}
-                    opts.update(_reset_fn())
-                    return super().reset(seed=seed, options=opts)
-
-            return SpecialistWrapper(n_assets=self.n_assets)
+        specialist_fn = specialist_fn  # None => use _random_specialist_outputs in factory
+        n_envs = n_envs if n_envs is not None else PPO_N_ENVS
 
         if historical_returns is not None and historical_ratio >= 1.0:
-            env = HistoricalTradingEnv(
-                returns_array=historical_returns,
-                n_assets=self.n_assets,
-            )
+            mode = "historical"
             logging.getLogger("boardroom").info("PPO training mode: 100%% historical")
         elif historical_returns is not None and 0 < historical_ratio < 1:
             historical_ratio = max(0.1, min(0.9, historical_ratio))
-            historical_env = HistoricalTradingEnv(
-                returns_array=historical_returns,
-                n_assets=self.n_assets,
-            )
-            synthetic_env = _make_synthetic_env()
-            env = MixedDataEnv(
-                historical_env=historical_env,
-                synthetic_env=synthetic_env,
-                historical_ratio=historical_ratio,
-            )
+            mode = "mixed"
             logging.getLogger("boardroom").info(
                 "PPO training mode: mixed (%.0f%% historical, %.0f%% synthetic)",
                 historical_ratio * 100,
                 (1 - historical_ratio) * 100,
             )
         else:
-            env = _make_synthetic_env()
+            mode = "synthetic"
             logging.getLogger("boardroom").info("PPO training mode: 100%% synthetic")
+
+        if n_envs <= 1:
+            env = _make_env_fn(
+                mode=mode,
+                historical_returns=historical_returns,
+                n_assets=self.n_assets,
+                historical_ratio=historical_ratio,
+                specialist_fn=specialist_fn,
+                seed=0,
+            )
+        else:
+            env_fns = [
+                partial(
+                    _make_env_fn,
+                    mode=mode,
+                    historical_returns=historical_returns,
+                    n_assets=self.n_assets,
+                    historical_ratio=historical_ratio,
+                    specialist_fn=specialist_fn,
+                    seed=i,
+                )
+                for i in range(n_envs)
+            ]
+            env = SubprocVecEnv(env_fns)
+            logging.getLogger("boardroom").info(
+                "PPO training with %d parallel envs (SubprocVecEnv)", n_envs
+            )
 
         device = _get_ppo_device()
         if device == "cpu":
@@ -179,6 +234,7 @@ class PPOTrader:
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cuda",
             )
 
+        env_num_envs = getattr(env, "num_envs", 1)
         if self.model is None:
             policy_kwargs = kwargs.pop("policy_kwargs", None) or PPO_NET_ARCH
             if policy_kwargs is None:
@@ -199,6 +255,12 @@ class PPOTrader:
                 verbose=1,
                 **kwargs,
             )
+        elif env_num_envs != self.model.n_envs:
+            path = META_LEARNER_MODEL_DIR / "ppo_trader.zip"
+            if path.exists():
+                self.model = PPO.load(str(path), env=env, device=device)
+            else:
+                self.model.set_env(env)
         else:
             self.model.set_env(env)
 

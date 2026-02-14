@@ -146,6 +146,8 @@ PPO_TOTAL_TIMESTEPS = int(os.getenv("PPO_TOTAL_TIMESTEPS", "500000"))  # Try 100
 PPO_CHECKPOINT_FREQ = int(os.getenv("PPO_CHECKPOINT_FREQ", "100000"))
 # CPU threads for PPO when device=cpu; 0 = use all available
 PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4)
+# Parallel envs for SubprocVecEnv; 1 = single env (no subprocess). With n_envs>1, total rollout = n_steps * n_envs
+PPO_N_ENVS = int(os.getenv("PPO_N_ENVS", "4"))
 
 # PPO training: fraction of episodes on historical vs synthetic data (0.0 = synthetic only, 1.0 = historical only)
 TRAIN_HISTORICAL_RATIO = float(os.getenv("TRAIN_HISTORICAL_RATIO", "0.0"))
