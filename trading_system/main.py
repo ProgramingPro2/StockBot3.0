@@ -31,6 +31,8 @@ import pandas as pd
 
 from .config import (
     BASE_DIR,
+    BOARDROOM_SUMMARY_DISCORD,
+    BOARDROOM_SUMMARY_ENABLED,
     ENV_ALLOW_CASH_EXPOSURE,
     ENV_OBS_ROLLING_FEATURES,
     FRACTIONAL,
@@ -320,19 +322,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     logger.info("Training meta-learner (PPO)...")
     trader = PPOTrader(n_assets=n_assets, load=not args.retrain)
 
-    def _proxy_specialist_fn_from_historical(
-        returns_array: np.ndarray, n: int, window: int = 21
-    ):
-        """Return a callable that yields proxy specialist outputs from historical returns (no LLM)."""
-        n_days = returns_array.shape[0]
-
-        def fn() -> list[dict]:
-            start = random.randint(window, n_days) if n_days > window else window
-            return [
-                _proxy_specialists_from_returns(pd.Series(returns_array[:, i]), start, window)
-                for i in range(n)
-            ]
-        return fn
+    from .meta_learner.env_helpers import create_proxy_specialist_fn
 
     ppo_kwargs = None
     if getattr(args, "use_tuned", False):
@@ -352,7 +342,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     # Training uses proxy-from-returns only (no LLM sentiment). Matches backtest.
     specialist_fn_for_train = (
-        _proxy_specialist_fn_from_historical(historical_returns, n_assets)
+        create_proxy_specialist_fn(historical_returns, n_assets)
         if historical_returns is not None
         else None
     )
@@ -690,8 +680,42 @@ def _run_backtest(
     )
 
 
+def _tune_interactive_prompt() -> dict:
+    """Prompt for tuning options; return dict of n_trials, timesteps, timeout, new, study_name, n_envs, use_historical, single_thread."""
+    from .config import PPO_N_ENVS
+
+    result = {}
+    print("Start new study or continue existing? [c]ontinue / [n]ew (default: continue): ", end="")
+    result["new"] = input().strip().lower().startswith("n")
+    if result["new"]:
+        print("Study name (optional; press Enter for auto-generated): ", end="")
+        result["study_name"] = input().strip() or None
+    else:
+        result["study_name"] = None
+    print("Number of trials (default: 50): ", end="")
+    raw = input().strip()
+    result["n_trials"] = int(raw) if raw.isdigit() else 50
+    print("Timesteps per trial (default: 100000): ", end="")
+    raw = input().strip()
+    result["timesteps"] = int(raw) if raw.isdigit() else 100_000
+    print("Timeout in seconds (0 = no limit, default: 0): ", end="")
+    raw = input().strip()
+    result["timeout"] = int(raw) if raw.isdigit() else 0
+    print("Parallel envs (default: %d): " % PPO_N_ENVS, end="")
+    raw = input().strip()
+    result["n_envs"] = int(raw) if raw.isdigit() else None
+    print("Use historical only (no mixed trials)? y/[n] (default: n): ", end="")
+    result["use_historical"] = input().strip().lower().startswith("y")
+    print("Single PyTorch thread (reproducibility)? y/[n]: ", end="")
+    result["single_thread"] = input().strip().lower().startswith("y")
+    return result
+
+
 def cmd_tune(args: argparse.Namespace) -> None:
     """Run Optuna hyperparameter tuning for PPO on historical data."""
+    import time
+
+    from .config import PPO_N_ENVS
     from .meta_learner.tuner import PPO_TUNE_PARAMS_PATH, run_tuning
 
     tickers = _tickers_from_args(args)
@@ -700,26 +724,70 @@ def cmd_tune(args: argparse.Namespace) -> None:
         logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
         return
 
+    n_trials = getattr(args, "n_trials", None) or 50
+    timesteps = getattr(args, "timesteps", None) or 100_000
+    timeout = getattr(args, "timeout", 0) or 0
+    start_new = getattr(args, "new", False)
+    study_name_arg = getattr(args, "study_name", None)
+    n_envs = getattr(args, "n_envs", None)
+    use_historical = getattr(args, "use_historical", False)
+    historical_ratio_arg = getattr(args, "historical_ratio", None)
+    interactive = getattr(args, "interactive", False)
+    single_thread = getattr(args, "single_thread", False)
+
+    if interactive:
+        prompted = _tune_interactive_prompt()
+        n_trials = prompted["n_trials"]
+        timesteps = prompted["timesteps"]
+        timeout = prompted["timeout"] or 0
+        start_new = prompted["new"]
+        study_name_arg = prompted.get("study_name") or study_name_arg
+        n_envs = prompted.get("n_envs") if prompted.get("n_envs") is not None else n_envs
+        use_historical = prompted.get("use_historical", False)
+        single_thread = prompted.get("single_thread", False)
+
+    if start_new and not study_name_arg:
+        study_name_arg = f"ppo_tune_{int(time.time())}"
+    study_name = study_name_arg or "ppo_tune"
+    load_if_exists = not start_new
+    fixed_historical_ratio = None
+    if use_historical:
+        fixed_historical_ratio = 1.0
+    elif historical_ratio_arg is not None:
+        fixed_historical_ratio = max(0.0, min(1.0, historical_ratio_arg))
+
     _, returns_array = _load_aligned_returns(tickers)
     if returns_array is None:
         logger.error("Could not load historical data for tuning")
         return
 
-    logger.info("Running hyperparameter tuning for %d tickers (%d trials, %d timesteps/trial)...", n_assets, args.n_trials, args.timesteps)
+    logger.info(
+        "Running hyperparameter tuning for %d tickers (%d trials, %d timesteps/trial, study=%s, n_envs=%s)...",
+        n_assets,
+        n_trials,
+        timesteps,
+        study_name,
+        n_envs if n_envs is not None else PPO_N_ENVS,
+    )
     best = run_tuning(
         returns_array=returns_array,
         n_assets=n_assets,
-        n_trials=args.n_trials,
-        n_timesteps=args.timesteps,
-        timeout=args.timeout if args.timeout > 0 else None,
+        n_trials=n_trials,
+        n_timesteps=timesteps,
+        timeout=timeout if timeout > 0 else None,
+        n_envs=n_envs,
+        study_name=study_name,
+        load_if_exists=load_if_exists,
+        fixed_historical_ratio=fixed_historical_ratio,
+        single_thread=single_thread,
     )
     logger.info("Tuning complete. Best params saved to %s", PPO_TUNE_PARAMS_PATH)
     try:
         from .broker.discord_notifier import send_hpo_complete_embed
         if send_hpo_complete_embed(
-            n_trials=args.n_trials,
+            n_trials=n_trials,
             n_tickers=n_assets,
-            timesteps_per_trial=args.timesteps,
+            timesteps_per_trial=timesteps,
             best_params=best,
             best_value=best.get("best_value"),
         ):
@@ -730,6 +798,31 @@ def cmd_tune(args: argparse.Namespace) -> None:
         if k != "policy_kwargs":
             logger.info("  %s: %s", k, v)
     logger.info("Run 'train --use-historical --use-tuned' to train with these params.")
+
+
+def cmd_tune_status(args: argparse.Namespace) -> None:
+    """Show tuning study status: studies in storage, best trial, best value."""
+    from .meta_learner.tuner import PPO_TUNE_PARAMS_PATH, PPO_TUNE_STUDY_PATH, get_tune_status
+
+    study_name = getattr(args, "study_name", None)
+    status = get_tune_status(study_name=study_name)
+    names = status.get("study_names", [])
+    studies = status.get("studies", {})
+    if not names:
+        logger.info("No tuning studies found. Storage: %s", PPO_TUNE_STUDY_PATH)
+        return
+    logger.info("Tuning storage: %s", PPO_TUNE_STUDY_PATH)
+    logger.info("Best params file: %s", PPO_TUNE_PARAMS_PATH)
+    for name in names:
+        info = studies.get(name, {})
+        if "error" in info:
+            logger.info("  %s: %s", name, info["error"])
+            continue
+        n_trials = info.get("n_trials", 0)
+        best_value = info.get("best_value")
+        best_trial = info.get("best_trial")
+        best_str = f" best_value=%.4f (trial %s)" % (best_value, best_trial) if best_value is not None else " (no completed trials)"
+        logger.info("  %s: n_trials=%d%s", name, n_trials, best_str)
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
@@ -836,6 +929,18 @@ def cmd_paper(args: argparse.Namespace) -> None:
                 action = np.array([_position_used(float(a)) for a in action])
             exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
 
+            if BOARDROOM_SUMMARY_ENABLED:
+                try:
+                    from .utils.boardroom_summary import get_boardroom_summary
+                    summary = get_boardroom_summary(tickers, specialist_list, weights, exposure, cash=None)
+                    if summary:
+                        logger.info("Boardroom: %s", summary)
+                        if BOARDROOM_SUMMARY_DISCORD:
+                            from .broker.discord_notifier import send_boardroom_summary_embed
+                            send_boardroom_summary_embed(summary, tickers, exposure)
+                except Exception as exc:
+                    logger.debug("Boardroom summary skipped: %s", exc)
+
             for i, t in enumerate(tickers):
                 position_pct = float(weights[i])
                 out = specialist_list[i]
@@ -926,6 +1031,13 @@ def cmd_live(args: argparse.Namespace) -> None:
             else:
                 logger.debug("Alpaca positions: none")
 
+            position_symbols = [p["symbol"] for p in alpaca_positions]
+            from zoneinfo import ZoneInfo
+
+            bought_today = broker.get_symbols_bought_on_date(
+                today, position_symbols, ZoneInfo("America/New_York")
+            )
+
             specialist_list: list[dict] = []
             for t in tickers:
                 specialist_list.append(_run_specialists(t))
@@ -941,9 +1053,39 @@ def cmd_live(args: argparse.Namespace) -> None:
                 logger.warning("Account on margin (cash=%.2f); not placing buy orders", cash)
             total_invested = max(0.0, cash * exposure) if cash > 0 else 0.0
 
+            if BOARDROOM_SUMMARY_ENABLED:
+                try:
+                    from .utils.boardroom_summary import get_boardroom_summary
+                    summary = get_boardroom_summary(tickers, specialist_list, weights, exposure, cash=cash)
+                    if summary:
+                        logger.info("Boardroom: %s", summary)
+                        if BOARDROOM_SUMMARY_DISCORD:
+                            from .broker.discord_notifier import send_boardroom_summary_embed
+                            send_boardroom_summary_embed(summary, tickers, exposure)
+                except Exception as exc:
+                    logger.debug("Boardroom summary skipped: %s", exc)
+
             if not broker.is_market_open():
                 logger.info("Market closed (Alpaca clock); skipping orders this cycle")
                 time.sleep(interval_sec)
+                continue
+
+            # Fully locked: all capital in positions bought today; no buys or sells possible
+            if alpaca_positions and cash < MIN_TRADE_NOTIONAL and all(
+                pos.get("symbol", "") in bought_today for pos in alpaca_positions
+            ):
+                logger.info(
+                    "All capital in positions bought today; no buys or sells possible. Sleeping until next trading day."
+                )
+                from datetime import datetime, timedelta
+                from zoneinfo import ZoneInfo
+
+                tz = ZoneInfo("America/New_York")
+                now = datetime.now(tz)
+                next_midnight = now.date() + timedelta(days=1)
+                next_day = datetime(next_midnight.year, next_midnight.month, next_midnight.day, 0, 0, 1, tzinfo=tz)
+                sec_until = max(1, int((next_day - now).total_seconds()))
+                time.sleep(sec_until)
                 continue
 
             # For whole-share orders we need latest price per ticker
@@ -1288,13 +1430,37 @@ def main() -> None:
     benchmark_p.add_argument("--use-historical", action="store_true", help="Use historical returns env (matches train with --use-historical)")
     benchmark_p.set_defaults(func=cmd_benchmark_device)
 
-    tune_p = sub.add_parser("tune", help="Run Optuna hyperparameter tuning for PPO")
+    tune_p = sub.add_parser("tune", help="Run Optuna hyperparameter tuning for PPO or show status")
     _add_debug(tune_p)
     tune_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
-    tune_p.add_argument("--n-trials", type=int, default=50, help="Number of Optuna trials")
-    tune_p.add_argument("--timesteps", type=int, default=100_000, help="PPO timesteps per trial")
+    tune_p.add_argument("--n-trials", type=int, default=None, help="Number of Optuna trials (default: 50)")
+    tune_p.add_argument("--timesteps", type=int, default=None, help="PPO timesteps per trial (default: 100000)")
     tune_p.add_argument("--timeout", type=int, default=0, help="Max seconds for tuning (0 = no limit, default)")
-    tune_p.set_defaults(func=cmd_tune)
+    tune_p.add_argument("--new", action="store_true", help="Start a new study (reuse name or use --study-name)")
+    tune_p.add_argument("--study-name", type=str, default=None, help="Optuna study name (default: ppo_tune; with --new, optional)")
+    tune_p.add_argument("--n-envs", type=int, default=None, help="Parallel env count for SubprocVecEnv (default: PPO_N_ENVS)")
+    tune_p.add_argument("--use-historical", action="store_true", help="Fix historical_ratio=1.0 (no mixed trials)")
+    tune_p.add_argument("--historical-ratio", type=float, default=None, help="Fixed historical ratio (overrides trial sampling)")
+    tune_p.add_argument("--interactive", action="store_true", help="Prompt for options interactively")
+    tune_p.add_argument("--single-thread", action="store_true", help="Use single PyTorch thread (reproducibility)")
+    tune_sub = tune_p.add_subparsers(dest="tune_action")
+    tune_run_p = tune_sub.add_parser("run", help="Run tuning (default when no subcommand)")
+    tune_run_p.add_argument("--tickers", type=str, default=None, help="Comma-separated tickers (default: config TRADE_TICKERS)")
+    tune_run_p.add_argument("--n-trials", type=int, default=None, help="Number of Optuna trials (default: 50)")
+    tune_run_p.add_argument("--timesteps", type=int, default=None, help="PPO timesteps per trial (default: 100000)")
+    tune_run_p.add_argument("--timeout", type=int, default=0, help="Max seconds for tuning (0 = no limit, default)")
+    tune_run_p.add_argument("--new", action="store_true", help="Start a new study (reuse name or use --study-name)")
+    tune_run_p.add_argument("--study-name", type=str, default=None, help="Optuna study name (default: ppo_tune; with --new, optional)")
+    tune_run_p.add_argument("--n-envs", type=int, default=None, help="Parallel env count for SubprocVecEnv (default: PPO_N_ENVS)")
+    tune_run_p.add_argument("--use-historical", action="store_true", help="Fix historical_ratio=1.0 (no mixed trials)")
+    tune_run_p.add_argument("--historical-ratio", type=float, default=None, help="Fixed historical ratio (overrides trial sampling)")
+    tune_run_p.add_argument("--interactive", action="store_true", help="Prompt for options interactively")
+    tune_run_p.add_argument("--single-thread", action="store_true", help="Use single PyTorch thread (reproducibility)")
+    tune_run_p.set_defaults(func=cmd_tune, tune_action="run")
+    tune_p.set_defaults(func=cmd_tune, tune_action="run")
+    tune_status_p = tune_sub.add_parser("status", help="Show tuning study status and best trial")
+    tune_status_p.add_argument("--study-name", type=str, default=None, help="Show only this study (default: all)")
+    tune_status_p.set_defaults(func=cmd_tune_status, tune_action="status")
 
     back_p = sub.add_parser("backtest", help="Backtest portfolio with trained models")
     _add_debug(back_p)

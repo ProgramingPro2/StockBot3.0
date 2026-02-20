@@ -1,8 +1,11 @@
 """
 Alpaca broker integration for live trading.
 """
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 from ..config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
@@ -74,6 +77,47 @@ class AlpacaBroker:
         except Exception as e:
             logger.error("Failed to get all positions: %s", e)
             return []
+
+    def get_symbols_bought_on_date(
+        self,
+        target_date: date,
+        position_symbols: list[str],
+        tz: ZoneInfo | None = None,
+    ) -> set[str]:
+        """
+        Return symbols that have at least one filled BUY order with filled_at on target_date (in tz).
+        Used for day-trading prevention: only call with symbols we currently hold (from positions).
+        """
+        if not self.client:
+            return set()
+        if not position_symbols:
+            return set()
+        tz = tz or ZoneInfo("America/New_York")
+        try:
+            after = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=tz)
+            until = after + timedelta(days=1)
+            req = GetOrdersRequest(
+                status="closed",
+                after=after,
+                until=until,
+                symbols=position_symbols,
+                side=OrderSide.BUY,
+                limit=500,
+            )
+            orders = self.client.get_orders(req)
+            result: set[str] = set()
+            for order in orders:
+                if order.filled_at is None or order.symbol is None:
+                    continue
+                if order.side != OrderSide.BUY:
+                    continue
+                fill_date = order.filled_at.astimezone(tz).date()
+                if fill_date == target_date:
+                    result.add(order.symbol)
+            return result
+        except Exception as e:
+            logger.error("Failed to get orders for bought-on-date check: %s", e)
+            return set()
 
     def get_position(self, ticker: str) -> dict:
         """Get current position for ticker."""

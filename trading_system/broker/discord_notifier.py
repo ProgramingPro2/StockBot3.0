@@ -136,6 +136,45 @@ def send_training_complete_embed(
         return False
 
 
+def send_boardroom_summary_embed(
+    summary: str,
+    tickers: list[str],
+    exposure: float,
+) -> bool:
+    """
+    Send the LLM-generated one-sentence boardroom summary to Discord.
+    Called each paper/live cycle when BOARDROOM_SUMMARY_DISCORD is set.
+    """
+    if not DISCORD_WEBHOOK_URL or not summary or not summary.strip():
+        return False
+
+    ticker_str = ", ".join(tickers) if len(tickers) <= 10 else ", ".join(tickers[:8]) + f"... (+{len(tickers) - 8} more)"
+    fields = [
+        {"name": "Summary", "value": summary.strip()[:1000], "inline": False},
+        {"name": "Tickers", "value": ticker_str, "inline": True},
+        {"name": "Exposure", "value": f"{exposure * 100:.0f}%", "inline": True},
+    ]
+
+    payload = {
+        "embeds": [
+            {
+                "title": "The Boardroom says",
+                "color": 0x0066CC,
+                "fields": fields,
+                "footer": {"text": "The Boardroom Trading System"},
+            }
+        ]
+    }
+
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.warning("Discord boardroom summary notification failed: %s", e)
+        return False
+
+
 def send_live_start_embed(
     tickers: list[str],
     interval_min: int,

@@ -1,9 +1,11 @@
 """
 Optuna-based hyperparameter tuning for PPO meta-learner.
 Samples PPO and env hyperparameters, trains on HistoricalTradingEnv, maximizes eval reward.
+Uses same env design as training: SubprocVecEnv, proxy-from-returns specialists.
 """
 import json
 import math
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -15,22 +17,27 @@ from optuna.samplers import TPESampler
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from ..config import (
     META_LEARNER_MODEL_DIR,
     PPO_BATCH_SIZE,
     PPO_CLIP_RANGE,
+    PPO_CPU_THREADS,
     PPO_GAMMA,
     PPO_GAE_LAMBDA,
     PPO_LEARNING_RATE,
     PPO_N_EPOCHS,
     PPO_N_STEPS,
+    PPO_N_ENVS,
     TRAIN_HISTORICAL_RATIO,
     TRAIN_HISTORICAL_RATIO_OVERRIDE,
 )
 import numpy as np
 
-from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
+from .env import HistoricalTradingEnv, MixedDataEnv
+from .env_helpers import create_proxy_specialist_fn
+from .ppo_trader import _make_env_fn
 
 
 PPO_TUNE_PARAMS_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_best.json"
@@ -45,9 +52,14 @@ def _get_ppo_device() -> str:
     return "cpu"
 
 
-def sample_ppo_params(trial: optuna.Trial) -> dict[str, Any]:
+def sample_ppo_params(
+    trial: optuna.Trial,
+    fixed_historical_ratio: float | None = None,
+) -> dict[str, Any]:
     """Sample PPO and env hyperparameters for a trial."""
-    if TRAIN_HISTORICAL_RATIO_OVERRIDE:
+    if fixed_historical_ratio is not None:
+        historical_ratio = max(0.0, min(1.0, fixed_historical_ratio))
+    elif TRAIN_HISTORICAL_RATIO_OVERRIDE:
         historical_ratio = max(0.0, min(1.0, TRAIN_HISTORICAL_RATIO))
     else:
         historical_ratio = trial.suggest_float("historical_ratio", 0.1, 0.9)
@@ -98,68 +110,69 @@ class TrialEvalCallback(EvalCallback):
 
 
 def run_tuning(
-    returns_array,
+    returns_array: np.ndarray,
     n_assets: int,
     n_trials: int = 50,
     n_timesteps: int = 100_000,
     n_evaluations: int = 5,
     n_eval_episodes: int = 5,
     timeout: int | None = None,
+    n_envs: int | None = None,
+    study_name: str = "ppo_tune",
+    load_if_exists: bool = True,
+    fixed_historical_ratio: float | None = None,
+    single_thread: bool = False,
+    params_path: Path | None = None,
 ) -> dict[str, Any]:
     """
     Run Optuna hyperparameter tuning.
+    Uses same env design as training: proxy-from-returns specialists, optional SubprocVecEnv.
     Returns best params dict.
     """
     eval_freq = max(n_timesteps // n_evaluations, 1)
+    n_envs = n_envs if n_envs is not None else PPO_N_ENVS
+    params_path = params_path or PPO_TUNE_PARAMS_PATH
+    returns_array = np.asarray(returns_array, dtype=np.float32)
 
-    def _default_specialist_fn():
-        return [
-            {
-                "sentiment": float(np.random.uniform(-1, 1)),
-                "quant_prob": float(np.random.uniform(0, 1)),
-                "fund_score": float(np.random.uniform(-1, 1)),
-                "regime_flag": float(np.random.uniform(0, 1)),
-                "momentum_score": float(np.random.uniform(-1, 1)),
-                "mean_reversion_score": float(np.random.uniform(-1, 1)),
-                "volatility_score": float(np.random.uniform(0, 1)),
-                "event_risk_score": float(np.random.uniform(0, 1)),
-                "relative_strength_score": float(np.random.uniform(-1, 1)),
-                "liquidity_score": float(np.random.uniform(0, 1)),
-            }
-            for _ in range(n_assets)
-        ]
+    proxy_specialist_fn = create_proxy_specialist_fn(returns_array, n_assets)
 
-    def _make_synthetic_env():
-        def _reset_fn():
-            outputs = _default_specialist_fn()
-            return {"specialist_outputs": outputs}
-
-        class SpecialistWrapper(TradingEnv):
-            def reset(self, seed=None, options=None):
-                opts = options or {}
-                opts.update(_reset_fn())
-                return super().reset(seed=seed, options=opts)
-
-        return SpecialistWrapper(n_assets=n_assets)
+    def _save_best_cb(study: optuna.Study, trial: optuna.Trial) -> None:
+        _save_best_params(study, trial, params_path)
 
     def objective(trial: optuna.Trial) -> float:
-        params = sample_ppo_params(trial)
+        params = sample_ppo_params(trial, fixed_historical_ratio=fixed_historical_ratio)
         historical_ratio = params.pop("historical_ratio")
 
         if historical_ratio >= 1.0:
-            env = HistoricalTradingEnv(returns_array=returns_array, n_assets=n_assets)
+            mode = "historical"
         elif historical_ratio > 0:
-            historical_env = HistoricalTradingEnv(
-                returns_array=returns_array, n_assets=n_assets
-            )
-            synthetic_env = _make_synthetic_env()
-            env = MixedDataEnv(
-                historical_env=historical_env,
-                synthetic_env=synthetic_env,
+            mode = "mixed"
+        else:
+            mode = "synthetic"
+
+        if n_envs <= 1:
+            env = _make_env_fn(
+                mode=mode,
+                historical_returns=returns_array,
+                n_assets=n_assets,
                 historical_ratio=historical_ratio,
+                specialist_fn=proxy_specialist_fn,
+                seed=trial.number,
             )
         else:
-            env = _make_synthetic_env()
+            env_fns = [
+                partial(
+                    _make_env_fn,
+                    mode=mode,
+                    historical_returns=returns_array,
+                    n_assets=n_assets,
+                    historical_ratio=historical_ratio,
+                    specialist_fn=proxy_specialist_fn,
+                    seed=trial.number * 1000 + i,
+                )
+                for i in range(n_envs)
+            ]
+            env = SubprocVecEnv(env_fns)
 
         env = Monitor(env)
         eval_env = HistoricalTradingEnv(returns_array=returns_array, n_assets=n_assets)
@@ -203,31 +216,44 @@ def run_tuning(
         if eval_callback.is_pruned:
             raise optuna.TrialPruned()
 
-        return eval_callback.last_mean_reward if eval_callback.last_mean_reward is not None else float("nan")
+        return (
+            eval_callback.last_mean_reward
+            if eval_callback.last_mean_reward is not None
+            else float("nan")
+        )
 
-    torch.set_num_threads(1)
+    device = _get_ppo_device()
+    if device == "cpu":
+        torch.set_num_threads(1 if single_thread else PPO_CPU_THREADS)
     sampler = TPESampler(n_startup_trials=5, seed=42)
     pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=max(n_evaluations // 3, 1))
 
     META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
+    if not load_if_exists:
+        try:
+            optuna.delete_study(study_name=study_name, storage=storage)
+        except Exception:
+            pass
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
         pruner=pruner,
         storage=storage,
-        study_name="ppo_tune",
-        load_if_exists=True,
+        study_name=study_name,
+        load_if_exists=load_if_exists,
     )
     if len(study.trials) == 0:
-        prev = _previous_best_to_enqueue()
+        prev = _previous_best_to_enqueue(params_path)
         if prev is not None:
             study.enqueue_trial(prev)
 
-    study.optimize(objective, n_trials=n_trials, timeout=timeout, callbacks=[_save_best_params])
+    study.optimize(
+        objective, n_trials=n_trials, timeout=timeout, callbacks=[_save_best_cb]
+    )
 
     if study.best_trial is None:
-        return load_tuned_params() or {}
+        return load_tuned_params(params_path) or {}
 
     raw = study.best_trial.params
     best_value = float(study.best_value)
@@ -246,7 +272,7 @@ def run_tuning(
     if not math.isnan(best_value):
         best["best_value"] = best_value
 
-    with open(PPO_TUNE_PARAMS_PATH, "w") as f:
+    with open(params_path, "w") as f:
         json.dump(best, f, indent=2)
 
     return best
@@ -272,12 +298,13 @@ def _net_arch_to_name(policy_kwargs: dict) -> str:
     return "small"
 
 
-def _previous_best_to_enqueue() -> dict[str, Any] | None:
+def _previous_best_to_enqueue(path: Path | None = None) -> dict[str, Any] | None:
     """Build params dict for enqueue_trial from ppo_tune_best.json, or None."""
-    if not PPO_TUNE_PARAMS_PATH.exists():
+    p = path or PPO_TUNE_PARAMS_PATH
+    if not p.exists():
         return None
     try:
-        with open(PPO_TUNE_PARAMS_PATH) as f:
+        with open(p) as f:
             data = json.load(f)
     except Exception:
         return None
@@ -304,8 +331,12 @@ def _previous_best_to_enqueue() -> dict[str, Any] | None:
     return result
 
 
-def _save_best_params(study: optuna.Study, trial: optuna.Trial) -> None:
-    """Callback: save ppo_tune_best.json whenever this trial is the new best."""
+def _save_best_params(
+    study: optuna.Study,
+    trial: optuna.Trial,
+    params_path: Path | None = None,
+) -> None:
+    """Callback: save best params JSON whenever this trial is the new best."""
     if study.best_trial is not trial:
         return
     raw = trial.params
@@ -325,16 +356,50 @@ def _save_best_params(study: optuna.Study, trial: optuna.Trial) -> None:
     if not math.isnan(best_value):
         best["best_value"] = best_value
     META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    with open(PPO_TUNE_PARAMS_PATH, "w") as f:
+    p = params_path or PPO_TUNE_PARAMS_PATH
+    with open(p, "w") as f:
         json.dump(best, f, indent=2)
 
 
-def load_tuned_params() -> dict[str, Any] | None:
+def get_tune_status(
+    study_name: str | None = None,
+) -> dict[str, Any]:
+    """
+    Return status of tuning studies: list of study names and summary for each.
+    If study_name is given, include best trial and best value for that study.
+    """
+    storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
+    if not PPO_TUNE_STUDY_PATH.exists():
+        return {"study_names": [], "studies": {}}
+    try:
+        study_names = optuna.study.get_all_study_names(storage=storage)
+    except Exception:
+        return {"study_names": [], "studies": {}}
+    result: dict[str, Any] = {"study_names": study_names, "studies": {}}
+    for name in study_names:
+        if study_name is not None and name != study_name:
+            continue
+        try:
+            study = optuna.load_study(study_name=name, storage=storage)
+            n_trials = len(study.trials)
+            best_value = float(study.best_value) if study.best_trial else None
+            result["studies"][name] = {
+                "n_trials": n_trials,
+                "best_value": best_value,
+                "best_trial": study.best_trial.number if study.best_trial else None,
+            }
+        except Exception:
+            result["studies"][name] = {"error": "failed to load"}
+    return result
+
+
+def load_tuned_params(path: Path | None = None) -> dict[str, Any] | None:
     """Load best params from tuning for use with PPOTrader.train(ppo_kwargs=...)."""
-    if not PPO_TUNE_PARAMS_PATH.exists():
+    p = path or PPO_TUNE_PARAMS_PATH
+    if not p.exists():
         return None
     try:
-        with open(PPO_TUNE_PARAMS_PATH) as f:
+        with open(p) as f:
             data = json.load(f)
         if "policy_kwargs" in data and isinstance(data["policy_kwargs"], dict):
             return data

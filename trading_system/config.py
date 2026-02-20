@@ -77,6 +77,10 @@ LIVE_PPO_MODEL_PATH = os.getenv("LIVE_PPO_MODEL_PATH", "").strip()
 # Discord webhook
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
+# Boardroom summary: LLM one-sentence summary each cycle (paper/live). Default off.
+BOARDROOM_SUMMARY_ENABLED = os.getenv("BOARDROOM_SUMMARY_ENABLED", "").strip().lower() in ("1", "true", "yes")
+BOARDROOM_SUMMARY_DISCORD = os.getenv("BOARDROOM_SUMMARY_DISCORD", "").strip().lower() in ("1", "true", "yes")
+
 # Trading: fractional shares and starting capital
 FRACTIONAL = os.getenv("FRACTIONAL", "yes").lower() in ("1", "true", "yes")
 try:

@@ -53,3 +53,5 @@ trading_system/models/
 htmlcov/
 .tox/
 .nox/
+
+.cursor/
