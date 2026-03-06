@@ -81,6 +81,19 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 BOARDROOM_SUMMARY_ENABLED = os.getenv("BOARDROOM_SUMMARY_ENABLED", "").strip().lower() in ("1", "true", "yes")
 BOARDROOM_SUMMARY_DISCORD = os.getenv("BOARDROOM_SUMMARY_DISCORD", "").strip().lower() in ("1", "true", "yes")
 
+# Paper/live: normal run interval (minutes) and Ollama refresh interval (minutes).
+# Normal run every CYCLE_INTERVAL_MIN; sentiment + boardroom summary from Ollama every OLLAMA_INTERVAL_MIN (cached between).
+try:
+    _cycle = int(os.getenv("CYCLE_INTERVAL_MIN", "5").strip() or "5")
+    CYCLE_INTERVAL_MIN = max(1, _cycle)
+except (ValueError, TypeError):
+    CYCLE_INTERVAL_MIN = 5
+try:
+    _ollama = int(os.getenv("OLLAMA_INTERVAL_MIN", "60").strip() or "60")
+    OLLAMA_INTERVAL_MIN = max(1, _ollama)
+except (ValueError, TypeError):
+    OLLAMA_INTERVAL_MIN = 60
+
 # Trading: fractional shares and starting capital
 FRACTIONAL = os.getenv("FRACTIONAL", "yes").lower() in ("1", "true", "yes")
 try:

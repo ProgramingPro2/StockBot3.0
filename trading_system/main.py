@@ -33,12 +33,14 @@ from .config import (
     BASE_DIR,
     BOARDROOM_SUMMARY_DISCORD,
     BOARDROOM_SUMMARY_ENABLED,
+    CYCLE_INTERVAL_MIN,
     ENV_ALLOW_CASH_EXPOSURE,
     ENV_OBS_ROLLING_FEATURES,
     FRACTIONAL,
     LIVE_PPO_MODEL_PATH,
     META_LEARNER_MODEL_DIR,
     MIN_TRADE_NOTIONAL,
+    OLLAMA_INTERVAL_MIN,
     OUTPUT_DIR,
     STARTING_CAPITAL,
     TRAIN_HISTORICAL_RATIO,
@@ -151,8 +153,9 @@ def _rolling_features_from_ohlcv(close_series) -> dict:
     }
 
 
-def _run_specialists(ticker: str = "SPY") -> dict:
-    """Run all specialists and return dict of outputs. Uses cache on network failure."""
+def _run_specialists(ticker: str = "SPY", force_refresh_sentiment: bool = False) -> dict:
+    """Run all specialists and return dict of outputs. Uses cache on network failure.
+    force_refresh_sentiment: when True, call Ollama for sentiment; when False, use cached sentiment if available."""
     from .agents import (
         get_sentiment,
         get_trend_probability,
@@ -167,7 +170,7 @@ def _run_specialists(ticker: str = "SPY") -> dict:
     )
     from .data.loader import load_ohlcv
 
-    sentiment, sentiment_conf, from_llm = get_sentiment(ticker)
+    sentiment, sentiment_conf, from_llm = get_sentiment(ticker, force_refresh=force_refresh_sentiment)
     if not from_llm:
         sentiment = _sentiment_proxy_from_ohlcv(ticker)
     quant_prob = get_trend_probability(ticker)
@@ -911,16 +914,23 @@ def cmd_paper(args: argparse.Namespace) -> None:
     if n_assets == 0:
         logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
         return
-    interval_sec = args.interval * 60
+    interval_min = getattr(args, "interval", None) or CYCLE_INTERVAL_MIN
+    interval_sec = interval_min * 60
 
     trader = PPOTrader(n_assets=n_assets)
-    logger.info("Starting paper trading for %s (interval=%dm) [simulated capital $%.2f]", tickers, args.interval, STARTING_CAPITAL)
+    logger.info("Starting paper trading for %s (interval=%dm, ollama_every=%dm) [simulated capital $%.2f]",
+                tickers, interval_min, OLLAMA_INTERVAL_MIN, STARTING_CAPITAL)
+
+    last_ollama_time = 0.0
+    cached_boardroom_summary: str | None = None
 
     while True:
         try:
+            do_ollama = (time.time() - last_ollama_time) >= (OLLAMA_INTERVAL_MIN * 60)
+            logger.info("Cycle ollama_refresh=%s (%s)", do_ollama, "sentiment+boardroom from LLM" if do_ollama else "cached sentiment/boardroom")
             specialist_list: list[dict] = []
             for t in tickers:
-                specialist_list.append(_run_specialists(t))
+                specialist_list.append(_run_specialists(t, force_refresh_sentiment=do_ollama))
             if is_debug():
                 _verify_specialist_outputs(specialist_list, tickers)
             action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
@@ -930,16 +940,21 @@ def cmd_paper(args: argparse.Namespace) -> None:
             exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
 
             if BOARDROOM_SUMMARY_ENABLED:
-                try:
-                    from .utils.boardroom_summary import get_boardroom_summary
-                    summary = get_boardroom_summary(tickers, specialist_list, weights, exposure, cash=None)
-                    if summary:
-                        logger.info("Boardroom: %s", summary)
-                        if BOARDROOM_SUMMARY_DISCORD:
-                            from .broker.discord_notifier import send_boardroom_summary_embed
-                            send_boardroom_summary_embed(summary, tickers, exposure)
-                except Exception as exc:
-                    logger.debug("Boardroom summary skipped: %s", exc)
+                if do_ollama:
+                    last_ollama_time = time.time()
+                    try:
+                        from .utils.boardroom_summary import get_boardroom_summary
+                        summary = get_boardroom_summary(tickers, specialist_list, weights, exposure, cash=None)
+                        if summary:
+                            cached_boardroom_summary = summary
+                            logger.info("Boardroom: %s", summary)
+                            if BOARDROOM_SUMMARY_DISCORD:
+                                from .broker.discord_notifier import send_boardroom_summary_embed
+                                send_boardroom_summary_embed(summary, tickers, exposure)
+                    except Exception as exc:
+                        logger.debug("Boardroom summary skipped: %s", exc)
+                elif cached_boardroom_summary:
+                    logger.info("Boardroom (cached): %s", cached_boardroom_summary)
 
             for i, t in enumerate(tickers):
                 position_pct = float(weights[i])
@@ -957,6 +972,7 @@ def cmd_paper(args: argparse.Namespace) -> None:
                 )
                 send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
 
+            logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
             time.sleep(interval_sec)
         except KeyboardInterrupt:
             logger.info("Paper trading stopped")
@@ -984,7 +1000,8 @@ def cmd_live(args: argparse.Namespace) -> None:
     if n_assets == 0:
         logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
         return
-    interval_sec = args.interval * 60
+    interval_min = getattr(args, "interval", None) or CYCLE_INTERVAL_MIN
+    interval_sec = interval_min * 60
 
     broker = AlpacaBroker()
     if not broker.client:
@@ -993,7 +1010,8 @@ def cmd_live(args: argparse.Namespace) -> None:
 
     model_path = Path(LIVE_PPO_MODEL_PATH) if LIVE_PPO_MODEL_PATH else None
     trader = PPOTrader(n_assets=n_assets, model_path=model_path)
-    logger.info("Starting LIVE trading for %s (interval=%dm) [fractional=%s] model=%s", tickers, args.interval, FRACTIONAL, model_path or "ppo_trader.zip")
+    logger.info("Starting LIVE trading for %s (interval=%dm, ollama_every=%dm) [fractional=%s] model=%s",
+                tickers, interval_min, OLLAMA_INTERVAL_MIN, FRACTIONAL, model_path or "ppo_trader.zip")
 
     try:
         from .broker.discord_notifier import send_live_start_embed
@@ -1006,6 +1024,8 @@ def cmd_live(args: argparse.Namespace) -> None:
 
     bought_today: set[str] = set()
     last_trading_date: date | None = None
+    last_ollama_time = 0.0
+    cached_boardroom_summary: str | None = None
 
     while True:
         try:
@@ -1038,9 +1058,11 @@ def cmd_live(args: argparse.Namespace) -> None:
                 today, position_symbols, ZoneInfo("America/New_York")
             )
 
+            do_ollama = (time.time() - last_ollama_time) >= (OLLAMA_INTERVAL_MIN * 60)
+            logger.info("Cycle ollama_refresh=%s (%s)", do_ollama, "sentiment+boardroom from LLM" if do_ollama else "cached sentiment/boardroom")
             specialist_list: list[dict] = []
             for t in tickers:
-                specialist_list.append(_run_specialists(t))
+                specialist_list.append(_run_specialists(t, force_refresh_sentiment=do_ollama))
             if is_debug():
                 _verify_specialist_outputs(specialist_list, tickers)
             action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
@@ -1054,19 +1076,34 @@ def cmd_live(args: argparse.Namespace) -> None:
             total_invested = max(0.0, cash * exposure) if cash > 0 else 0.0
 
             if BOARDROOM_SUMMARY_ENABLED:
-                try:
-                    from .utils.boardroom_summary import get_boardroom_summary
-                    summary = get_boardroom_summary(tickers, specialist_list, weights, exposure, cash=cash)
-                    if summary:
-                        logger.info("Boardroom: %s", summary)
-                        if BOARDROOM_SUMMARY_DISCORD:
-                            from .broker.discord_notifier import send_boardroom_summary_embed
-                            send_boardroom_summary_embed(summary, tickers, exposure)
-                except Exception as exc:
-                    logger.debug("Boardroom summary skipped: %s", exc)
+                if do_ollama:
+                    last_ollama_time = time.time()
+                    try:
+                        from .utils.boardroom_summary import get_boardroom_summary
+                        portfolio_value = float(account.get("portfolio_value", 0))
+                        summary = get_boardroom_summary(
+                            tickers,
+                            specialist_list,
+                            weights,
+                            exposure,
+                            cash=cash,
+                            current_positions=alpaca_positions,
+                            portfolio_value=portfolio_value,
+                        )
+                        if summary:
+                            cached_boardroom_summary = summary
+                            logger.info("Boardroom: %s", summary)
+                            if BOARDROOM_SUMMARY_DISCORD:
+                                from .broker.discord_notifier import send_boardroom_summary_embed
+                                send_boardroom_summary_embed(summary, tickers, exposure)
+                    except Exception as exc:
+                        logger.debug("Boardroom summary skipped: %s", exc)
+                elif cached_boardroom_summary:
+                    logger.info("Boardroom (cached): %s", cached_boardroom_summary)
 
             if not broker.is_market_open():
                 logger.info("Market closed (Alpaca clock); skipping orders this cycle")
+                logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
                 time.sleep(interval_sec)
                 continue
 
@@ -1077,6 +1114,7 @@ def cmd_live(args: argparse.Namespace) -> None:
                 logger.info(
                     "All capital in positions bought today; no buys or sells possible. Sleeping until next trading day."
                 )
+                logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
                 from datetime import datetime, timedelta
                 from zoneinfo import ZoneInfo
 
@@ -1176,6 +1214,7 @@ def cmd_live(args: argparse.Namespace) -> None:
                 else:
                     logger.info("HOLD %s | Position=%.1f%%", t, position_pct * 100)
 
+            logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
             time.sleep(interval_sec)
         except KeyboardInterrupt:
             logger.info("Live trading stopped")

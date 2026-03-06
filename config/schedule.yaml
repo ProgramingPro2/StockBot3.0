@@ -13,8 +13,8 @@ services:
       start: "09:30"
       end: "17:00"
       weekdays: [1, 2, 3, 4, 5]
+    # Cycle interval: from .env CYCLE_INTERVAL_MIN when not set below; set options.interval to override.
     options:
-      interval: 60
       autodiscover: false
     log: trading_system/outputs/scheduler_weekday_live.log
 #jobs:

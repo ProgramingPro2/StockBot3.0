@@ -32,20 +32,42 @@ def _build_context(
     weights: "np.ndarray",
     exposure: float,
     cash: float | None,
+    current_positions: list[dict] | None = None,
+    portfolio_value: float | None = None,
 ) -> str:
     """Build a short readable context string for the LLM."""
     lines = [
         "Tickers: " + ", ".join(tickers),
-        f"Portfolio: exposure={exposure * 100:.0f}% (rest in cash)",
+        f"Target: exposure={exposure * 100:.0f}% (rest in cash)",
     ]
     if cash is not None:
         lines.append(f"Cash: ${cash:,.0f}")
     lines.append("")
+
+    # Current portfolio (actual holdings) when live broker data is provided
+    if current_positions is not None and portfolio_value is not None:
+        if portfolio_value <= 0:
+            lines.append("Current portfolio (actual holdings): no positions / $0")
+        else:
+            pos_by_symbol = {p["symbol"]: float(p.get("market_value", 0)) for p in current_positions}
+            lines.append(f"Current portfolio (actual holdings): Total ${portfolio_value:,.0f}.")
+            for ticker in tickers:
+                mv = pos_by_symbol.get(ticker, 0.0)
+                pct = (mv / portfolio_value * 100) if portfolio_value > 0 else 0
+                lines.append(f"  {ticker}: ${mv:,.0f} ({pct:.0f}%)")
+            others = [p for p in current_positions if p.get("symbol") not in tickers]
+            if others:
+                for p in others:
+                    sym = p.get("symbol", "?")
+                    mv = float(p.get("market_value", 0))
+                    lines.append(f"  Other: {sym} ${mv:,.0f}")
+        lines.append("")
+
     for i, ticker in enumerate(tickers):
         out = specialist_list[i] if i < len(specialist_list) else {}
         w = float(weights[i]) * 100 if i < len(weights) else 0
         lines.append(
-            f"  {ticker}: weight={w:.0f}% | sentiment={out.get('sentiment', 0):.2f} "
+            f"  {ticker}: target weight={w:.0f}% | sentiment={out.get('sentiment', 0):.2f} "
             f"quant_prob={out.get('quant_prob', 0.5):.2f} fund={out.get('fund_score', 0):.2f} "
             f"regime={out.get('regime_name', '?')} momentum={out.get('momentum_score', 0):.2f}"
         )
@@ -58,10 +80,14 @@ def get_boardroom_summary(
     weights: "np.ndarray",
     exposure: float,
     cash: float | None = None,
+    current_positions: list[dict] | None = None,
+    portfolio_value: float | None = None,
 ) -> str | None:
     """
     Ask the LLM for one short, friendly sentence summarizing the boardroom's stance.
     Returns the sentence or None on failure (never raises; trading loop continues).
+    When current_positions and portfolio_value are provided (live mode), the summary
+    describes actual holdings first, then target/rebalancing if relevant.
     """
     import numpy as np
 
@@ -76,10 +102,35 @@ def get_boardroom_summary(
         if host:
             os.environ.setdefault("OLLAMA_HOST", host)
 
-    context = _build_context(tickers, specialist_list, weights, exposure, cash)
-    prompt = f"""You are summarizing a trading system's current stance for a human. Below is the boardroom state: which symbols we track, how much we allocate to each, and key specialist scores (sentiment, trend probability, fundamental score, regime, momentum).
+    context = _build_context(
+        tickers,
+        specialist_list,
+        weights,
+        exposure,
+        cash,
+        current_positions=current_positions,
+        portfolio_value=portfolio_value,
+    )
+    has_current = (
+        current_positions is not None
+        and portfolio_value is not None
+        and portfolio_value > 0
+    )
+    if has_current:
+        instruction = (
+            "Summarize the CURRENT portfolio in plain language: what we actually hold and in what proportion. "
+            "You may add one short phrase about target or rebalancing if relevant (e.g. 'rebalancing to X'). "
+            "Be accurate to the actual holdings listed above, not only the target weights."
+        )
+    else:
+        instruction = (
+            "Write exactly one short, friendly sentence that says what the boardroom decided and why "
+            "in plain language (e.g. which names we favor, whether we're holding cash)."
+        )
+    prompt = f"""You are summarizing a trading system's current stance for a human. Below is the boardroom state: symbols we track, target allocation, and key specialist scores. When "Current portfolio (actual holdings)" is present, it shows what we actually hold.
 
-Write exactly one short, friendly sentence that says what the boardroom decided and why in plain language (e.g. which names we favor, whether we're holding cash). Be approachable and non-technical. No JSON, no bullet points, no emojis. One sentence only.
+{instruction}
+Be approachable and non-technical. No JSON, no bullet points, no emojis. One sentence only.
 
 Boardroom state:
 {context}

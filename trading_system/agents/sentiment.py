@@ -101,12 +101,21 @@ def _models_to_try() -> list[str]:
     return out
 
 
-def get_sentiment(ticker: str) -> tuple[float, float, bool]:
+# Per-ticker cache: (score, confidence, timestamp). Main controls refresh via force_refresh.
+_sentiment_cache: dict[str, tuple[float, float, float]] = {}
+
+
+def get_sentiment(ticker: str, force_refresh: bool = False) -> tuple[float, float, bool]:
     """
     Get sentiment score and confidence for a ticker.
     Returns (sentiment_score, confidence, from_llm) in [-1, 1], [0, 1], and bool.
     When from_llm is False, caller should use proxy sentiment instead.
+    When force_refresh is False, may return cached value from a previous Ollama call.
     """
+    if not force_refresh and ticker in _sentiment_cache:
+        score, conf, _ = _sentiment_cache[ticker]
+        return score, conf, True
+
     if "OLLAMA_HOST" not in os.environ and OLLAMA_URL:
         host = OLLAMA_URL.replace("https://", "").replace("http://", "").strip()
         if host:
@@ -201,6 +210,7 @@ Output valid JSON only. Example: {{"sentiment_score": 0.2, "confidence": 0.7, "r
                             conf,
                             model,
                         )
+                    _sentiment_cache[ticker] = (score, conf, time.time())
                     return score, conf, True
 
                 except Exception as e:

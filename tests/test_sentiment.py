@@ -7,7 +7,12 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 # Import from trading_system; run tests from project root with PYTHONPATH=. or python -m pytest tests/
-from trading_system.agents.sentiment import _extract_json, get_sentiment, SentimentOutput
+from trading_system.agents.sentiment import (
+    _extract_json,
+    _sentiment_cache,
+    get_sentiment,
+    SentimentOutput,
+)
 from trading_system.config import OLLAMA_URL
 
 
@@ -62,6 +67,9 @@ Done."""
 
 class TestGetSentimentMocked(unittest.TestCase):
     """Tests for get_sentiment with mocked ollama and news."""
+
+    def setUp(self) -> None:
+        _sentiment_cache.clear()
 
     @patch("trading_system.agents.sentiment.fetch_news")
     @patch("trading_system.agents.sentiment.news_to_text")
@@ -183,6 +191,31 @@ class TestGetSentimentMocked(unittest.TestCase):
         self.assertGreaterEqual(conf, 0)
         self.assertLessEqual(conf, 1)
 
+    @patch("trading_system.agents.sentiment.fetch_news")
+    @patch("trading_system.agents.sentiment.news_to_text")
+    @patch("ollama.chat")
+    def test_force_refresh_false_returns_cached_without_calling_ollama(
+        self,
+        mock_chat: MagicMock,
+        mock_news_to_text: MagicMock,
+        mock_fetch_news: MagicMock,
+    ) -> None:
+        mock_fetch_news.return_value = [MagicMock(title="T", summary="S", published=None)]
+        mock_news_to_text.return_value = "News"
+        mock_chat.return_value = MagicMock(
+            message=MagicMock(content='{"sentiment_score": 0.25, "confidence": 0.9, "reasoning": "Cached"}')
+        )
+        score1, conf1, from_llm1 = get_sentiment("CACHE_TICKER", force_refresh=True)
+        self.assertTrue(from_llm1)
+        self.assertAlmostEqual(score1, 0.25)
+        self.assertAlmostEqual(conf1, 0.9)
+        call_count_after_refresh = mock_chat.call_count
+        score2, conf2, from_llm2 = get_sentiment("CACHE_TICKER", force_refresh=False)
+        self.assertTrue(from_llm2)
+        self.assertAlmostEqual(score2, 0.25)
+        self.assertAlmostEqual(conf2, 0.9)
+        self.assertEqual(mock_chat.call_count, call_count_after_refresh, "ollama.chat should not be called on cache hit")
+
 
 class TestSentimentOutput(unittest.TestCase):
     """Sanity check for SentimentOutput schema."""
@@ -206,6 +239,9 @@ class TestSentimentOutput(unittest.TestCase):
 
 class TestOllamaConnection(unittest.TestCase):
     """OLLAMA_HOST set from OLLAMA_URL when unset."""
+
+    def setUp(self) -> None:
+        _sentiment_cache.clear()
 
     @patch("trading_system.agents.sentiment.fetch_news")
     @patch("trading_system.agents.sentiment.news_to_text")
@@ -240,6 +276,9 @@ class TestOllamaConnection(unittest.TestCase):
 class TestGetSentimentIntegration(unittest.TestCase):
     """Optional integration test: call real Ollama if available; skip otherwise."""
 
+    def setUp(self) -> None:
+        _sentiment_cache.clear()
+
     def test_get_sentiment_real_ollama_if_available(self) -> None:
         try:
             import requests
@@ -249,7 +288,7 @@ class TestGetSentimentIntegration(unittest.TestCase):
                 self.skipTest("Ollama not reachable")
         except Exception as e:
             self.skipTest(f"Ollama not available: {e}")
-        score, conf, from_llm = get_sentiment("SPY")
+        score, conf, from_llm = get_sentiment("SPY", force_refresh=True)
         self.assertIsInstance(score, (int, float))
         self.assertIsInstance(conf, (int, float))
         self.assertIsInstance(from_llm, bool)

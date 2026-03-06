@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import BASE_DIR
+from .config import BASE_DIR, CYCLE_INTERVAL_MIN
 from .utils.logger import get_logger
 
 logger = get_logger()
@@ -150,7 +150,8 @@ def _now() -> str:
 def _build_live_argv(options: dict[str, Any]) -> list[str]:
     opts = options or {}
     argv = [sys.executable, "-m", "trading_system", "live"]
-    argv.extend(["--interval", str(int(opts.get("interval", 60)))])
+    interval = opts.get("interval") if opts.get("interval") is not None else CYCLE_INTERVAL_MIN
+    argv.extend(["--interval", str(int(interval))])
     if opts.get("autodiscover"):
         argv.append("--autodiscover")
     if opts.get("tickers"):
@@ -161,7 +162,8 @@ def _build_live_argv(options: dict[str, Any]) -> list[str]:
 def _build_paper_argv(options: dict[str, Any]) -> list[str]:
     opts = options or {}
     argv = [sys.executable, "-m", "trading_system", "paper"]
-    argv.extend(["--interval", str(int(opts.get("interval", 60)))])
+    interval = opts.get("interval") if opts.get("interval") is not None else CYCLE_INTERVAL_MIN
+    argv.extend(["--interval", str(int(interval))])
     if opts.get("autodiscover"):
         argv.append("--autodiscover")
     if opts.get("tickers"):
