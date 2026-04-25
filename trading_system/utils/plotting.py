@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from ..config import OUTPUT_DIR
+from .output_cleanup import rotate_output_plots
 
 
 def save_performance_plot(
@@ -128,8 +129,10 @@ def save_performance_plot(
 
     plt.tight_layout()
     out_path = OUTPUT_DIR / filename
+    rotate_output_plots()
     plt.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
     plt.close()
+    rotate_output_plots()
     return out_path
 
 

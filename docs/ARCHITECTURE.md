@@ -4,7 +4,7 @@
 
 The Boardroom is a hierarchical multi-agent trading system. Ten specialist agents analyze the market independently (per ticker). Their outputs are fed into a PPO meta-learner that decides position sizing for a configurable list of symbols (default: 5 stocks).
 
-The system trades a configurable list of tickers (see `TRADE_TICKERS` in config; default: SPY, AAPL, MSFT, GOOGL, NVDA). Override via `--tickers SPY,AAPL,...` on the CLI. Training, backtest, paper, and live all use this list.
+The system trades a configurable list of tickers (see `TRADE_TICKERS` in config; default: SPY, IWM, XLE, XLF, EEM). Override via `--tickers SPY,AAPL,...` on the CLI. Training, backtest, paper, and live all use this list.
 
 ## Data Flow
 

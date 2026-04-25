@@ -183,6 +183,40 @@ def get_features_for_date(
     return out
 
 
+def build_daily_aux_for_aligned(
+    aligned: pd.DataFrame,
+    tickers: list[str],
+    lookback_years: int = 5,
+) -> np.ndarray | None:
+    """
+    Build (n_days, n_assets, 2) array of [atr_pct, volume_ratio] aligned to aligned.index
+    for merging into HistoricalTradingEnv observations. Returns None if build fails.
+    """
+    feat = build_feature_dataset(tickers, lookback_years=lookback_years)
+    if feat is None or feat.empty:
+        return None
+    dates = pd.to_datetime(aligned.index).tz_localize(None)
+    n = len(dates)
+    m = len(tickers)
+    out = np.full((n, m, 2), np.nan, dtype=np.float32)
+    for ti, t in enumerate(tickers):
+        for di in range(n):
+            d = dates[di]
+            try:
+                row = feat.loc[(d.normalize(), t)]
+            except (KeyError, TypeError, ValueError):
+                try:
+                    row = feat.loc[(d, t)]
+                except (KeyError, TypeError, ValueError):
+                    continue
+            idx = row.index if hasattr(row, "index") else []
+            if "atr_pct" in idx:
+                out[di, ti, 0] = float(row["atr_pct"])
+            if "volume_ratio" in idx:
+                out[di, ti, 1] = float(row["volume_ratio"])
+    return out
+
+
 def check_no_future_leakage() -> bool:
     """
     Leakage contract: all features in this module use only past data (no shift(-n) or future-known labels).

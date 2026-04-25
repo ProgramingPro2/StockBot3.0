@@ -8,7 +8,14 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-from ..config import CACHE_DIR, CACHE_MAX_AGE_HOURS, RATE_LIMIT_REQUESTS_PER_MIN, YFINANCE_LOOKBACK_YEARS
+from ..config import (
+    CACHE_DIR,
+    CACHE_MAX_AGE_DAYS,
+    CACHE_MAX_AGE_HOURS,
+    CACHE_STALE_FULL_REFRESH_DAYS,
+    RATE_LIMIT_REQUESTS_PER_MIN,
+    YFINANCE_LOOKBACK_YEARS,
+)
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -43,11 +50,16 @@ def _cache_path(ticker: str) -> Path:
 
 
 def _cache_valid(path: Path) -> bool:
-    """Check if cache is fresh within max age."""
+    """Check if cache is fresh within max age; force refresh if older than CACHE_STALE_FULL_REFRESH_DAYS."""
     if not path.exists():
         return False
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
-    return datetime.now() - mtime < timedelta(hours=CACHE_MAX_AGE_HOURS)
+    age = datetime.now() - mtime
+    if age < timedelta(hours=CACHE_MAX_AGE_HOURS):
+        return True
+    if CACHE_STALE_FULL_REFRESH_DAYS > 0 and age >= timedelta(days=CACHE_STALE_FULL_REFRESH_DAYS):
+        return False
+    return age < timedelta(days=CACHE_MAX_AGE_DAYS)
 
 
 def load_ohlcv(

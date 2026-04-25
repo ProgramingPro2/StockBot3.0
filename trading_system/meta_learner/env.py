@@ -2,8 +2,8 @@
 Custom Gymnasium environment for the RL meta-learner.
 Observation: per-asset [sentiment, quant_prob, fund_score, regime_flag, momentum_score, holdings]
   + optional [rolling_return_5d, rolling_return_21d, rolling_vol_21d].
-Action: position size % per asset
-Reward: portfolio Sharpe ratio over rolling window, minus drawdown penalty
+Action: position size % per asset (normalized so sum <= 1 before execution, matching live/backtest).
+Reward: log utility of portfolio return minus drawdown and turnover costs.
 """
 import gymnasium as gym
 import numpy as np
@@ -19,125 +19,16 @@ from ..config import (
     STARTING_CAPITAL,
     TRANSACTION_COST_BPS,
 )
+from .proxy_specialists import (
+    merge_daily_aux_into_proxy_row,
+    normalize_action_max_unit_exposure,
+)
 
 
 def _sanitize_obs(obs: np.ndarray) -> np.ndarray:
     """Replace NaN/Inf with 0 and clip to [-1, 1] so the policy never sees invalid values."""
     out = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     return np.clip(out, -1.0, 1.0)
-
-
-def _proxy_specialists_vectorized(returns_2d: np.ndarray) -> np.ndarray:
-    """
-    Vectorized version: returns_2d shape (window, n_assets).
-    Returns shape (n_assets, 13): sentiment, quant_prob, fund_score, regime_flag,
-    momentum, mean_reversion, volatility, event_risk, relative_strength, liquidity,
-    ret_5d_norm, ret_21d_norm, vol_21d_norm per asset.
-    """
-    # returns_2d may have NaNs; use nanmean/nanstd for robustness
-    mean_ret = np.nanmean(returns_2d, axis=0).astype(np.float32)
-    std_ret = np.nanstd(returns_2d, axis=0).astype(np.float32)
-    std_ret = np.where(std_ret < 1e-8, 0.01, std_ret)
-
-    sentiment = np.clip(mean_ret * 12, -0.5, 0.5)
-    trend = np.clip(mean_ret * 20, -0.5, 0.5)
-    quant_prob = 0.5 + trend
-    fund_score = np.clip(-mean_ret * 15, -0.5, 0.5)
-    vol_norm = np.clip((std_ret - 0.01) * 50, -0.5, 0.5)
-    regime_flag = 0.5 + vol_norm
-    momentum = np.clip(mean_ret * 15, -1, 1)
-    mean_reversion = np.clip(-mean_ret * 20, -0.5, 0.5)
-    volatility = np.clip((vol_norm + 1.0) / 2.0, 0.0, 1.0)
-    event_risk = np.zeros_like(mean_ret, dtype=np.float32)
-    relative_strength = np.zeros_like(mean_ret, dtype=np.float32)
-    liquidity = np.full_like(mean_ret, 0.5, dtype=np.float32)
-
-    n = returns_2d.shape[0]
-    ret_5d = np.nanmean(returns_2d[-5:] if n >= 5 else returns_2d, axis=0)
-    ret_21d = np.nanmean(returns_2d[-21:] if n >= 21 else returns_2d, axis=0)
-    vol_21d = np.nanstd(returns_2d[-21:] if n >= 21 else returns_2d, axis=0)
-    vol_21d = np.where(vol_21d < 1e-8, 0.01, vol_21d)
-
-    ret_5d_norm = np.clip(ret_5d * 50, -1, 1)
-    ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
-    vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
-
-    return np.column_stack(
-        (
-            sentiment,
-            quant_prob,
-            fund_score,
-            regime_flag,
-            momentum,
-            mean_reversion,
-            volatility,
-            event_risk,
-            relative_strength,
-            liquidity,
-            ret_5d_norm,
-            ret_21d_norm,
-            vol_21d_norm,
-        )
-    )
-
-
-def _proxy_specialists_from_returns_np(
-    returns: np.ndarray, start: int, window: int = 21
-) -> tuple[float, float, float, float, float, float, float, float, float, float, float, float, float]:
-    """
-    Derive proxy specialist outputs from rolling returns (numpy, no pandas).
-    Returns (sentiment, quant_prob, fund_score, regime_flag, momentum_score,
-             mean_reversion, volatility, event_risk, relative_strength, liquidity,
-             rolling_return_5d, rolling_return_21d, rolling_vol_21d).
-    """
-    lookback = returns[max(0, start - window) : start]
-    lookback = lookback[~np.isnan(lookback)]
-    if len(lookback) == 0:
-        return 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 0.01
-
-    mean_ret = float(np.mean(lookback))
-    std_ret = float(np.std(lookback))
-    if std_ret < 1e-8:
-        std_ret = 0.01
-
-    trend = np.clip(mean_ret * 20, -0.5, 0.5)
-    quant_prob = 0.5 + trend
-    vol_norm = np.clip((std_ret - 0.01) * 50, -0.5, 0.5)
-    regime_flag = 0.5 + vol_norm
-    sentiment_proxy = float(np.clip(mean_ret * 12, -0.5, 0.5))
-    fund_score_proxy = float(np.clip(-mean_ret * 15, -0.5, 0.5))
-    momentum_proxy = float(np.clip(mean_ret * 15, -1, 1))
-    mean_reversion_proxy = float(np.clip(-mean_ret * 20, -0.5, 0.5))
-    volatility_proxy = float(np.clip((vol_norm + 1.0) / 2.0, 0.0, 1.0))
-    event_risk_proxy = 0.0
-    relative_strength_proxy = 0.0
-    liquidity_proxy = 0.5
-
-    ret_5d = float(np.mean(lookback[-5:])) if len(lookback) >= 5 else mean_ret
-    ret_21d = float(np.mean(lookback[-21:])) if len(lookback) >= 21 else mean_ret
-    vol_21d = float(np.std(lookback[-21:])) if len(lookback) >= 21 else std_ret
-    if vol_21d < 1e-8:
-        vol_21d = 0.01
-
-    ret_5d_norm = np.clip(ret_5d * 50, -1, 1)
-    ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
-    vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
-
-    return (
-        sentiment_proxy,
-        quant_prob,
-        fund_score_proxy,
-        regime_flag,
-        momentum_proxy,
-        mean_reversion_proxy,
-        volatility_proxy,
-        event_risk_proxy,
-        relative_strength_proxy,
-        liquidity_proxy,
-        ret_5d_norm,
-        ret_21d_norm,
-        vol_21d_norm,
-    )
 
 
 def _obs_features_per_asset() -> int:
@@ -148,11 +39,43 @@ def _obs_features_per_asset() -> int:
     return base
 
 
+def _effective_holdings_min_trade(
+    action: np.ndarray,
+    holdings: np.ndarray,
+    equity: float,
+    min_trade_equity: float,
+) -> np.ndarray:
+    """Vectorized min-notional execution (same semantics as prior nested loops)."""
+    a = np.asarray(action, dtype=np.float64)
+    h = np.asarray(holdings, dtype=np.float64)
+    notional = np.abs(a - h) * equity
+    trade = notional >= min_trade_equity
+    buy = (a > h) & trade
+    sell = (a < h) & trade
+    eff = h.copy()
+    eff = np.where(buy, a, eff)
+    eff = np.where(sell, a, eff)
+    return eff.astype(np.float32)
+
+
+def _compute_step_reward(
+    portfolio_return: float,
+    turnover: float,
+    drawdown: float,
+    drawdown_penalty: float,
+) -> float:
+    """Log utility minus drawdown and proportional transaction cost (no hidden 10x multiplier)."""
+    utility = float(np.log(max(1e-8, 1.0 + portfolio_return)))
+    cost_frac = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
+    reward = utility - drawdown_penalty * drawdown - turnover * cost_frac
+    return float(np.clip(np.nan_to_num(reward, nan=0.0, posinf=3.0, neginf=-3.0), -3.0, 3.0))
+
+
 class TradingEnv(gym.Env):
     """
     Trading environment for PPO meta-learner.
     Multi-asset: n_assets sets of specialist features + n_assets holdings.
-    Uses synthetic returns during training (for backward compatibility).
+    Optional bootstrap_returns in reset(options): real return rows for synthetic branch (no self-fulfilling signal).
     """
 
     metadata = {"render_modes": []}
@@ -190,16 +113,20 @@ class TradingEnv(gym.Env):
 
         self._returns_history: list[float] = []
         self._equity_history: list[float] = []
+        self._equity_peak: float = 1.0
         self._holdings: np.ndarray = np.zeros(self.n_assets, dtype=np.float32)
         self._step_count = 0
         self._specialist_outputs: list[dict] | None = None
         self._rolling_returns: np.ndarray | None = None  # (n_assets, 21) per-asset
         self._rolling_vols: np.ndarray | None = None
+        self._bootstrap_returns: np.ndarray | None = None
+        self._bootstrap_idx: int = 0
 
     def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
         self._returns_history = []
         self._equity_history = [1.0]
+        self._equity_peak = 1.0
         self._holdings = np.zeros(self.n_assets, dtype=np.float32)
         self._step_count = 0
         specialist = options.get("specialist_outputs", []) if options else []
@@ -208,71 +135,62 @@ class TradingEnv(gym.Env):
         self._specialist_outputs = (specialist + [{}] * self.n_assets)[: self.n_assets]
         self._rolling_returns = np.full((self.n_assets, 21), np.nan, dtype=np.float32)
         self._rolling_vols = np.full(self.n_assets, 0.01, dtype=np.float32)
+        br = options.get("bootstrap_returns") if options else None
+        if br is not None:
+            self._bootstrap_returns = np.asarray(br, dtype=np.float32)
+            self._bootstrap_idx = 0
+        else:
+            self._bootstrap_returns = None
+            self._bootstrap_idx = 0
 
         obs = self._get_obs(holdings=self._holdings)
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         self._step_count += 1
-        action = np.clip(action, 0, 1).astype(np.float32)
+        action = normalize_action_max_unit_exposure(action)
 
         min_trade_equity = MIN_TRADE_NOTIONAL / STARTING_CAPITAL
-        equity = self._equity_history[-1]
-        effective_holdings = self._holdings.copy()
-        increased_this_step: set[int] = set()
-        for i in range(self.n_assets):
-            notional = abs(action[i] - self._holdings[i]) * equity
-            if action[i] > self._holdings[i] and notional >= min_trade_equity:
-                effective_holdings[i] = action[i]
-                increased_this_step.add(i)
-        for i in range(self.n_assets):
-            if action[i] < self._holdings[i] and i not in increased_this_step:
-                notional = abs(action[i] - self._holdings[i]) * equity
-                if notional >= min_trade_equity:
-                    effective_holdings[i] = action[i]
+        equity = float(self._equity_history[-1])
+        effective_holdings = _effective_holdings_min_trade(action, self._holdings, equity, min_trade_equity)
         turnover = float(np.sum(np.abs(effective_holdings - self._holdings)))
         self._holdings = effective_holdings
 
-        outputs = self._specialist_outputs or [{}] * self.n_assets
-        returns_per_asset = np.zeros(self.n_assets, dtype=np.float32)
-        for i in range(self.n_assets):
-            s = outputs[i] if i < len(outputs) else {}
-            sentiment = s.get("sentiment", 0.0)
-            quant_prob = s.get("quant_prob", 0.5)
-            fund_score = s.get("fund_score", 0.0)
-            regime_flag = s.get("regime_flag", 0.5)
-            signal = (sentiment + (quant_prob - 0.5) * 2 + fund_score - regime_flag) / 4
-            ret = signal * 0.01 + float(self.np_random.normal(0, 0.01))
-            returns_per_asset[i] = ret
-            if self._rolling_returns is not None:
-                self._rolling_returns[i] = np.roll(self._rolling_returns[i], 1)
-                self._rolling_returns[i, 0] = ret
-                valid = self._rolling_returns[i][~np.isnan(self._rolling_returns[i])]
-                if len(valid) >= 5:
-                    self._rolling_vols[i] = max(0.01, float(np.std(valid)))
+        if self._bootstrap_returns is not None and self._bootstrap_idx < len(self._bootstrap_returns):
+            returns_per_asset = np.asarray(
+                self._bootstrap_returns[self._bootstrap_idx], dtype=np.float32
+            ).reshape(self.n_assets)
+            self._bootstrap_idx += 1
+        else:
+            outputs = self._specialist_outputs or [{}] * self.n_assets
+            returns_per_asset = np.zeros(self.n_assets, dtype=np.float32)
+            for i in range(self.n_assets):
+                s = outputs[i] if i < len(outputs) else {}
+                sentiment = s.get("sentiment", 0.0)
+                quant_prob = s.get("quant_prob", 0.5)
+                fund_score = s.get("fund_score", 0.0)
+                regime_flag = s.get("regime_flag", 0.5)
+                signal = (sentiment + (quant_prob - 0.5) * 2 + fund_score - regime_flag) / 4
+                ret = signal * 0.01 + float(self.np_random.normal(0, 0.01))
+                returns_per_asset[i] = ret
+                if self._rolling_returns is not None:
+                    self._rolling_returns[i] = np.roll(self._rolling_returns[i], 1)
+                    self._rolling_returns[i, 0] = ret
+                    valid = self._rolling_returns[i][~np.isnan(self._rolling_returns[i])]
+                    if len(valid) >= 5:
+                        self._rolling_vols[i] = max(0.01, float(np.std(valid)))
 
-        # Full-portfolio return: weights sum to <= 1, unallocated is cash (0 return)
         portfolio_return = float(np.dot(effective_holdings, returns_per_asset))
         self._returns_history.append(portfolio_return)
-        self._equity_history.append(self._equity_history[-1] * (1 + portfolio_return))
+        new_eq = self._equity_history[-1] * (1 + portfolio_return)
+        self._equity_history.append(new_eq)
+        self._equity_peak = max(self._equity_peak, new_eq)
 
         obs = self._get_obs(holdings=self._holdings)
 
-        if len(self._returns_history) >= self.rolling_sharpe_days:
-            recent = np.array(self._returns_history[-self.rolling_sharpe_days :])
-            sharpe = np.mean(recent) / (np.std(recent) + 1e-8) * np.sqrt(252)
-            reward = float(np.clip(sharpe, -2, 2))
-        else:
-            reward = portfolio_return * 100
-
-        if self.drawdown_penalty > 0 and len(self._equity_history) > 1:
-            peak = max(self._equity_history)
-            current = self._equity_history[-1]
-            drawdown = (peak - current) / (peak + 1e-8)
-            reward -= self.drawdown_penalty * drawdown
-        cost_bps = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
-        reward -= turnover * cost_bps * 10.0
-        reward = float(np.clip(np.nan_to_num(reward, nan=0.0, posinf=2.0, neginf=-2.0), -2.0, 2.0))
+        current = self._equity_history[-1]
+        drawdown = (self._equity_peak - current) / (self._equity_peak + 1e-8) if len(self._equity_history) > 1 else 0.0
+        reward = _compute_step_reward(portfolio_return, turnover, drawdown, self.drawdown_penalty)
 
         terminated = self._step_count >= self.episode_days
         truncated = False
@@ -320,7 +238,7 @@ class HistoricalTradingEnv(gym.Env):
     """
     Trading environment using real historical returns.
     Steps through aligned return data; derives specialist proxies from lookback.
-    Episodes are rolling windows over the data.
+    Optional daily_aux_features (n_days, n_assets, 2): atr_pct, volume_ratio mapped into obs slots.
     """
 
     metadata = {"render_modes": []}
@@ -333,17 +251,27 @@ class HistoricalTradingEnv(gym.Env):
         episode_days: int | None = None,
         drawdown_penalty: float | None = None,
         render_mode: str | None = None,
+        daily_aux_features: np.ndarray | None = None,
     ):
         """
         Args:
             returns_array: Shape (n_days, n_assets), daily returns per asset.
             n_assets: Number of assets.
+            daily_aux_features: Optional (n_days, n_assets, 2) for atr_pct, volume_ratio.
         """
         super().__init__()
         self.returns_array = np.asarray(returns_array, dtype=np.float32)
         self.n_days, self.n_assets = self.returns_array.shape
         if self.n_assets != n_assets:
             raise ValueError("returns_array n_assets mismatch")
+        self.daily_aux_features = (
+            np.asarray(daily_aux_features, dtype=np.float32) if daily_aux_features is not None else None
+        )
+        if self.daily_aux_features is not None and self.daily_aux_features.shape[:2] != (
+            self.n_days,
+            self.n_assets,
+        ):
+            raise ValueError("daily_aux_features shape must match (n_days, n_assets, K)")
         self.rolling_sharpe_days = rolling_sharpe_days or ENV_ROLLING_SHARPE_DAYS
         self.episode_days = episode_days or ENV_EPISODE_DAYS
         self.drawdown_penalty = (
@@ -369,8 +297,14 @@ class HistoricalTradingEnv(gym.Env):
         self._step_in_episode: int = 0
         self._returns_history: list[float] = []
         self._equity_history: list[float] = []
+        self._equity_peak: float = 1.0
         self._holdings: np.ndarray | None = None
         self.np_random = np.random.default_rng()
+
+        # Pre-compute proxy features once; _get_obs() becomes a cheap array lookup.
+        # Shape (n_days, n_assets, 13) — row t uses returns_array[t-21:t].
+        from .proxy_specialists import precompute_proxy_feature_matrix
+        self._proxy_cache = precompute_proxy_feature_matrix(self.returns_array, window=21)
 
     def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
@@ -384,6 +318,7 @@ class HistoricalTradingEnv(gym.Env):
         self._step_in_episode = 0
         self._returns_history = []
         self._equity_history = [1.0]
+        self._equity_peak = 1.0
         self._holdings = np.zeros(self.n_assets, dtype=np.float32)
 
         obs = self._get_obs()
@@ -391,22 +326,11 @@ class HistoricalTradingEnv(gym.Env):
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         self._step_in_episode += 1
-        action = np.clip(action, 0, 1).astype(np.float32)
+        action = normalize_action_max_unit_exposure(action)
 
         min_trade_equity = MIN_TRADE_NOTIONAL / STARTING_CAPITAL
-        equity = self._equity_history[-1]
-        effective_holdings = self._holdings.copy()
-        increased_this_step: set[int] = set()
-        for i in range(self.n_assets):
-            notional = abs(action[i] - self._holdings[i]) * equity
-            if action[i] > self._holdings[i] and notional >= min_trade_equity:
-                effective_holdings[i] = action[i]
-                increased_this_step.add(i)
-        for i in range(self.n_assets):
-            if action[i] < self._holdings[i] and i not in increased_this_step:
-                notional = abs(action[i] - self._holdings[i]) * equity
-                if notional >= min_trade_equity:
-                    effective_holdings[i] = action[i]
+        equity = float(self._equity_history[-1])
+        effective_holdings = _effective_holdings_min_trade(action, self._holdings, equity, min_trade_equity)
         turnover = float(np.sum(np.abs(effective_holdings - self._holdings)))
         self._holdings = effective_holdings
 
@@ -415,29 +339,18 @@ class HistoricalTradingEnv(gym.Env):
             return _sanitize_obs(obs), 0.0, True, False, {"return": 0.0}
 
         day_returns = self.returns_array[self._cursor]
-        # Full-portfolio return: weights sum to <= 1, unallocated is cash (0 return)
         portfolio_return = float(np.dot(effective_holdings, day_returns))
         self._returns_history.append(portfolio_return)
-        self._equity_history.append(self._equity_history[-1] * (1 + portfolio_return))
+        new_eq = self._equity_history[-1] * (1 + portfolio_return)
+        self._equity_history.append(new_eq)
+        self._equity_peak = max(self._equity_peak, new_eq)
 
         self._cursor += 1
         obs = self._get_obs()
 
-        if len(self._returns_history) >= self.rolling_sharpe_days:
-            recent = np.array(self._returns_history[-self.rolling_sharpe_days :])
-            sharpe = np.mean(recent) / (np.std(recent) + 1e-8) * np.sqrt(252)
-            reward = float(np.clip(sharpe, -2, 2))
-        else:
-            reward = portfolio_return * 100
-
-        if self.drawdown_penalty > 0 and len(self._equity_history) > 1:
-            peak = max(self._equity_history)
-            current = self._equity_history[-1]
-            drawdown = (peak - current) / (peak + 1e-8)
-            reward -= self.drawdown_penalty * drawdown
-        cost_bps = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
-        reward -= turnover * cost_bps * 10.0
-        reward = float(np.clip(np.nan_to_num(reward, nan=0.0, posinf=2.0, neginf=-2.0), -2.0, 2.0))
+        current = self._equity_history[-1]
+        drawdown = (self._equity_peak - current) / (self._equity_peak + 1e-8) if len(self._equity_history) > 1 else 0.0
+        reward = _compute_step_reward(portfolio_return, turnover, drawdown, self.drawdown_penalty)
 
         terminated = self._step_in_episode >= self.episode_days or self._cursor >= self.n_days
         truncated = False
@@ -445,18 +358,21 @@ class HistoricalTradingEnv(gym.Env):
         return _sanitize_obs(obs), reward, terminated, truncated, {"return": portfolio_return}
 
     def _get_obs(self) -> np.ndarray:
-        window = 21
-        start_idx = max(0, self._cursor - window)
-        returns_window = self.returns_array[start_idx : self._cursor, :]  # (window, n_assets)
-        if returns_window.size == 0:
+        if self._cursor == 0:
             features = np.zeros((self.n_assets, 13), dtype=np.float32)
             features[:, 1] = 0.5
             features[:, 3] = 0.5
             features[:, 6] = 0.5
-            features[:, 9] = 0.5  # liquidity
+            features[:, 9] = 0.5
             features[:, 12] = 0.01
         else:
-            features = _proxy_specialists_vectorized(returns_window)  # (n_assets, 13)
+            features = self._proxy_cache[self._cursor].copy()  # (n_assets, 13)
+            if self.daily_aux_features is not None:
+                aux_row = self.daily_aux_features[self._cursor - 1]
+                for j in range(self.n_assets):
+                    features[j] = merge_daily_aux_into_proxy_row(
+                        features[j], aux_row[j]
+                    )
 
         holdings = self._holdings if self._holdings is not None else np.zeros(self.n_assets, dtype=np.float32)
         if ENV_OBS_ROLLING_FEATURES:

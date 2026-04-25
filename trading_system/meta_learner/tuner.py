@@ -123,6 +123,7 @@ def run_tuning(
     fixed_historical_ratio: float | None = None,
     single_thread: bool = False,
     params_path: Path | None = None,
+    show_progress: bool = True,
 ) -> dict[str, Any]:
     """
     Run Optuna hyperparameter tuning.
@@ -130,8 +131,8 @@ def run_tuning(
     Returns best params dict.
     """
     n_envs = n_envs if n_envs is not None else PPO_N_ENVS
-    # EvalCallback uses n_calls (callback invocations); PPO calls once per rollout step = 1 call per n_envs timesteps
-    eval_freq = max((n_timesteps // n_evaluations) // n_envs, 1)
+    # EvalCallback n_calls scales with vec env rollouts; align eval cadence with n_envs
+    eval_freq = max((n_timesteps // n_evaluations) // max(1, n_envs), 1)
     params_path = params_path or PPO_TUNE_PARAMS_PATH
     returns_array = np.asarray(returns_array, dtype=np.float32)
 
@@ -169,6 +170,7 @@ def run_tuning(
                 historical_ratio=historical_ratio,
                 specialist_fn=proxy_specialist_fn,
                 seed=trial.number,
+                daily_aux_features=None,
             )
         else:
             env_fns = [
@@ -180,10 +182,19 @@ def run_tuning(
                     historical_ratio=historical_ratio,
                     specialist_fn=proxy_specialist_fn,
                     seed=trial.number * 1000 + i,
+                    daily_aux_features=None,
                 )
                 for i in range(n_envs)
             ]
-            env = SubprocVecEnv(env_fns)
+            try:
+                import sys
+
+                if sys.platform != "win32":
+                    env = SubprocVecEnv(env_fns, start_method="forkserver")
+                else:
+                    env = SubprocVecEnv(env_fns)
+            except TypeError:
+                env = SubprocVecEnv(env_fns)
 
         env = VecMonitor(env) if isinstance(env, VecEnv) else Monitor(env)
         eval_inner = HistoricalTradingEnv(returns_array=val_returns, n_assets=n_assets)
@@ -218,7 +229,7 @@ def run_tuning(
         )
 
         try:
-            model.learn(total_timesteps=n_timesteps, callback=eval_callback, progress_bar=False)
+            model.learn(total_timesteps=n_timesteps, callback=eval_callback, progress_bar=show_progress)
         except (AssertionError, ValueError):
             return float("nan")
         finally:
@@ -261,7 +272,8 @@ def run_tuning(
             study.enqueue_trial(prev)
 
     study.optimize(
-        objective, n_trials=n_trials, timeout=timeout, callbacks=[_save_best_cb]
+        objective, n_trials=n_trials, timeout=timeout, callbacks=[_save_best_cb],
+        show_progress_bar=show_progress,
     )
 
     if study.best_trial is None:

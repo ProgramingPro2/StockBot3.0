@@ -15,7 +15,8 @@ A hierarchical multi-agent algorithmic trading system for long-term equity strat
 cd StockBot3.0
 python -m venv .venv
 source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-pip install -r trading_system/requirements.txt
+pip install -r requirements.txt
+# or: pip install -e .
 ```
 
 ### Ollama Setup

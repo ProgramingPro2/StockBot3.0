@@ -3,6 +3,8 @@ PPO meta-learner via stable-baselines3.
 Weights specialist opinions to decide position sizing.
 """
 import logging
+import os
+import sys
 import time
 from datetime import datetime
 from functools import partial
@@ -20,9 +22,11 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback,
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from ..config import (
+    ENV_EPISODE_DAYS,
     ENV_OBS_ROLLING_FEATURES,
     META_LEARNER_MODEL_DIR,
     PPO_CHECKPOINT_FREQ,
+    PPO_CHECKPOINT_KEEP_LAST,
     PPO_CPU_THREADS,
     PPO_EARLY_STOPPING_EVAL_FREQ,
     PPO_EARLY_STOPPING_MIN_DELTA,
@@ -39,7 +43,9 @@ from ..config import (
     PPO_N_ENVS,
     PPO_N_STEPS,
 )
+from ..utils.output_cleanup import prune_checkpoints
 from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
+from .proxy_specialists import normalize_action_max_unit_exposure
 
 
 class EarlyStoppingCallback(BaseCallback):
@@ -110,21 +116,43 @@ class EarlyStoppingCallback(BaseCallback):
         return True
 
 
-def _random_specialist_outputs(n_assets: int) -> list[dict]:
-    """Module-level random specialist outputs; picklable (no closure over self)."""
+def _random_specialist_outputs(n_assets: int, rng: np.random.Generator | None = None) -> list[dict]:
+    """Random specialist outputs; use rng for reproducibility."""
+    rng = rng or np.random.default_rng()
     return [
         {
-            "sentiment": float(np.random.uniform(-1, 1)),
-            "quant_prob": float(np.random.uniform(0, 1)),
-            "fund_score": float(np.random.uniform(-1, 1)),
-            "regime_flag": float(np.random.uniform(0, 1)),
-            "momentum_score": float(np.random.uniform(-1, 1)),
-            "mean_reversion_score": float(np.random.uniform(-1, 1)),
-            "volatility_score": float(np.random.uniform(0, 1)),
-            "event_risk_score": float(np.random.uniform(0, 1)),
+            "sentiment": float(rng.uniform(-1, 1)),
+            "quant_prob": float(rng.uniform(0, 1)),
+            "fund_score": float(rng.uniform(-1, 1)),
+            "regime_flag": float(rng.uniform(0, 1)),
+            "momentum_score": float(rng.uniform(-1, 1)),
+            "mean_reversion_score": float(rng.uniform(-1, 1)),
+            "volatility_score": float(rng.uniform(0, 1)),
+            "event_risk_score": float(rng.uniform(0, 1)),
+            "relative_strength_score": float(rng.uniform(-1, 1)),
+            "liquidity_score": float(rng.uniform(0, 1)),
         }
         for _ in range(n_assets)
     ]
+
+
+class BootstrapReturnSampler:
+    """Picklable: sample contiguous return blocks from historical data for synthetic TradingEnv."""
+
+    def __init__(self, returns_array: np.ndarray, n_assets: int, episode_days: int, seed: int = 0):
+        self.returns_array = np.asarray(returns_array, dtype=np.float32)
+        self.n_rows = int(self.returns_array.shape[0])
+        self.n_assets = int(n_assets)
+        self.episode_days = int(episode_days)
+        self._rng = np.random.default_rng(seed)
+
+    def sample_block(self) -> np.ndarray:
+        need = self.episode_days + 1
+        if self.n_rows < need:
+            return np.zeros((need, self.n_assets), dtype=np.float32)
+        max_start = self.n_rows - need
+        s = int(self._rng.integers(0, max_start + 1))
+        return self.returns_array[s : s + need].copy()
 
 
 class SpecialistWrapper(TradingEnv):
@@ -133,18 +161,29 @@ class SpecialistWrapper(TradingEnv):
     Module-level for picklability with SubprocVecEnv.
     """
 
-    def __init__(self, n_assets: int, specialist_fn: Callable[[], list[dict]] | None = None):
+    def __init__(
+        self,
+        n_assets: int,
+        specialist_fn: Callable[[], list[dict]] | None = None,
+        bootstrap_sampler: BootstrapReturnSampler | None = None,
+    ):
         super().__init__(n_assets=n_assets)
         self._specialist_fn = specialist_fn
+        self._bootstrap_sampler = bootstrap_sampler
 
     def reset(self, seed: int | None = None, options: dict | None = None):
         opts = dict(options or {})
-        fn = self._specialist_fn or (lambda: _random_specialist_outputs(self.n_assets))
-        outputs = fn()
+        rng = np.random.default_rng(seed if seed is not None else 0)
+        if self._specialist_fn is not None:
+            outputs = self._specialist_fn()
+        else:
+            outputs = _random_specialist_outputs(self.n_assets, rng)
         if isinstance(outputs, dict):
             outputs = [outputs] * self.n_assets
         outputs = (list(outputs) + [{}] * self.n_assets)[: self.n_assets]
         opts["specialist_outputs"] = outputs
+        if self._bootstrap_sampler is not None:
+            opts["bootstrap_returns"] = self._bootstrap_sampler.sample_block()
         return super().reset(seed=seed, options=opts)
 
 
@@ -155,23 +194,46 @@ def _make_env_fn(
     historical_ratio: float,
     specialist_fn: Callable[[], list[dict]] | None,
     seed: int,
+    daily_aux_features: np.ndarray | None = None,
 ) -> gym.Env:
     """
     Picklable factory that creates one env for SubprocVecEnv.
     mode: "historical" | "mixed" | "synthetic"
     """
+    bootstrap_sampler: BootstrapReturnSampler | None = None
+    if historical_returns is not None and mode in ("synthetic", "mixed"):
+        bootstrap_sampler = BootstrapReturnSampler(
+            historical_returns, n_assets, ENV_EPISODE_DAYS, seed
+        )
+
     if mode == "historical" and historical_returns is not None:
-        env = HistoricalTradingEnv(returns_array=historical_returns, n_assets=n_assets)
+        env = HistoricalTradingEnv(
+            returns_array=historical_returns,
+            n_assets=n_assets,
+            daily_aux_features=daily_aux_features,
+        )
     elif mode == "mixed" and historical_returns is not None and 0 < historical_ratio < 1:
-        hist_env = HistoricalTradingEnv(returns_array=historical_returns, n_assets=n_assets)
-        synth_env = SpecialistWrapper(n_assets=n_assets, specialist_fn=specialist_fn)
+        hist_env = HistoricalTradingEnv(
+            returns_array=historical_returns,
+            n_assets=n_assets,
+            daily_aux_features=daily_aux_features,
+        )
+        synth_env = SpecialistWrapper(
+            n_assets=n_assets,
+            specialist_fn=specialist_fn,
+            bootstrap_sampler=bootstrap_sampler,
+        )
         env = MixedDataEnv(
             historical_env=hist_env,
             synthetic_env=synth_env,
             historical_ratio=historical_ratio,
         )
     else:
-        env = SpecialistWrapper(n_assets=n_assets, specialist_fn=specialist_fn)
+        env = SpecialistWrapper(
+            n_assets=n_assets,
+            specialist_fn=specialist_fn,
+            bootstrap_sampler=bootstrap_sampler,
+        )
 
     env.reset(seed=seed)
     return env
@@ -231,6 +293,7 @@ class PPOTrader:
         validation_returns: np.ndarray | None = None,
         ppo_kwargs: dict[str, Any] | None = None,
         n_envs: int | None = None,
+        daily_aux_features: np.ndarray | None = None,
     ) -> Path | None:
         """
         Train PPO on simulated or historical episodes.
@@ -268,6 +331,9 @@ class PPOTrader:
             mode = "synthetic"
             logging.getLogger("boardroom").info("PPO training mode: 100%% synthetic")
 
+        if n_envs > 1:
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+
         if n_envs <= 1:
             env = _make_env_fn(
                 mode=mode,
@@ -276,6 +342,7 @@ class PPOTrader:
                 historical_ratio=historical_ratio,
                 specialist_fn=specialist_fn,
                 seed=0,
+                daily_aux_features=daily_aux_features,
             )
         else:
             env_fns = [
@@ -287,10 +354,17 @@ class PPOTrader:
                     historical_ratio=historical_ratio,
                     specialist_fn=specialist_fn,
                     seed=i,
+                    daily_aux_features=daily_aux_features,
                 )
                 for i in range(n_envs)
             ]
-            env = SubprocVecEnv(env_fns)
+            try:
+                if sys.platform != "win32":
+                    env = SubprocVecEnv(env_fns, start_method="forkserver")
+                else:
+                    env = SubprocVecEnv(env_fns)
+            except TypeError:
+                env = SubprocVecEnv(env_fns)
             logging.getLogger("boardroom").info(
                 "PPO training with %d parallel envs (SubprocVecEnv)", n_envs
             )
@@ -360,15 +434,25 @@ class PPOTrader:
         ):
             from stable_baselines3.common.monitor import Monitor
             eval_returns = validation_returns if validation_returns is not None and len(validation_returns) > 0 else historical_returns
+            eval_aux = None
+            if (
+                daily_aux_features is not None
+                and daily_aux_features.shape[0] == len(eval_returns)
+            ):
+                eval_aux = daily_aux_features
             eval_env = HistoricalTradingEnv(
                 returns_array=eval_returns,
                 n_assets=self.n_assets,
+                daily_aux_features=eval_aux,
             )
             eval_env = Monitor(eval_env)
+            eval_freq_calls = max(
+                1, PPO_EARLY_STOPPING_EVAL_FREQ // max(1, getattr(env, "num_envs", 1))
+            )
             eval_callback = EvalCallback(
                 eval_env,
                 n_eval_episodes=5,
-                eval_freq=PPO_EARLY_STOPPING_EVAL_FREQ,
+                eval_freq=eval_freq_calls,
                 deterministic=True,
                 verbose=0,
             )
@@ -382,8 +466,10 @@ class PPOTrader:
                 )
             )
             logging.getLogger("boardroom").info(
-                "Early stopping enabled: eval every %d steps, patience=%d, min_delta=%.4f",
+                "Early stopping enabled: eval every %d env-callback steps (~%d train steps with n_envs=%d), patience=%d, min_delta=%.4f",
+                eval_freq_calls,
                 PPO_EARLY_STOPPING_EVAL_FREQ,
+                getattr(env, "num_envs", 1),
                 PPO_EARLY_STOPPING_PATIENCE,
                 PPO_EARLY_STOPPING_MIN_DELTA,
             )
@@ -392,6 +478,9 @@ class PPOTrader:
             progress_bar=True,
             callback=callbacks if callbacks else None,
         )
+
+        ck_dir = META_LEARNER_MODEL_DIR / "checkpoints"
+        prune_checkpoints(ck_dir, keep=PPO_CHECKPOINT_KEEP_LAST)
 
         META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         self.model.save(str(META_LEARNER_MODEL_DIR / "ppo_trader.zip"))
@@ -453,7 +542,7 @@ class PPOTrader:
         obs = np.array(parts, dtype=np.float32)
         obs = np.clip(obs, -1, 1)
         action, _ = self.model.predict(obs, deterministic=True)
-        action_clipped = np.clip(action, 0, 1)
+        action_clipped = normalize_action_max_unit_exposure(np.asarray(action, dtype=np.float32))
 
         if debug:
             per_asset = 11 + (3 if ENV_OBS_ROLLING_FEATURES else 0)

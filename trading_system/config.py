@@ -63,8 +63,12 @@ for d in [CACHE_DIR, FUNDAMENTAL_CACHE_DIR, NEWS_CACHE_DIR, SPECIALIST_CACHE_DIR
 
 # Ollama (first model tried; fallbacks used if primary fails, e.g. not pulled)
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
-OLLAMA_FALLBACK_MODELS = [m.strip() for m in os.getenv("OLLAMA_FALLBACK_MODELS", "llama3.2,llama2").split(",") if m.strip()]
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+OLLAMA_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv("OLLAMA_FALLBACK_MODELS", "gpt-oss:latest,llama3:latest,llama2:7b").split(",")
+    if m.strip()
+]
 
 # Alpaca (live trading)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
@@ -142,6 +146,11 @@ N_ASSETS = len(TRADE_TICKERS)
 # Data
 CACHE_MAX_AGE_HOURS = 1
 CACHE_MAX_AGE_DAYS = 7  # Stale cache OK when network fails
+# When OHLCV parquet cache is older than this many days, refetch on next load (0 = disable, use hours-only)
+try:
+    CACHE_STALE_FULL_REFRESH_DAYS = int(os.getenv("CACHE_STALE_FULL_REFRESH_DAYS", "90").strip() or "90")
+except (ValueError, TypeError):
+    CACHE_STALE_FULL_REFRESH_DAYS = 90
 SPECIALIST_CACHE_MAX_AGE_HOURS = 1  # Refetch when older (sentiment/news change)
 RATE_LIMIT_REQUESTS_PER_MIN = 30
 YFINANCE_LOOKBACK_YEARS = 10
@@ -174,8 +183,8 @@ VAE_REGIME_CLUSTERS = 4  # Bull, Bear, Sideways, Crash
 PPO_LEARNING_RATE = 3e-4
 # When using --use-tuned, n_steps is capped at this value for faster training (tune often picks 4096)
 PPO_N_STEPS = int(os.getenv("PPO_N_STEPS", "2048"))
-PPO_BATCH_SIZE = 64
-PPO_N_EPOCHS = 10
+PPO_BATCH_SIZE = int(os.getenv("PPO_BATCH_SIZE", "256"))
+PPO_N_EPOCHS = int(os.getenv("PPO_N_EPOCHS", "10"))
 PPO_GAMMA = 0.99
 PPO_GAE_LAMBDA = 0.95
 PPO_CLIP_RANGE = 0.2
@@ -184,6 +193,8 @@ PPO_NET_ARCH: dict | list = None  # None = default; or {"pi": [64, 64], "vf": [6
 PPO_TOTAL_TIMESTEPS = int(os.getenv("PPO_TOTAL_TIMESTEPS", "500000"))  # Try 1000000+ with --use-historical --use-tuned
 # Save checkpoint every N timesteps during training (0 = disable)
 PPO_CHECKPOINT_FREQ = int(os.getenv("PPO_CHECKPOINT_FREQ", "100000"))
+PPO_CHECKPOINT_KEEP_LAST = int(os.getenv("PPO_CHECKPOINT_KEEP_LAST", "5"))
+OUTPUT_PLOT_KEEP_LAST = int(os.getenv("OUTPUT_PLOT_KEEP_LAST", "5"))
 # Early stopping: stop if eval reward has no improvement for this many consecutive evaluations (0 = disabled)
 PPO_EARLY_STOPPING_PATIENCE = int(os.getenv("PPO_EARLY_STOPPING_PATIENCE", "5"))
 # Eval every N timesteps for early stopping; 0 = no early stopping

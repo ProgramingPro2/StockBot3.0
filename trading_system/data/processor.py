@@ -70,8 +70,8 @@ def prepare_tft_data_inference(
     ticker: str | None = None,
 ) -> pd.DataFrame:
     """
-    Prepare OHLCV for TFT inference: no dropna on target so the current bar can be scored.
-    Fills forward_return_30d with 0 for the last max_prediction_length rows (not used at inference).
+    Prepare OHLCV for TFT inference without future leakage.
+    Target column is set to 0.0 for all rows (not used for loss at inference; avoids shift(-n)).
     """
     if df.empty or len(df) < max_encoder_length + 1:
         return pd.DataFrame()
@@ -79,13 +79,11 @@ def prepare_tft_data_inference(
     df = df.sort_index().reset_index()
     df["time_idx"] = np.arange(len(df))
     df["return_1d"] = df["close"].pct_change()
-    df["forward_return_30d"] = df["close"].shift(-max_prediction_length) / df["close"] - 1
+    df["forward_return_30d"] = 0.0
     df[group_id] = ticker if ticker else "asset"
     df["vol_20d"] = df["return_1d"].rolling(20).std()
     df["vol_20d"] = df["vol_20d"].bfill().fillna(0)
     df["return_1d"] = df["return_1d"].fillna(0)
-    # Keep all rows for inference; fill tail target so we can score the current bar
-    df.loc[df["forward_return_30d"].isna(), "forward_return_30d"] = 0.0
     return df
 
 

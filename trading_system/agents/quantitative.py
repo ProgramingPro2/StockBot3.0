@@ -176,6 +176,13 @@ def get_trend_probability(ticker: str, retrain: bool = False) -> float:
     _model.eval()
     with torch.no_grad():
         preds = _model.predict(dl)
-    # Last prediction corresponds to the most recent encoder window (current bar)
-    forecast = float(preds[-1]) if preds.numel() >= 1 else 0.0
+    # preds: (n_samples, prediction_length) or (n_samples,) — use last row, first horizon step
+    if preds is None or preds.numel() == 0:
+        forecast = 0.0
+    elif preds.dim() == 2:
+        forecast = float(preds[-1, 0])
+    elif preds.dim() == 1:
+        forecast = float(preds[-1])
+    else:
+        forecast = float(preds.flatten()[-1])
     return _forecast_to_probability(forecast)
