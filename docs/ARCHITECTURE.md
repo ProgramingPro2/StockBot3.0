@@ -103,13 +103,13 @@ Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
 - **Model**: PPO (stable-baselines3)
 - **Observation**: Per-asset specialist features + holdings + optional rolling features. Length = 14 \* n_assets when `ENV_OBS_ROLLING_FEATURES` is true: for each asset (sentiment, quant_prob, fund_score, regime_flag, momentum_score, mean_reversion_score, volatility_score, event_risk_score, relative_strength_score, liquidity_score, holdings, rolling_return_5d, rolling_return_21d, rolling_vol_21d). Without rolling: 11 \* n_assets. Example: 70-dim for 5 assets with rolling.
 - **Action**: Position size % per asset [0, 1]; n_assets outputs (e.g. 5). When `ENV_ALLOW_CASH_EXPOSURE` is true, the **sum** of actions is interpreted as total market exposure (capped at 1); the rest stays in cash (0 return).
-- **Reward**: Portfolio rolling Sharpe ratio minus drawdown penalty (configurable via `ENV_REWARD_DRAWDOWN_PENALTY`).
-- **Training**: Three modes: synthetic `TradingEnv` (random returns), `HistoricalTradingEnv` (real OHLCV returns), or `MixedDataEnv` (configurable blend). Use `--use-historical` for 100% historical, `--historical-ratio 0.7` for 70% historical / 30% synthetic, or `TRAIN_HISTORICAL_RATIO` in config. When `TRAIN_HISTORICAL_RATIO` is set in `.env`, it is used as the fixed ratio for both training and tuning and the tuner will not search for it. Mixed training lets the model learn both generalizable strategies and real market dynamics.
+- **Reward**: Full-portfolio return (weights \* returns, cash earns 0) with rolling Sharpe when enough history; drawdown penalty (`ENV_REWARD_DRAWDOWN_PENALTY`) and turnover cost (`TRANSACTION_COST_BPS`, `SLIPPAGE_BPS`).
+- **Training**: Default is historical-first (`TRAIN_HISTORICAL_RATIO=1.0`). Three modes: synthetic `TradingEnv`, `HistoricalTradingEnv` (real OHLCV returns), or mixed. Use `--use-historical` for 100% historical or `TRAIN_HISTORICAL_RATIO` in config. When set in `.env`, it is used as the fixed ratio for both training and tuning. See [Training Data and Evaluation](training_data_and_evaluation.md) for walk-forward splits and data contract.
 - **Tuning**: Run `tune` for Optuna-based hyperparameter optimization; use `--use-tuned` when training.
 
 ### Variable Exposure and Cash
 
-When `ENV_ALLOW_CASH_EXPOSURE` is true (default): allocation uses raw action sum as total market exposure (capped at 1.0). Strategy return = exposure _ (weighted basket return); remainder of capital stays in cash. In live trading, only `cash _ exposure` is invested; the rest remains in the account. When false, behavior is unchanged: weights are normalized to sum to 1 (100% invested).
+When `ENV_ALLOW_CASH_EXPOSURE` is true (default): allocation uses raw action sum as total market exposure (capped at 1.0). Strategy return = exposure \* (weighted basket return); remainder of capital stays in cash. **Live, paper, and backtest size targets from total portfolio value** (not cash), so target value per asset = portfolio_value \* weight. This avoids sell-then-rebuy churn when cash is temporarily low. When false, weights are normalized to sum to 1 (100% invested).
 
 ## Scheduler
 
@@ -161,7 +161,7 @@ This keeps behavior consistent across live, backtest, and training and avoids da
 
 **Paper**: Run specialists for all tickers each interval; one PPO prediction (5 position sizes); log exposure and weights; Discord per ticker. Use `--autodiscover` to resolve the trade list via universe autodiscovery (top N by scorer) at start.
 
-**Live**: Same as paper; allocate `cash * exposure` to the weighted basket; place buy/sell per ticker via Alpaca; remainder stays in cash. Use `--autodiscover` to resolve the trade list via universe autodiscovery at start.
+**Live**: Same as paper; target value per ticker = portfolio_value \* weight (sized from total portfolio value, not cash); place buy/sell per ticker via Alpaca. Rebalance band and cooldowns (min hold after buy, min re-entry after sell) apply. Use `--autodiscover` to resolve the trade list via universe autodiscovery at start.
 
 Switching the number of assets (e.g. changing TRADE_TICKERS length) requires retraining the PPO; the saved policy has fixed input/output dimensions.
 

@@ -15,8 +15,16 @@ from ..config import (
     ENV_REWARD_DRAWDOWN_PENALTY,
     ENV_ROLLING_SHARPE_DAYS,
     MIN_TRADE_NOTIONAL,
+    SLIPPAGE_BPS,
     STARTING_CAPITAL,
+    TRANSACTION_COST_BPS,
 )
+
+
+def _sanitize_obs(obs: np.ndarray) -> np.ndarray:
+    """Replace NaN/Inf with 0 and clip to [-1, 1] so the policy never sees invalid values."""
+    out = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return np.clip(out, -1.0, 1.0)
 
 
 def _proxy_specialists_vectorized(returns_2d: np.ndarray) -> np.ndarray:
@@ -222,6 +230,7 @@ class TradingEnv(gym.Env):
                 notional = abs(action[i] - self._holdings[i]) * equity
                 if notional >= min_trade_equity:
                     effective_holdings[i] = action[i]
+        turnover = float(np.sum(np.abs(effective_holdings - self._holdings)))
         self._holdings = effective_holdings
 
         outputs = self._specialist_outputs or [{}] * self.n_assets
@@ -242,8 +251,8 @@ class TradingEnv(gym.Env):
                 if len(valid) >= 5:
                     self._rolling_vols[i] = max(0.01, float(np.std(valid)))
 
-        eff_sum = float(np.sum(effective_holdings)) + 1e-8
-        portfolio_return = float(np.dot(effective_holdings, returns_per_asset) / eff_sum)
+        # Full-portfolio return: weights sum to <= 1, unallocated is cash (0 return)
+        portfolio_return = float(np.dot(effective_holdings, returns_per_asset))
         self._returns_history.append(portfolio_return)
         self._equity_history.append(self._equity_history[-1] * (1 + portfolio_return))
 
@@ -261,11 +270,14 @@ class TradingEnv(gym.Env):
             current = self._equity_history[-1]
             drawdown = (peak - current) / (peak + 1e-8)
             reward -= self.drawdown_penalty * drawdown
+        cost_bps = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
+        reward -= turnover * cost_bps * 10.0
+        reward = float(np.clip(np.nan_to_num(reward, nan=0.0, posinf=2.0, neginf=-2.0), -2.0, 2.0))
 
         terminated = self._step_count >= self.episode_days
         truncated = False
 
-        return obs, reward, terminated, truncated, {"return": portfolio_return}
+        return _sanitize_obs(obs), reward, terminated, truncated, {"return": portfolio_return}
 
     def _get_obs(self, holdings: np.ndarray) -> np.ndarray:
         outputs = self._specialist_outputs or [{}] * self.n_assets
@@ -295,7 +307,7 @@ class TradingEnv(gym.Env):
                 else:
                     parts.extend([0.0, 0.0, 0.0])
         obs = np.array(parts, dtype=np.float32)
-        return np.clip(obs, -1, 1)
+        return _sanitize_obs(obs)
 
     def render(self) -> None:
         pass
@@ -395,15 +407,16 @@ class HistoricalTradingEnv(gym.Env):
                 notional = abs(action[i] - self._holdings[i]) * equity
                 if notional >= min_trade_equity:
                     effective_holdings[i] = action[i]
+        turnover = float(np.sum(np.abs(effective_holdings - self._holdings)))
         self._holdings = effective_holdings
 
         if self._cursor >= self.n_days:
             obs = self._get_obs()
-            return obs, 0.0, True, False, {"return": 0.0}
+            return _sanitize_obs(obs), 0.0, True, False, {"return": 0.0}
 
         day_returns = self.returns_array[self._cursor]
-        eff_sum = float(np.sum(effective_holdings)) + 1e-8
-        portfolio_return = float(np.dot(effective_holdings, day_returns) / eff_sum)
+        # Full-portfolio return: weights sum to <= 1, unallocated is cash (0 return)
+        portfolio_return = float(np.dot(effective_holdings, day_returns))
         self._returns_history.append(portfolio_return)
         self._equity_history.append(self._equity_history[-1] * (1 + portfolio_return))
 
@@ -422,11 +435,14 @@ class HistoricalTradingEnv(gym.Env):
             current = self._equity_history[-1]
             drawdown = (peak - current) / (peak + 1e-8)
             reward -= self.drawdown_penalty * drawdown
+        cost_bps = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
+        reward -= turnover * cost_bps * 10.0
+        reward = float(np.clip(np.nan_to_num(reward, nan=0.0, posinf=2.0, neginf=-2.0), -2.0, 2.0))
 
         terminated = self._step_in_episode >= self.episode_days or self._cursor >= self.n_days
         truncated = False
 
-        return obs, reward, terminated, truncated, {"return": portfolio_return}
+        return _sanitize_obs(obs), reward, terminated, truncated, {"return": portfolio_return}
 
     def _get_obs(self) -> np.ndarray:
         window = 21
@@ -450,7 +466,7 @@ class HistoricalTradingEnv(gym.Env):
         else:
             per_asset = np.column_stack((features[:, :10], holdings))  # (n_assets, 11)
         obs = per_asset.flatten().astype(np.float32)
-        return np.clip(obs, -1, 1)
+        return _sanitize_obs(obs)
 
     def render(self) -> None:
         pass

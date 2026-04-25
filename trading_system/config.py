@@ -105,6 +105,29 @@ try:
     MIN_TRADE_NOTIONAL = float(os.getenv("MIN_TRADE_NOTIONAL", "100").strip() or "100")
 except (ValueError, TypeError):
     MIN_TRADE_NOTIONAL = 100.0
+# Rebalance band: only rebalance when |target - current| > max(MIN_TRADE_NOTIONAL, portfolio_value * REBALANCE_BAND_PCT)
+try:
+    REBALANCE_BAND_PCT = float(os.getenv("REBALANCE_BAND_PCT", "0.03").strip() or "0.03")
+except (ValueError, TypeError):
+    REBALANCE_BAND_PCT = 0.03
+# Execution cooldowns (minutes): min hold after buy before allowing sell; min wait after sell before allowing re-buy
+try:
+    MIN_HOLD_MINUTES_AFTER_BUY = int(os.getenv("MIN_HOLD_MINUTES_AFTER_BUY", "60").strip() or "60")
+except (ValueError, TypeError):
+    MIN_HOLD_MINUTES_AFTER_BUY = 60
+try:
+    MIN_REENTRY_MINUTES_AFTER_SELL = int(os.getenv("MIN_REENTRY_MINUTES_AFTER_SELL", "60").strip() or "60")
+except (ValueError, TypeError):
+    MIN_REENTRY_MINUTES_AFTER_SELL = 60
+# Transaction cost and slippage (basis points) for backtest and training reward
+try:
+    TRANSACTION_COST_BPS = float(os.getenv("TRANSACTION_COST_BPS", "10").strip() or "10")
+except (ValueError, TypeError):
+    TRANSACTION_COST_BPS = 10.0
+try:
+    SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "5").strip() or "5")
+except (ValueError, TypeError):
+    SLIPPAGE_BPS = 5.0
 
 # Trade tickers (5 assets; override via TRADE_TICKERS=SPY,IWM,... in .env)
 # Default: ETFs chosen for active-trading fit (volatility, dispersion) vs strong-trend names.
@@ -161,19 +184,33 @@ PPO_NET_ARCH: dict | list = None  # None = default; or {"pi": [64, 64], "vf": [6
 PPO_TOTAL_TIMESTEPS = int(os.getenv("PPO_TOTAL_TIMESTEPS", "500000"))  # Try 1000000+ with --use-historical --use-tuned
 # Save checkpoint every N timesteps during training (0 = disable)
 PPO_CHECKPOINT_FREQ = int(os.getenv("PPO_CHECKPOINT_FREQ", "100000"))
+# Early stopping: stop if eval reward has no improvement for this many consecutive evaluations (0 = disabled)
+PPO_EARLY_STOPPING_PATIENCE = int(os.getenv("PPO_EARLY_STOPPING_PATIENCE", "5"))
+# Eval every N timesteps for early stopping; 0 = no early stopping
+PPO_EARLY_STOPPING_EVAL_FREQ = int(os.getenv("PPO_EARLY_STOPPING_EVAL_FREQ", "50000"))
+# Minimum improvement in eval reward to count as improvement
+PPO_EARLY_STOPPING_MIN_DELTA = float(os.getenv("PPO_EARLY_STOPPING_MIN_DELTA", "0.01"))
+# L2 regularization: Adam weight_decay (0 = disabled). Reduces overfitting.
+PPO_WEIGHT_DECAY = float(os.getenv("PPO_WEIGHT_DECAY", "0"))
 # CPU threads for PPO when device=cpu; 0 = use all available
 PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 # Parallel envs for SubprocVecEnv; 1 = single env (no subprocess). With n_envs>1, total rollout = n_steps * n_envs
 PPO_N_ENVS = int(os.getenv("PPO_N_ENVS", "4"))
 
 # PPO training: fraction of episodes on historical vs synthetic data (0.0 = synthetic only, 1.0 = historical only)
-TRAIN_HISTORICAL_RATIO = float(os.getenv("TRAIN_HISTORICAL_RATIO", "0.0"))
+# Default 1.0 so training learns from market data, not self-fulfilling synthetic simulator
+TRAIN_HISTORICAL_RATIO = float(os.getenv("TRAIN_HISTORICAL_RATIO", "1.0"))
 # When set in .env, use this ratio for both training and tuning; tuner will not search for historical_ratio
 TRAIN_HISTORICAL_RATIO_OVERRIDE = "TRAIN_HISTORICAL_RATIO" in os.environ
 
+# Walk-forward: hold out last TEST_WINDOW_DAYS for out-of-sample evaluation; tune/train on the rest
+TEST_WINDOW_DAYS = int(os.getenv("TEST_WINDOW_DAYS", "252"))  # 1 year default
+TRAIN_WINDOW_YEARS = int(os.getenv("TRAIN_WINDOW_YEARS", "5"))  # years of history to load
+
 # Environment
-ENV_ROLLING_SHARPE_DAYS = 252
-ENV_EPISODE_DAYS = int(os.getenv("ENV_EPISODE_DAYS", "42"))  # ~2 months; was 21
+# Reward: use rolling Sharpe only when we have enough steps; keep window <= episode length so reward is reachable
+ENV_EPISODE_DAYS = int(os.getenv("ENV_EPISODE_DAYS", "42"))  # ~2 months
+ENV_ROLLING_SHARPE_DAYS = min(252, max(5, ENV_EPISODE_DAYS - 5))  # reachable within episode
 ENV_REWARD_DRAWDOWN_PENALTY = float(os.getenv("ENV_REWARD_DRAWDOWN_PENALTY", "0.7"))  # 0.3-1.0; stronger = more defensive
 ENV_OBS_ROLLING_FEATURES = True  # Add rolling return 5d/21d and vol 21d per asset
 ENV_ALLOW_CASH_EXPOSURE = os.getenv("ENV_ALLOW_CASH_EXPOSURE", "true").lower() in ("1", "true", "yes")  # When True, sum(action) = total exposure (capped at 1); rest in cash

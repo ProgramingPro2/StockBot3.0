@@ -17,7 +17,7 @@ from optuna.samplers import TPESampler
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecMonitor
 
 from ..config import (
     META_LEARNER_MODEL_DIR,
@@ -129,12 +129,23 @@ def run_tuning(
     Uses same env design as training: proxy-from-returns specialists, optional SubprocVecEnv.
     Returns best params dict.
     """
-    eval_freq = max(n_timesteps // n_evaluations, 1)
     n_envs = n_envs if n_envs is not None else PPO_N_ENVS
+    # EvalCallback uses n_calls (callback invocations); PPO calls once per rollout step = 1 call per n_envs timesteps
+    eval_freq = max((n_timesteps // n_evaluations) // n_envs, 1)
     params_path = params_path or PPO_TUNE_PARAMS_PATH
     returns_array = np.asarray(returns_array, dtype=np.float32)
 
-    proxy_specialist_fn = create_proxy_specialist_fn(returns_array, n_assets)
+    # Use a validation slice for eval so tuning does not overfit to the same data as training
+    n = len(returns_array)
+    val_size = max(21, min(252, n // 5))
+    if n > val_size + 252:
+        train_returns = returns_array[: n - val_size]
+        val_returns = returns_array[n - val_size :]
+    else:
+        train_returns = returns_array
+        val_returns = returns_array
+
+    proxy_specialist_fn = create_proxy_specialist_fn(train_returns, n_assets)
 
     def _save_best_cb(study: optuna.Study, trial: optuna.Trial) -> None:
         _save_best_params(study, trial, params_path)
@@ -153,7 +164,7 @@ def run_tuning(
         if n_envs <= 1:
             env = _make_env_fn(
                 mode=mode,
-                historical_returns=returns_array,
+                historical_returns=train_returns,
                 n_assets=n_assets,
                 historical_ratio=historical_ratio,
                 specialist_fn=proxy_specialist_fn,
@@ -164,7 +175,7 @@ def run_tuning(
                 partial(
                     _make_env_fn,
                     mode=mode,
-                    historical_returns=returns_array,
+                    historical_returns=train_returns,
                     n_assets=n_assets,
                     historical_ratio=historical_ratio,
                     specialist_fn=proxy_specialist_fn,
@@ -174,9 +185,12 @@ def run_tuning(
             ]
             env = SubprocVecEnv(env_fns)
 
-        env = Monitor(env)
-        eval_env = HistoricalTradingEnv(returns_array=returns_array, n_assets=n_assets)
-        eval_env = Monitor(eval_env)
+        env = VecMonitor(env) if isinstance(env, VecEnv) else Monitor(env)
+        eval_inner = HistoricalTradingEnv(returns_array=val_returns, n_assets=n_assets)
+        if isinstance(env, VecMonitor):
+            eval_env = VecMonitor(DummyVecEnv([lambda: eval_inner]))
+        else:
+            eval_env = Monitor(eval_inner)
 
         model = PPO(
             "MlpPolicy",
@@ -205,13 +219,11 @@ def run_tuning(
 
         try:
             model.learn(total_timesteps=n_timesteps, callback=eval_callback, progress_bar=False)
-        except AssertionError:
+        except (AssertionError, ValueError):
+            return float("nan")
+        finally:
             env.close()
             eval_env.close()
-            return float("nan")
-
-        env.close()
-        eval_env.close()
 
         if eval_callback.is_pruned:
             raise optuna.TrialPruned()

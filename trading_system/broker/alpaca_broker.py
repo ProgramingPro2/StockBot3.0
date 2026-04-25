@@ -119,6 +119,82 @@ class AlpacaBroker:
             logger.error("Failed to get orders for bought-on-date check: %s", e)
             return set()
 
+    def get_symbols_bought_since(
+        self,
+        since: datetime,
+        symbols: list[str],
+        tz: ZoneInfo | None = None,
+    ) -> set[str]:
+        """
+        Return symbols that have at least one filled BUY order with filled_at >= since (in tz).
+        Used for min-hold cooldown: do not sell these symbols until hold period has passed.
+        """
+        if not self.client or not symbols:
+            return set()
+        tz = tz or ZoneInfo("America/New_York")
+        try:
+            req = GetOrdersRequest(
+                status="closed",
+                after=since,
+                symbols=symbols,
+                side=OrderSide.BUY,
+                limit=500,
+            )
+            orders = self.client.get_orders(req)
+            result: set[str] = set()
+            since_aware = since if since.tzinfo else since.replace(tzinfo=tz)
+            since_ts = since_aware.timestamp()
+            for order in orders:
+                if order.filled_at is None or order.symbol is None:
+                    continue
+                if order.side != OrderSide.BUY:
+                    continue
+                fill_ts = order.filled_at.astimezone(tz).timestamp()
+                if fill_ts >= since_ts:
+                    result.add(order.symbol)
+            return result
+        except Exception as e:
+            logger.error("Failed to get orders for bought-since check: %s", e)
+            return set()
+
+    def get_symbols_sold_since(
+        self,
+        since: datetime,
+        symbols: list[str],
+        tz: ZoneInfo | None = None,
+    ) -> set[str]:
+        """
+        Return symbols that have at least one filled SELL order with filled_at >= since (in tz).
+        Used for re-entry cooldown: do not buy these symbols until cooldown has passed.
+        """
+        if not self.client or not symbols:
+            return set()
+        tz = tz or ZoneInfo("America/New_York")
+        try:
+            req = GetOrdersRequest(
+                status="closed",
+                after=since,
+                symbols=symbols,
+                side=OrderSide.SELL,
+                limit=500,
+            )
+            orders = self.client.get_orders(req)
+            result: set[str] = set()
+            since_aware = since if since.tzinfo else since.replace(tzinfo=tz)
+            since_ts = since_aware.timestamp()
+            for order in orders:
+                if order.filled_at is None or order.symbol is None:
+                    continue
+                if order.side != OrderSide.SELL:
+                    continue
+                fill_ts = order.filled_at.astimezone(tz).timestamp()
+                if fill_ts >= since_ts:
+                    result.add(order.symbol)
+            return result
+        except Exception as e:
+            logger.error("Failed to get orders for sold-since check: %s", e)
+            return set()
+
     def get_position(self, ticker: str) -> dict:
         """Get current position for ticker."""
         if not self.client:

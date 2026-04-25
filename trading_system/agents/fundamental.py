@@ -101,7 +101,11 @@ def _extract_features(ticker: str) -> dict[str, float]:
 
 
 def _build_training_data(tickers: list[str]) -> tuple[pd.DataFrame, np.ndarray]:
-    """Build labeled dataset for training (heuristic: future return percentile)."""
+    """
+    Build labeled dataset for training. Labels are point-in-time only: cross-sectional
+    P/E percentile (Overvalued=high P/E, Fair=mid, Undervalued=low P/E). No future
+    return or other lookahead is used.
+    """
     rows = []
     for ticker in tickers:
         feat = _extract_features(ticker)
@@ -115,9 +119,7 @@ def _build_training_data(tickers: list[str]) -> tuple[pd.DataFrame, np.ndarray]:
     df = pd.DataFrame(rows).set_index("ticker")
     df = df.select_dtypes(include=[np.number])
 
-    # Heuristic label: use P/E percentile vs future return
-    # For training, we use trailing 1y return as proxy for "value"
-    # Overvalued = high P/E, Fair = mid, Undervalued = low P/E
+    # Point-in-time label: P/E tercile (Overvalued=high P/E, Fair=mid, Undervalued=low P/E)
     if "trailingPE" in df.columns:
         pe = df["trailingPE"].dropna()
         q33 = pe.quantile(0.33)

@@ -25,7 +25,7 @@ from ..config import (
     YFINANCE_LOOKBACK_YEARS,
 )
 from ..data.loader import load_ohlcv
-from ..data.processor import prepare_tft_data
+from ..data.processor import prepare_tft_data, prepare_tft_data_inference
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -149,6 +149,7 @@ def _ensure_model(
 def get_trend_probability(ticker: str, retrain: bool = False) -> float:
     """
     Get probability that trend continues over next 30 days for ticker.
+    Uses inference-only preparation (no target drop) so the current bar is scored.
     Returns float in [0, 1].
     """
     if not _ensure_model(ticker, retrain=retrain):
@@ -159,7 +160,7 @@ def get_trend_probability(ticker: str, retrain: bool = False) -> float:
     if df.empty or len(df) < TFT_MAX_ENCODER_LENGTH + TFT_MAX_PREDICTION_LENGTH:
         return 0.5
 
-    prepared = prepare_tft_data(df, ticker=t)
+    prepared = prepare_tft_data_inference(df, ticker=t)
     if prepared.empty:
         return 0.5
 
@@ -175,5 +176,6 @@ def get_trend_probability(ticker: str, retrain: bool = False) -> float:
     _model.eval()
     with torch.no_grad():
         preds = _model.predict(dl)
-    forecast = float(preds[0]) if preds.numel() >= 1 else 0.0
+    # Last prediction corresponds to the most recent encoder window (current bar)
+    forecast = float(preds[-1]) if preds.numel() >= 1 else 0.0
     return _forecast_to_probability(forecast)

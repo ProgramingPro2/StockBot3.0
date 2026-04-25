@@ -39,12 +39,17 @@ from .config import (
     FRACTIONAL,
     LIVE_PPO_MODEL_PATH,
     META_LEARNER_MODEL_DIR,
+    MIN_HOLD_MINUTES_AFTER_BUY,
+    MIN_REENTRY_MINUTES_AFTER_SELL,
     MIN_TRADE_NOTIONAL,
     OLLAMA_INTERVAL_MIN,
     OUTPUT_DIR,
+    REBALANCE_BAND_PCT,
+    SLIPPAGE_BPS,
     STARTING_CAPITAL,
     TRAIN_HISTORICAL_RATIO,
     TRAIN_HISTORICAL_RATIO_OVERRIDE,
+    TRANSACTION_COST_BPS,
     TRADE_LIST_SIZE,
     TRADE_TICKERS,
 )
@@ -248,13 +253,24 @@ def _resolve_backtest_model_path(path_str: str) -> Path | None:
     return p if p.exists() else None
 
 
-def _load_aligned_returns(tickers: list[str], lookback_years: int = 3):
-    """Load and align OHLCV returns for tickers. Returns (aligned_df, returns_array)."""
+def _load_aligned_returns(
+    tickers: list[str],
+    lookback_years: int | None = None,
+    max_days: int | None = None,
+):
+    """
+    Load and align OHLCV returns for tickers.
+    Returns (aligned_df, returns_array).
+    lookback_years: years of history to load (default from config TRAIN_WINDOW_YEARS).
+    max_days: if set, keep only the last max_days rows (explicit override only; default uses full loaded window).
+    """
+    from .config import TRAIN_WINDOW_YEARS
     from .data.loader import load_ohlcv
 
+    years = lookback_years if lookback_years is not None else TRAIN_WINDOW_YEARS
     dfs: list[pd.DataFrame] = []
     for t in tickers:
-        df = load_ohlcv(t, lookback_years=lookback_years)
+        df = load_ohlcv(t, lookback_years=years)
         if df.empty or len(df) < 252:
             return None, None
         df = df[["close"]].copy()
@@ -265,13 +281,38 @@ def _load_aligned_returns(tickers: list[str], lookback_years: int = 3):
     aligned = dfs[0]
     for df in dfs[1:]:
         aligned = aligned.join(df, how="inner")
-    aligned = aligned.dropna(how="all").tail(252 * 2)
+    aligned = aligned.dropna(how="all")
+    if max_days is not None:
+        aligned = aligned.tail(max_days)
     if len(aligned) < 252:
         return None, None
 
     return_cols = ["return_" + t for t in tickers]
     returns_array = aligned[return_cols].fillna(0).values.astype(np.float32)
     return aligned, returns_array
+
+
+def _chronological_train_test_split(
+    aligned: pd.DataFrame,
+    returns_array: np.ndarray,
+    test_days: int | None = None,
+):
+    """
+    Split aligned returns into train and test by time (no shuffle).
+    Returns (train_returns, test_returns, aligned_train, aligned_test) or (None, None, None, None) if too short.
+    """
+    from .config import TEST_WINDOW_DAYS
+
+    n = len(returns_array)
+    test_len = test_days if test_days is not None else TEST_WINDOW_DAYS
+    if n < test_len + 252:
+        return None, None, None, None
+    train_len = n - test_len
+    train_returns = returns_array[:train_len]
+    test_returns = returns_array[train_len:]
+    aligned_train = aligned.iloc[:train_len]
+    aligned_test = aligned.iloc[train_len:]
+    return train_returns, test_returns, aligned_train, aligned_test
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -313,9 +354,38 @@ def cmd_train(args: argparse.Namespace) -> None:
             logger.info("Using historical_ratio from tuned params: %.2f", historical_ratio)
 
     historical_returns = None
+    validation_returns = None
+    aligned_full = None
+    aligned_test = None
     if historical_ratio > 0:
-        _, returns_array = _load_aligned_returns(tickers)
-        if returns_array is not None:
+        aligned_full, returns_array = _load_aligned_returns(tickers)
+        if returns_array is not None and aligned_full is not None:
+            train_returns, _test_returns, _aligned_train, aligned_test = _chronological_train_test_split(
+                aligned_full, returns_array
+            )
+            if train_returns is not None:
+                n_train = len(train_returns)
+                val_days = max(21, min(252, n_train // 5))  # validation slice: 20% or up to 252 days, min 21
+                if n_train > val_days + 252:  # enough for train + validation
+                    historical_returns = train_returns[: n_train - val_days]
+                    validation_returns = train_returns[n_train - val_days :]
+                    logger.info(
+                        "Using chronological split: training on %d days; validation %d days (early stopping); test window held out",
+                        len(historical_returns),
+                        len(validation_returns),
+                    )
+                else:
+                    historical_returns = train_returns
+                    logger.info(
+                        "Using chronological split: training on %d days; test window (%d days) held out for evaluation",
+                        len(train_returns),
+                        len(returns_array) - len(train_returns),
+                    )
+                logger.info("Test window: %d days held out for final backtest", len(returns_array) - len(train_returns))
+            else:
+                historical_returns = returns_array
+                logger.info("Using historical returns for PPO training (%d days)", len(returns_array))
+        elif returns_array is not None:
             historical_returns = returns_array
             logger.info("Using historical returns for PPO training (%d days)", len(returns_array))
         else:
@@ -323,7 +393,9 @@ def cmd_train(args: argparse.Namespace) -> None:
             historical_ratio = 0.0
 
     logger.info("Training meta-learner (PPO)...")
-    trader = PPOTrader(n_assets=n_assets, load=not args.retrain)
+    # When using tuned params, force fresh model so hyperparameters are applied
+    load_model = not args.retrain and not getattr(args, "use_tuned", False)
+    trader = PPOTrader(n_assets=n_assets, load=load_model)
 
     from .meta_learner.env_helpers import create_proxy_specialist_fn
 
@@ -354,6 +426,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         specialist_fn=specialist_fn_for_train,
         historical_returns=historical_returns,
         historical_ratio=historical_ratio,
+        validation_returns=validation_returns,
         ppo_kwargs=ppo_kwargs,
         n_envs=getattr(args, "n_envs", None),
     )
@@ -365,7 +438,11 @@ def cmd_train(args: argparse.Namespace) -> None:
         from .broker.discord_notifier import send_training_complete_embed
         from .utils.plotting import save_performance_plot
 
-        result = _run_backtest(tickers, trader)
+        # Report out-of-sample when test window was held out; otherwise full backtest
+        backtest_aligned = aligned_test if aligned_test is not None else None
+        if backtest_aligned is not None:
+            logger.info("Running training-complete backtest on held-out test window (out-of-sample)")
+        result = _run_backtest(tickers, trader, aligned_df=backtest_aligned)
         if result is not None:
             equity, returns, bh_returns, equity_dollars, rebalance_dates, rebalance_direction, rebalance_trades = result
             stats = _compute_backtest_stats(equity, returns, bh_returns, STARTING_CAPITAL)
@@ -549,7 +626,7 @@ def _proxy_specialists_from_returns(
     fund_score_proxy = max(-0.5, min(0.5, -mean_ret * 15))
     momentum_proxy = max(-1, min(1, mean_ret * 15))
     mean_reversion_proxy = max(-0.5, min(0.5, -mean_ret * 20))
-    volatility_proxy = max(0.0, min(1.0, (vol_norm + 0.5)))
+    volatility_proxy = max(0.0, min(1.0, (vol_norm + 1.0) / 2.0))  # match env.py _proxy_specialists_vectorized
     event_risk_proxy = 0.0
 
     out = {
@@ -579,30 +656,38 @@ def _proxy_specialists_from_returns(
 def _run_backtest(
     tickers: list[str],
     trader: PPOTrader,
+    aligned_df: pd.DataFrame | None = None,
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, list, list, list[list[tuple[str, float]]]] | None:
     """
-    Load aligned data, run backtest day-by-day with live-style threshold.
-    Only rebalance an asset when dollar gap (target vs current) exceeds MIN_TRADE_NOTIONAL.
+    Run backtest day-by-day with live-style threshold.
+    When aligned_df is provided (e.g. test window), use it for out-of-sample evaluation.
+    Otherwise load and align OHLCV internally.
     Return (equity, strategy_returns, bh_returns, equity_dollars, rebalance_dates,
     rebalance_direction, rebalance_trades) or None if insufficient data.
     """
-    from .data.loader import load_ohlcv
-
-    dfs: list[pd.DataFrame] = []
-    for t in tickers:
-        df = load_ohlcv(t, lookback_years=3)
-        if df.empty or len(df) < 252:
+    if aligned_df is not None:
+        aligned = aligned_df
+        if len(aligned) < 252:
             return None
-        df = df[["close"]].copy()
-        df.columns = [t]
-        df["return_" + t] = df[t].pct_change()
-        dfs.append(df)
-    aligned = dfs[0]
-    for df in dfs[1:]:
-        aligned = aligned.join(df, how="inner")
-    aligned = aligned.dropna(how="all").tail(252 * 2)
-    if len(aligned) < 252:
-        return None
+    else:
+        from .config import TRAIN_WINDOW_YEARS
+        from .data.loader import load_ohlcv
+
+        dfs: list[pd.DataFrame] = []
+        for t in tickers:
+            df = load_ohlcv(t, lookback_years=TRAIN_WINDOW_YEARS)
+            if df.empty or len(df) < 252:
+                return None
+            df = df[["close"]].copy()
+            df.columns = [t]
+            df["return_" + t] = df[t].pct_change()
+            dfs.append(df)
+        aligned = dfs[0]
+        for df in dfs[1:]:
+            aligned = aligned.join(df, how="inner")
+        aligned = aligned.dropna(how="all")
+        if len(aligned) < 252:
+            return None
 
     n_assets = len(tickers)
     return_cols = ["return_" + t for t in tickers]
@@ -615,45 +700,66 @@ def _run_backtest(
     rebalance_trades: list[list[tuple[str, float]]] = []
     effective_weights: np.ndarray | None = None
     prev_position_sum: float | None = None
-    last_buy_bar: np.ndarray = np.full(n_assets, -1, dtype=np.int64)
+    last_buy_bar: np.ndarray = np.full(n_assets, -999, dtype=np.int64)
+    last_sell_bar: np.ndarray = np.full(n_assets, -999, dtype=np.int64)
+    min_hold_bars = 1
+    min_reentry_bars = 1
+    cost_bps = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
+    turnover_pct = 0.0
 
     for t in range(window, n):
         specialist_list = [
             _proxy_specialists_from_returns(aligned[ret_col], t, window)
             for ret_col in return_cols
         ]
-        action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
+        # Pass current portfolio weights so PPO sees same observation structure as in training
+        current_holdings = (
+            effective_weights.copy()
+            if effective_weights is not None
+            else np.zeros(n_assets, dtype=np.float64)
+        )
+        action = trader.predict(
+            specialist_outputs_by_asset=specialist_list,
+            holdings=current_holdings,
+            debug=is_debug(),
+        )
         action = np.array(action, dtype=np.float64)
         if not ENV_ALLOW_CASH_EXPOSURE:
             action = np.array([_position_used(float(a)) for a in action])
         exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
+        target_holdings = exposure * weights  # actual fractional holdings (sum = exposure), matches PPO env semantics
         portfolio_value = equity_arr[t - 1] * STARTING_CAPITAL
+        rebalance_band = max(MIN_TRADE_NOTIONAL, portfolio_value * REBALANCE_BAND_PCT)
+        traded = False
 
         if effective_weights is None:
-            effective_weights = np.array(weights, dtype=np.float64)
+            effective_weights = np.array(target_holdings, dtype=np.float64)
             for i in range(n_assets):
-                if weights[i] > 1e-6:
+                if target_holdings[i] > 1e-6:
                     last_buy_bar[i] = t
             prev_position_sum = float(np.sum(effective_weights))
             rebalance_dates.append(aligned.index[t])
-            rebalance_trades.append([(tickers[i], float(weights[i] * 100)) for i in range(n_assets) if weights[i] > 1e-6])
+            rebalance_trades.append([(tickers[i], float(target_holdings[i] * 100)) for i in range(n_assets) if target_holdings[i] > 1e-6])
             rebalance_direction.append(1 if exposure > 0 else 0)
+            turnover_pct = float(np.sum(np.abs(effective_weights)))
+            traded = True
         else:
             new_effective = effective_weights.copy()
             for i in range(n_assets):
                 current_value_i = portfolio_value * effective_weights[i]
-                target_value_i = portfolio_value * weights[i]
-                is_increase = target_value_i > current_value_i + MIN_TRADE_NOTIONAL
-                is_decrease = current_value_i > target_value_i + MIN_TRADE_NOTIONAL
+                target_value_i = portfolio_value * target_holdings[i]
+                is_increase = target_value_i > current_value_i + rebalance_band
+                is_decrease = current_value_i > target_value_i + rebalance_band
                 if is_increase:
-                    new_effective[i] = weights[i]
-                    last_buy_bar[i] = t
-                elif is_decrease and last_buy_bar[i] != t:
-                    new_effective[i] = weights[i]
-            weight_sum = float(np.sum(new_effective)) + 1e-8
-            exposure_sum = float(np.sum(weights)) + 1e-8
-            new_effective = new_effective / weight_sum * exposure_sum
+                    if last_sell_bar[i] < 0 or (t - last_sell_bar[i]) >= min_reentry_bars:
+                        new_effective[i] = target_holdings[i]
+                        last_buy_bar[i] = t
+                elif is_decrease:
+                    if last_buy_bar[i] < 0 or (t - last_buy_bar[i]) >= min_hold_bars:
+                        new_effective[i] = target_holdings[i]
+                        last_sell_bar[i] = t
             traded = np.any(np.abs(new_effective - effective_weights) > 1e-6)
+            turnover_pct = float(np.sum(np.abs(new_effective - effective_weights)))
             if traded:
                 rebalance_dates.append(aligned.index[t])
                 deltas = [(tickers[i], float((new_effective[i] - effective_weights[i]) * 100)) for i in range(n_assets) if abs(new_effective[i] - effective_weights[i]) > 1e-6]
@@ -663,10 +769,12 @@ def _run_backtest(
                 prev_position_sum = position_sum
             effective_weights = new_effective
 
-        eff_sum = float(np.sum(effective_weights)) + 1e-8
-        basket_ret = sum(effective_weights[i] * aligned[return_cols[i]].iloc[t] for i in range(n_assets)) / eff_sum
+        # Portfolio return = dot(holdings, returns); holdings sum to exposure (rest is cash at 0 return)
+        basket_ret = sum(effective_weights[i] * aligned[return_cols[i]].iloc[t] for i in range(n_assets))
         strategy_returns.iloc[t] = basket_ret
         equity_arr[t] = equity_arr[t - 1] * (1.0 + basket_ret)
+        if traded:
+            equity_arr[t] *= max(0.0, 1.0 - cost_bps * turnover_pct)
 
     strategy_returns = strategy_returns.fillna(0)
     equity = pd.Series(equity_arr, index=aligned.index)
@@ -759,10 +867,22 @@ def cmd_tune(args: argparse.Namespace) -> None:
     elif historical_ratio_arg is not None:
         fixed_historical_ratio = max(0.0, min(1.0, historical_ratio_arg))
 
-    _, returns_array = _load_aligned_returns(tickers)
-    if returns_array is None:
+    aligned, returns_array = _load_aligned_returns(tickers)
+    if returns_array is None or aligned is None:
         logger.error("Could not load historical data for tuning")
         return
+
+    # Walk-forward: tune on train window only; test window held out for final evaluation
+    train_returns, _test_returns, _aligned_train, _aligned_test = _chronological_train_test_split(
+        aligned, returns_array
+    )
+    tuning_returns = train_returns if train_returns is not None else returns_array
+    if train_returns is not None:
+        logger.info(
+            "Using chronological split: tuning on %d days, test window held out (%d days)",
+            len(tuning_returns),
+            len(returns_array) - len(tuning_returns),
+        )
 
     logger.info(
         "Running hyperparameter tuning for %d tickers (%d trials, %d timesteps/trial, study=%s, n_envs=%s)...",
@@ -773,7 +893,7 @@ def cmd_tune(args: argparse.Namespace) -> None:
         n_envs if n_envs is not None else PPO_N_ENVS,
     )
     best = run_tuning(
-        returns_array=returns_array,
+        returns_array=tuning_returns,
         n_assets=n_assets,
         n_trials=n_trials,
         n_timesteps=timesteps,
@@ -923,6 +1043,9 @@ def cmd_paper(args: argparse.Namespace) -> None:
 
     last_ollama_time = 0.0
     cached_boardroom_summary: str | None = None
+    # Stateful paper portfolio: cash and position value per ticker (aligned with live semantics)
+    paper_cash = float(STARTING_CAPITAL)
+    paper_positions: dict[str, float] = {t: 0.0 for t in tickers}
 
     while True:
         try:
@@ -933,11 +1056,27 @@ def cmd_paper(args: argparse.Namespace) -> None:
                 specialist_list.append(_run_specialists(t, force_refresh_sentiment=do_ollama))
             if is_debug():
                 _verify_specialist_outputs(specialist_list, tickers)
-            action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
+
+            paper_equity = paper_cash + sum(paper_positions.get(t, 0.0) for t in tickers)
+            if paper_equity < 1e-6:
+                paper_equity = float(STARTING_CAPITAL)
+                paper_cash = paper_equity
+                paper_positions = {t: 0.0 for t in tickers}
+            current_holdings = np.array(
+                [paper_positions.get(t, 0.0) / (paper_equity + 1e-12) for t in tickers],
+                dtype=np.float64,
+            )
+            action = trader.predict(
+                specialist_outputs_by_asset=specialist_list,
+                holdings=current_holdings,
+                debug=is_debug(),
+            )
             action = np.array(action, dtype=np.float64)
             if not ENV_ALLOW_CASH_EXPOSURE:
                 action = np.array([_position_used(float(a)) for a in action])
             exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
+            target_holdings = exposure * weights  # match PPO env: actual fractional holdings (sum = exposure)
+            rebalance_band = max(MIN_TRADE_NOTIONAL, paper_equity * REBALANCE_BAND_PCT)
 
             if BOARDROOM_SUMMARY_ENABLED:
                 if do_ollama:
@@ -957,22 +1096,49 @@ def cmd_paper(args: argparse.Namespace) -> None:
                     logger.info("Boardroom (cached): %s", cached_boardroom_summary)
 
             for i, t in enumerate(tickers):
-                position_pct = float(weights[i])
+                position_pct = float(target_holdings[i])
                 out = specialist_list[i]
-                logger.info(
-                    "Paper | %s | Sentiment=%.2f Quant=%.2f Fund=%.2f Regime=%s | Exposure=%.1f%% Weight=%.1f%% (capital=$%.2f)",
-                    t,
-                    out["sentiment"],
-                    out["quant_prob"],
-                    out["fund_score"],
-                    out["regime_name"],
-                    exposure * 100,
-                    position_pct * 100,
-                    STARTING_CAPITAL,
-                )
-                send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
+                target_value = paper_equity * target_holdings[i]
+                current_value = paper_positions.get(t, 0.0)
+                if target_value > current_value + rebalance_band:
+                    notional = target_value - current_value
+                    if paper_cash >= notional:
+                        paper_cash -= notional
+                        paper_positions[t] = paper_positions.get(t, 0.0) + notional
+                        logger.info(
+                            "Paper BUY %s | $%.2f | Sentiment=%.2f Quant=%.2f | equity=$%.2f",
+                            t, notional, out["sentiment"], out["quant_prob"], paper_equity,
+                        )
+                        send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
+                    else:
+                        logger.info(
+                            "Paper | %s HOLD (insufficient cash for BUY $%.2f) | Weight=%.1f%%",
+                            t, notional, position_pct * 100,
+                        )
+                elif current_value > target_value + rebalance_band:
+                    notional = min(current_value - target_value, current_value)
+                    paper_cash += notional
+                    paper_positions[t] = paper_positions.get(t, 0.0) - notional
+                    logger.info(
+                        "Paper SELL %s | $%.2f | Sentiment=%.2f Quant=%.2f | equity=$%.2f",
+                        t, notional, out["sentiment"], out["quant_prob"], paper_equity,
+                    )
+                    send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
+                else:
+                    logger.info(
+                        "Paper HOLD %s | Sentiment=%.2f Quant=%.2f Fund=%.2f Regime=%s | Exposure=%.1f%% Weight=%.1f%% (equity=$%.2f)",
+                        t,
+                        out["sentiment"],
+                        out["quant_prob"],
+                        out["fund_score"],
+                        out["regime_name"],
+                        exposure * 100,
+                        position_pct * 100,
+                        paper_equity,
+                    )
+                    send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
 
-            logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
+            logger.info("Cycle completed (type=%s) paper_equity=$%.2f", "ollama_refresh" if do_ollama else "cache_only", paper_cash + sum(paper_positions.get(t, 0.0) for t in tickers))
             time.sleep(interval_sec)
         except KeyboardInterrupt:
             logger.info("Paper trading stopped")
@@ -1065,15 +1231,28 @@ def cmd_live(args: argparse.Namespace) -> None:
                 specialist_list.append(_run_specialists(t, force_refresh_sentiment=do_ollama))
             if is_debug():
                 _verify_specialist_outputs(specialist_list, tickers)
-            action = trader.predict(specialist_outputs_by_asset=specialist_list, debug=is_debug())
+
+            # Size targets from total portfolio value, not cash; pass current holdings into PPO
+            portfolio_value = float(account.get("portfolio_value", 0))
+            pos_by_symbol = {p["symbol"]: float(p.get("market_value", 0)) for p in alpaca_positions}
+            current_holdings = np.array(
+                [pos_by_symbol.get(t, 0.0) / (portfolio_value + 1e-12) for t in tickers],
+                dtype=np.float64,
+            )
+            action = trader.predict(
+                specialist_outputs_by_asset=specialist_list,
+                holdings=current_holdings,
+                debug=is_debug(),
+            )
             action = np.array(action, dtype=np.float64)
             if not ENV_ALLOW_CASH_EXPOSURE:
                 action = np.array([_position_used(float(a)) for a in action])
             exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
-            # No margin: only invest when cash is positive; long-only so never target short
+            target_holdings = exposure * weights  # match PPO env: actual fractional holdings (sum = exposure)
             if cash <= 0:
                 logger.warning("Account on margin (cash=%.2f); not placing buy orders", cash)
-            total_invested = max(0.0, cash * exposure) if cash > 0 else 0.0
+            # Target values are fractions of total portfolio (consistent with backtest)
+            rebalance_band = max(MIN_TRADE_NOTIONAL, portfolio_value * REBALANCE_BAND_PCT)
 
             if BOARDROOM_SUMMARY_ENABLED:
                 if do_ollama:
@@ -1107,6 +1286,15 @@ def cmd_live(args: argparse.Namespace) -> None:
                 time.sleep(interval_sec)
                 continue
 
+            # Cooldowns: do not sell if bought recently; do not buy if sold recently
+            from datetime import datetime, timedelta
+            tz = ZoneInfo("America/New_York")
+            now_dt = datetime.now(tz)
+            since_hold = now_dt - timedelta(minutes=MIN_HOLD_MINUTES_AFTER_BUY)
+            since_reentry = now_dt - timedelta(minutes=MIN_REENTRY_MINUTES_AFTER_SELL)
+            bought_since = broker.get_symbols_bought_since(since_hold, tickers, tz)
+            sold_since = broker.get_symbols_sold_since(since_reentry, tickers, tz)
+
             # Fully locked: all capital in positions bought today; no buys or sells possible
             if alpaca_positions and cash < MIN_TRADE_NOTIONAL and all(
                 pos.get("symbol", "") in bought_today for pos in alpaca_positions
@@ -1115,14 +1303,9 @@ def cmd_live(args: argparse.Namespace) -> None:
                     "All capital in positions bought today; no buys or sells possible. Sleeping until next trading day."
                 )
                 logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
-                from datetime import datetime, timedelta
-                from zoneinfo import ZoneInfo
-
-                tz = ZoneInfo("America/New_York")
-                now = datetime.now(tz)
-                next_midnight = now.date() + timedelta(days=1)
+                next_midnight = now_dt.date() + timedelta(days=1)
                 next_day = datetime(next_midnight.year, next_midnight.month, next_midnight.day, 0, 0, 1, tzinfo=tz)
-                sec_until = max(1, int((next_day - now).total_seconds()))
+                sec_until = max(1, int((next_day - now_dt).total_seconds()))
                 time.sleep(sec_until)
                 continue
 
@@ -1138,14 +1321,16 @@ def cmd_live(args: argparse.Namespace) -> None:
                         latest_prices[t] = 0.0
 
             for i, t in enumerate(tickers):
-                target_value = total_invested * weights[i]
+                target_value = portfolio_value * float(target_holdings[i])
                 current_pos = broker.get_position(t)
                 current_value = float(current_pos.get("market_value", 0))
                 outputs = specialist_list[i]
-                position_pct = float(weights[i])
+                position_pct = float(target_holdings[i])
 
-                if target_value > current_value + MIN_TRADE_NOTIONAL:
-                    if cash <= 0:
+                if target_value > current_value + rebalance_band:
+                    if t in sold_since:
+                        logger.info("HOLD %s: skip buy (re-entry cooldown)", t)
+                    elif cash <= 0:
                         logger.debug("HOLD %s: skip buy (no margin)", t)
                     else:
                         notional = target_value - current_value
@@ -1166,9 +1351,9 @@ def cmd_live(args: argparse.Namespace) -> None:
                                     send_discord_notification(t, "BUY", position_pct, outputs, order)
                             else:
                                 logger.warning("No price for %s; skipping buy", t)
-                elif current_value > target_value + MIN_TRADE_NOTIONAL:
-                    if t in bought_today:
-                        logger.info("HOLD %s: skip sell (bought today, avoid day trade)", t)
+                elif current_value > target_value + rebalance_band:
+                    if t in bought_today or t in bought_since:
+                        logger.info("HOLD %s: skip sell (bought today or within hold period)", t)
                     elif current_value <= 0:
                         logger.debug("HOLD %s: no long position to reduce (current_value=%.2f)", t, current_value)
                     else:

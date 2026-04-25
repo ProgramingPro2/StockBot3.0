@@ -16,7 +16,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from ..config import (
@@ -24,6 +24,10 @@ from ..config import (
     META_LEARNER_MODEL_DIR,
     PPO_CHECKPOINT_FREQ,
     PPO_CPU_THREADS,
+    PPO_EARLY_STOPPING_EVAL_FREQ,
+    PPO_EARLY_STOPPING_MIN_DELTA,
+    PPO_EARLY_STOPPING_PATIENCE,
+    PPO_WEIGHT_DECAY,
     PPO_BATCH_SIZE,
     PPO_CLIP_RANGE,
     PPO_ENT_COEF,
@@ -36,6 +40,74 @@ from ..config import (
     PPO_N_STEPS,
 )
 from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
+
+
+class EarlyStoppingCallback(BaseCallback):
+    """
+    Stop training when eval reward has not improved for `patience` consecutive evaluations.
+    Requires an EvalCallback to run first in the callback list so last_mean_reward is set.
+    Only counts no-improvement on steps where a new evaluation was just run (same cadence as eval_freq).
+    """
+
+    def __init__(
+        self,
+        eval_callback: EvalCallback,
+        patience: int = 5,
+        min_delta: float = 0.01,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose=verbose)
+        self.eval_callback = eval_callback
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_reward: float | None = None
+        self.no_improvement_count = 0
+        self._last_eval_n_calls = -1
+
+    def _on_step(self) -> bool:
+        # Only act when a new evaluation just ran (EvalCallback runs when n_calls % eval_freq == 0)
+        eval_freq = getattr(self.eval_callback, "eval_freq", 0)
+        if eval_freq <= 0 or self.eval_callback.n_calls % eval_freq != 0:
+            return True
+        if self.eval_callback.last_mean_reward is None:
+            return True
+        # Avoid counting the same eval twice
+        if self.eval_callback.n_calls == self._last_eval_n_calls:
+            return True
+        self._last_eval_n_calls = self.eval_callback.n_calls
+        current = self.eval_callback.last_mean_reward
+        if not np.isfinite(current):
+            if self.verbose > 0:
+                logging.getLogger("boardroom").warning(
+                    "EarlyStopping: skipping non-finite eval reward %.4f", current
+                )
+            return True
+        if self.best_reward is None:
+            self.best_reward = current
+            self.no_improvement_count = 0
+            if self.verbose > 0:
+                logging.getLogger("boardroom").info(
+                    "EarlyStopping: initial eval reward %.4f", current
+                )
+            return True
+        if current > self.best_reward + self.min_delta:
+            self.best_reward = current
+            self.no_improvement_count = 0
+            if self.verbose > 0:
+                logging.getLogger("boardroom").info(
+                    "EarlyStopping: new best eval reward %.4f", current
+                )
+            return True
+        self.no_improvement_count += 1
+        if self.no_improvement_count >= self.patience:
+            if self.verbose > 0:
+                logging.getLogger("boardroom").info(
+                    "EarlyStopping: no improvement for %d evals (best=%.4f), stopping",
+                    self.patience,
+                    self.best_reward,
+                )
+            return False
+        return True
 
 
 def _random_specialist_outputs(n_assets: int) -> list[dict]:
@@ -156,6 +228,7 @@ class PPOTrader:
         specialist_fn=None,
         historical_returns: np.ndarray | None = None,
         historical_ratio: float = 0.0,
+        validation_returns: np.ndarray | None = None,
         ppo_kwargs: dict[str, Any] | None = None,
         n_envs: int | None = None,
     ) -> Path | None:
@@ -166,6 +239,7 @@ class PPOTrader:
         historical_returns: if provided, shape (n_days, n_assets), used for HistoricalTradingEnv.
         historical_ratio: fraction of episodes on historical data (0.0 = synthetic only,
             1.0 = historical only, 0.5 = 50/50 mixed).
+        validation_returns: if provided, used for early-stopping eval (out-of-sample vs training).
         ppo_kwargs: optional overrides for PPO hyperparameters (e.g. from tuning).
         n_envs: parallel env count for SubprocVecEnv; None = use PPO_N_ENVS.
         """
@@ -239,6 +313,10 @@ class PPOTrader:
             policy_kwargs = kwargs.pop("policy_kwargs", None) or PPO_NET_ARCH
             if policy_kwargs is None:
                 policy_kwargs = {}
+            if isinstance(policy_kwargs, dict) and PPO_WEIGHT_DECAY > 0:
+                policy_kwargs = dict(policy_kwargs)
+                policy_kwargs.setdefault("optimizer_kwargs", {})
+                policy_kwargs["optimizer_kwargs"]["weight_decay"] = PPO_WEIGHT_DECAY
             self.model = PPO(
                 "MlpPolicy",
                 env,
@@ -266,16 +344,53 @@ class PPOTrader:
 
         checkpoint_dir = META_LEARNER_MODEL_DIR / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_callback = CheckpointCallback(
-            save_freq=PPO_CHECKPOINT_FREQ,
-            save_path=str(checkpoint_dir),
-            name_prefix="ppo_trader",
-        ) if PPO_CHECKPOINT_FREQ > 0 else None
-
+        callbacks: list[BaseCallback] = []
+        if PPO_CHECKPOINT_FREQ > 0:
+            callbacks.append(
+                CheckpointCallback(
+                    save_freq=PPO_CHECKPOINT_FREQ,
+                    save_path=str(checkpoint_dir),
+                    name_prefix="ppo_trader",
+                )
+            )
+        if (
+            (historical_returns is not None or validation_returns is not None)
+            and PPO_EARLY_STOPPING_EVAL_FREQ > 0
+            and PPO_EARLY_STOPPING_PATIENCE > 0
+        ):
+            from stable_baselines3.common.monitor import Monitor
+            eval_returns = validation_returns if validation_returns is not None and len(validation_returns) > 0 else historical_returns
+            eval_env = HistoricalTradingEnv(
+                returns_array=eval_returns,
+                n_assets=self.n_assets,
+            )
+            eval_env = Monitor(eval_env)
+            eval_callback = EvalCallback(
+                eval_env,
+                n_eval_episodes=5,
+                eval_freq=PPO_EARLY_STOPPING_EVAL_FREQ,
+                deterministic=True,
+                verbose=0,
+            )
+            callbacks.append(eval_callback)
+            callbacks.append(
+                EarlyStoppingCallback(
+                    eval_callback,
+                    patience=PPO_EARLY_STOPPING_PATIENCE,
+                    min_delta=PPO_EARLY_STOPPING_MIN_DELTA,
+                    verbose=1,
+                )
+            )
+            logging.getLogger("boardroom").info(
+                "Early stopping enabled: eval every %d steps, patience=%d, min_delta=%.4f",
+                PPO_EARLY_STOPPING_EVAL_FREQ,
+                PPO_EARLY_STOPPING_PATIENCE,
+                PPO_EARLY_STOPPING_MIN_DELTA,
+            )
         self.model.learn(
             total_timesteps=total_timesteps,
             progress_bar=True,
-            callback=checkpoint_callback,
+            callback=callbacks if callbacks else None,
         )
 
         META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
