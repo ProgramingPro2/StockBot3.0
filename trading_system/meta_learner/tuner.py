@@ -38,7 +38,9 @@ import pandas as pd
 from .env import HistoricalTradingEnv, MixedDataEnv
 from .env_helpers import create_proxy_specialist_fn
 from .eval_helpers import SharpeEvalCallback, deterministic_validation_walk
+from .metrics_callback import JsonlMetricsCallback, metrics_path
 from .ppo_trader import _make_env_fn
+from .runs_index import make_run_id, record_end, record_start, tb_log_dir_for
 
 
 PPO_TUNE_PARAMS_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_best.json"
@@ -190,6 +192,31 @@ def run_tuning(
                 env = SubprocVecEnv(env_fns)
 
         env = VecMonitor(env) if isinstance(env, VecEnv) else Monitor(env)
+        run_id = make_run_id(f"tune_t{trial.number}")
+        tb_dir = tb_log_dir_for(run_id)
+        try:
+            record_start(
+                run_id,
+                "tune",
+                timesteps=int(n_timesteps),
+                extra={
+                    "trial": int(trial.number),
+                    "study": study_name,
+                    "params": {k: params.get(k) for k in (
+                        "learning_rate",
+                        "n_steps",
+                        "batch_size",
+                        "n_epochs",
+                        "gamma",
+                        "gae_lambda",
+                        "clip_range",
+                        "ent_coef",
+                        "historical_ratio",
+                    )},
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
         model = PPO(
             "MlpPolicy",
             env,
@@ -204,6 +231,7 @@ def run_tuning(
             policy_kwargs=params["policy_kwargs"],
             device=_get_ppo_device(),
             verbose=0,
+            tensorboard_log=str(tb_dir.parent),
         )
 
         sharpe_eval_callback = SharpeEvalCallback(
@@ -214,17 +242,32 @@ def run_tuning(
             trading_dates=val_trading_dates,
             verbose=0,
         )
+        callbacks: list = [sharpe_eval_callback]
+        if metrics_path() is not None:
+            callbacks.insert(0, JsonlMetricsCallback())
 
+        trial_status = "ok"
         try:
             model.learn(
                 total_timesteps=n_timesteps,
-                callback=sharpe_eval_callback,
+                callback=callbacks,
                 progress_bar=show_progress,
+                tb_log_name=run_id,
+                reset_num_timesteps=True,
             )
         except (AssertionError, ValueError):
+            trial_status = "failed"
+            try:
+                record_end(run_id, status=trial_status)
+            except Exception:  # noqa: BLE001
+                pass
             return float("nan")
         finally:
             env.close()
+        try:
+            record_end(run_id, status=trial_status)
+        except Exception:  # noqa: BLE001
+            pass
 
         sharpe, _ = deterministic_validation_walk(
             model,

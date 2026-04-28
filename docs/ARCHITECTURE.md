@@ -125,20 +125,50 @@ Config lives in `config/schedule.yaml` (timezone, services, jobs). See README "S
 
 ```
 trading_system/
-  config.py         - Configuration (loads from .env)
-  main.py           - CLI: train, tune, backtest, paper, live, schedule
-  scheduler.py      - Time-window supervisor + cron one-shot jobs
-  scheduler_systemd.py - Install/uninstall systemd user service (Linux)
-  data/             - Loader, news scraper, processor
-  agents/           - sentiment, quantitative, fundamental, regime, momentum, mean_reversion, volatility, earnings_event, relative_strength, liquidity
-  meta_learner/     - Gym env (TradingEnv, HistoricalTradingEnv), PPO trader, Optuna tuner
-  universe/         - Universe provider, features, ScorerModel, selector, autodiscover pipeline
-  broker/           - Alpaca integration, Discord notifications
-  utils/            - Logger, plotting (headless)
-  models/           - Saved checkpoints (including models/universe/ for scorer)
-  outputs/          - Plots, logs, schedule.log (daemon), scheduler_<id>.log (per service), current_trade_list.txt (when autodiscover --save)
+  config.py             - Configuration (loads from .env)
+  main.py               - Re-exports the Typer CLI + helpers used by tests
+  cli/
+    app.py              - Typer app (replaces argparse parser); rich-formatted help
+    parser.py           - Backwards-compat shim re-exporting cli/app
+    formatting.py       - Rich helpers (panels, stats tables, --json)
+    commands/           - Per-command Typer modules
+    run.py              - Implementations (cmd_train, cmd_backtest, ...)
+  scheduler.py          - Time-window supervisor + cron one-shot jobs
+  scheduler_systemd.py  - Install/uninstall systemd user service (Linux)
+  data/                 - Loader, news scraper, processor
+  agents/               - sentiment, quantitative, fundamental, regime, momentum, ...
+  meta_learner/
+    env.py / env_helpers.py
+    ppo_trader.py       - PPO trainer; tensorboard_log + JsonlMetricsCallback
+    metrics_callback.py - Per-rollout JSONL writer for the web UI charts
+    runs_index.py       - models/meta_learner/runs.json bookkeeping
+    tuner.py            - Optuna tuning (also writes TB logs per trial)
+    eval_helpers.py / proxy_specialists.py
+  universe/             - Universe provider, features, ScorerModel, selector
+  broker/               - Alpaca integration, Discord notifications
+  utils/                - Logger, plotting (headless), pdt
+  models/               - Saved checkpoints
+    meta_learner/
+      ppo_trader*.zip
+      tensorboard/<run_id>/  (PPO logs)
+      runs.json
+  outputs/              - Plots, logs, schedule.log
+    jobs/<job_id>/      - log.txt, metrics.jsonl, result.json, params.json
 config/
-  schedule.yaml     - Scheduler config (timezone, services, jobs)
+  schedule.yaml         - Scheduler config (timezone, services, jobs)
+
+webapp/
+  backend/              - FastAPI (api/, job_manager.py, env_manager.py, schedule_manager.py,
+                          system_info.py, tensorboard_proxy.py, schemas.py)
+  frontend/             - Vite + React + Tailwind (src/pages, src/components, lib/api.ts, lib/ws.ts)
+
+docker/
+  Dockerfile            - Multi-stage: node:20-alpine + nvidia/cuda runtime
+  docker-compose.yml    - webapp + tensorboard sidecar + optional ollama profile
+  entrypoint.sh
+
+requirements-web.txt    - FastAPI/uvicorn/websockets/psutil/nvidia-ml-py
+Makefile                - web/web-dev/web-prod, frontend-build, docker-up*, test, cli
 ```
 
 ## Day-trading prevention
@@ -174,3 +204,31 @@ A separate pipeline scores a candidate universe and selects the top N symbols fo
 - **ScorerModel**: GradientBoostingClassifier trained on historical proxy features; label = 1 if forward return in top quartile, else 0. Saves to `models/universe/scorer_model.pkl`. When no model exists, a simple rule score is used.
 - **Selector**: Rank by score descending; take top N (`TRADE_LIST_SIZE`, default 5).
 - **CLI**: `autodiscover` runs discovery once and prints or saves the list (`--save` to `outputs/current_trade_list.txt`). `train-universe` trains the ScorerModel from aligned historical returns. Paper and live accept `--autodiscover` to resolve the trade list at start.
+
+## Web Layer
+
+The CLI (`trading_system.cli.app`) is wrapped by a FastAPI + React control plane under `webapp/`.
+
+```
+Browser (React + Tailwind, Vite build)
+    | HTTP / WS via /api/*
+    v
+FastAPI (webapp/backend)
+    +---> JobManager: subprocess.Popen("python -m trading_system <cmd>", env=BOARDROOM_*)
+    |       +-> tees stdout to outputs/jobs/<id>/log.txt (broadcast over WS)
+    |       +-> tails outputs/jobs/<id>/metrics.jsonl (broadcast over WS)
+    |       +-> reads outputs/jobs/<id>/result.json when done
+    +---> EnvManager: parse/write .env preserving comments
+    +---> ScheduleManager: read/write config/schedule.yaml + run-now/stop/status
+    +---> SystemInfo: psutil + nvidia-ml-py for CPU/GPU pills
+    +---> RunsIndex: models/meta_learner/runs.json (TensorBoard run list)
+    +---> /tb/* reverse-proxy to TensorBoard (port 6006; web UI default HTTP port 28473)
+```
+
+The Boardroom CLI accepts `--json` and reads `BOARDROOM_RESULT_PATH`/`BOARDROOM_METRICS_PATH`/`BOARDROOM_RUN_ID`/`BOARDROOM_RUN_KIND` from the environment. The PPO trainer in `trading_system/meta_learner/ppo_trader.py` writes TensorBoard logs to `models/meta_learner/tensorboard/<run_id>/` and emits one `metrics.jsonl` line per rollout via `JsonlMetricsCallback` (only when `BOARDROOM_METRICS_PATH` is set, so direct CLI use is unaffected).
+
+`docker/` packages the web layer as a multi-stage build (Node frontend builder + CUDA Python runtime). `docker/docker-compose.yml` defines:
+
+- `webapp` (this image, port 28473, GPU reservations, mounts the project's `.env`/`config/`/`outputs/`/`models/`/`data/cache/`).
+- `tensorboard` reading the same logs volume on port 6006; `webapp` proxies it under `/tb/`.
+- `ollama` (opt-in via the `ollama` profile) for fully containerized deployments.

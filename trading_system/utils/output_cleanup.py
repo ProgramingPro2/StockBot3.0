@@ -50,4 +50,11 @@ def rotate_output_plots(
                 removed += 1
             except OSError:
                 pass
+            json_sibling = p.with_suffix(".json")
+            if json_sibling.is_file():
+                try:
+                    json_sibling.unlink()
+                    removed += 1
+                except OSError:
+                    pass
     return removed

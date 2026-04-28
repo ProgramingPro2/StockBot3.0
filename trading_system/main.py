@@ -1,10 +1,12 @@
 """
 CLI entry point for The Boardroom trading system.
-Implementation lives in trading_system.cli.
+
+The implementation lives in :mod:`trading_system.cli.app` (Typer + Rich).
+We re-export internal helpers here so existing tests keep working.
 """
 from __future__ import annotations
 
-from .cli.parser import main
+from .cli.app import main
 from .cli.run import (
     _chronological_train_test_split,
     _compute_backtest_stats,
@@ -23,6 +25,7 @@ __all__ = [
     "_proxy_specialists_from_returns",
     "_run_backtest",
 ]
+
 
 if __name__ == "__main__":
     main()

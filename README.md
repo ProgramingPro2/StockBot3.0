@@ -2,6 +2,12 @@
 
 A hierarchical multi-agent algorithmic trading system for long-term equity strategies. Four specialist agents (Narrative, Quantitative, Fundamental, Regime) feed into a PPO meta-learner for position sizing. The system trades a configurable list of symbols (default: 5 ETFs chosen for active-trading fit: SPY, IWM, XLE, XLF, EEM).
 
+The repository ships with three ways to drive the system:
+
+- A modern **Typer + Rich CLI** (`boardroom` / `python -m trading_system`) for terminal use.
+- A **FastAPI + React Web UI** (`make web`) for everything in a browser - training, tuning, backtests, paper/live, env editor, scheduler, plot gallery, and an embedded TensorBoard.
+- A **Docker Compose** stack with NVIDIA GPU support, a TensorBoard sidecar, and an optional Ollama service.
+
 ## Requirements
 
 - Ubuntu Server (headless)
@@ -233,3 +239,103 @@ To let the system pick the trade list from a larger universe:
    python -m trading_system live --autodiscover --interval 60
    ```
    When `UNIVERSE_SOURCE=config`, behavior is unchanged: trade list = TRADE_TICKERS or `--tickers`.
+
+## Modern CLI (Typer + Rich)
+
+The CLI is built on [Typer](https://typer.tiangolo.com/) with [Rich](https://rich.readthedocs.io/) output. You get colored help, panels, and stat tables in the terminal, plus a `--json` mode for machine consumption.
+
+```bash
+# Pretty help with colored output
+python -m trading_system --help
+
+# Each subcommand has its own help and typed flags
+python -m trading_system train --help
+python -m trading_system tune status
+
+# Backtest stats render as a Rich table; pass --json for a structured payload
+python -m trading_system backtest --json
+```
+
+The same entry point works as a console script after `pip install -e .`:
+
+```bash
+boardroom train --timesteps 500000
+boardroom backtest --tickers SPY,IWM,XLE
+```
+
+When `BOARDROOM_RESULT_PATH` is set (the web UI does this automatically), `backtest`, `train`, and `tune` also dump their structured results to that JSON file.
+
+## Web UI
+
+A FastAPI + React control plane sits in `webapp/`. It wraps every CLI mode with start/stop controls, live log streaming over WebSockets, live recharts panels for PPO metrics, an embedded TensorBoard, an `.env` editor, the scheduler YAML editor, a plot gallery, and a model manager.
+
+### Local development
+
+```bash
+# Install backend deps (CLI + web)
+pip install -r requirements.txt -r requirements-web.txt
+
+# One-shot run: build the React app and serve it on port 28473 (override: make web PORT=9100)
+make web
+
+# Hot-reload setup: backend with --reload + Vite dev server
+make web-dev          # runs uvicorn with reload
+make frontend-dev     # in another terminal: starts Vite at :5173 with /api proxy to 28473 (live logs/metrics WebSockets connect directly to that backend, not through the proxy)
+```
+
+Vite defaults to **polling** file watching (avoids `EMFILE: too many open files` on low `ulimit -n` or small inotify pools). For native fs watchers instead, run `npm run dev:native` or `VITE_WATCH_POLLING=0 npm run dev`. Do not keep a duplicate `vite.config.js` next to `vite.config.ts` (Vite prefers `.js` and doubles config watchers); `make frontend-dev` also bumps `ulimit -n` when the shell allows it.
+
+Then open <http://127.0.0.1:28473>.
+
+The default HTTP port is **28473** (set `BOARDROOM_PORT` in `.env` or the shell to change it). The first time you start the backend it auto-spawns a TensorBoard process bound to `127.0.0.1:6006` with `--path_prefix /tb`; the UI proxies it through `/tb/` so everything stays on a single origin. To disable that auto-spawn (e.g. when running TensorBoard yourself), set `BOARDROOM_DISABLE_TB=1`. To point the proxy at a remote TensorBoard, set `BOARDROOM_TB_UPSTREAM=http://hostname:6006` and start that TensorBoard with the same prefix, e.g. `tensorboard --logdir ... --path_prefix /tb` (override the path with `BOARDROOM_TB_PATH_PREFIX` if both sides must match a different value).
+
+### Pages
+
+- **Dashboard**: running jobs, GPU/CPU/memory pills, latest backtest/training previews (interactive Recharts from sibling JSON next to each PNG), quick-start tiles.
+- **Train / Tune**: typed forms, live log stream, recharts panels for `ep_rew_mean`, policy/value/entropy losses and KL.
+- **Backtest**: model picker, ticker chips, interactive equity curve (B&H overlay, drawdown, histogram, weights, brush zoom) from `outputs/*.json`, static PNG link, final stats table.
+- **Paper / Live**: start/stop with a guard so paper and live cannot run simultaneously; live mode requires an explicit confirmation toggle.
+- **Models**: list `ppo_trader*.zip`, set the live default (writes `LIVE_PPO_MODEL_PATH`), delete with confirm.
+- **Schedule**: Monaco YAML editor for `config/schedule.yaml`, run-now/stop/status table.
+- **Plots**: gallery of every PNG under `outputs/` with interactive previews when a matching `*.json` series file exists; click to enlarge the full chart.
+- **Logs**: viewer for any file in `outputs/` and per-job `log.txt`.
+- **TensorBoard**: full-page iframe to `/tb/` plus a sidebar driven by `models/meta_learner/runs.json`.
+- **Config**: grouped editor for `.env` with secret toggles for Alpaca/Discord credentials.
+- **System**: live host telemetry and the resolved values from `trading_system/config.py`.
+
+### Per-job artifacts
+
+The job manager writes to `trading_system/outputs/jobs/<job_id>/`:
+
+- `log.txt` – tee of stdout + stderr.
+- `metrics.jsonl` – one JSON line per PPO rollout (live charts).
+- `result.json` – structured result (backtest stats, train run summary, etc.). Includes `series_path` when an interactive chart payload was written under `outputs/` (sibling `.json` next to the PNG).
+- `params.json` – parameters as submitted via the web UI.
+
+A registry of recent jobs lives at `trading_system/outputs/jobs/registry.json`.
+
+## Docker
+
+A multi-stage Dockerfile builds the React frontend in `node:20-alpine`, then assembles a CUDA-enabled Python runtime image. `docker/docker-compose.yml` wires three services:
+
+1. `webapp` (this image) on port **28473** with NVIDIA GPU reservations and `extra_hosts` so it can talk to a host-running Ollama via `host.docker.internal`.
+2. `tensorboard` reading the same `models/meta_learner/tensorboard` volume on port 6006.
+3. `ollama` as an opt-in service activated by the `ollama` profile.
+
+```bash
+# Build the webapp image
+make docker-build
+
+# Bring up webapp + tensorboard with GPU
+make docker-up
+
+# Same plus a containerized Ollama on :11434
+make docker-up-ollama
+
+# Stop everything
+make docker-down
+```
+
+Open <http://localhost:28473>. TensorBoard is also reachable directly at <http://localhost:6006/tb/> (path prefix matches the web UI proxy) if you prefer it standalone.
+
+The compose file mounts the project's `.env`, `config/`, `outputs/`, `models/` and `data/cache/` so trained models, logs, and plots are persisted on the host.

@@ -475,7 +475,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         from datetime import datetime
 
         from ..broker.discord_notifier import send_training_complete_embed
-        from ..utils.plotting import save_performance_plot
+        from ..utils.plotting import save_performance_plot, save_performance_series
 
         # Report out-of-sample when test window was held out; otherwise full backtest
         backtest_aligned = aligned_test if aligned_test is not None else None
@@ -483,7 +483,16 @@ def cmd_train(args: argparse.Namespace) -> None:
             logger.info("Running training-complete backtest on held-out test window (out-of-sample)")
         result = _run_backtest(tickers, trader, aligned_df=backtest_aligned)
         if result is not None:
-            equity, returns, bh_returns, equity_dollars, rebalance_dates, rebalance_direction, rebalance_trades = result
+            (
+                equity,
+                returns,
+                bh_returns,
+                equity_dollars,
+                rebalance_dates,
+                rebalance_direction,
+                rebalance_trades,
+                weights_history,
+            ) = result
             stats = _compute_backtest_stats(equity, returns, bh_returns, STARTING_CAPITAL)
             plot_filename = f"training_complete_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
             plot_path = save_performance_plot(
@@ -494,7 +503,36 @@ def cmd_train(args: argparse.Namespace) -> None:
                 rebalance_direction=rebalance_direction,
                 rebalance_trades=rebalance_trades,
             )
+            series_path = save_performance_series(
+                equity_dollars=equity_dollars,
+                bh_returns=bh_returns,
+                rebalance_dates=rebalance_dates,
+                rebalance_direction=rebalance_direction,
+                rebalance_trades=rebalance_trades,
+                tickers=tickers,
+                weights_history=weights_history,
+                starting_capital=float(STARTING_CAPITAL),
+                filename=Path(plot_filename).with_suffix(".json").name,
+                kind="train",
+            )
             dated_name = dated_path.name if dated_path else None
+            try:
+                from .formatting import is_quiet, stats_table, write_result_path
+
+                if not is_quiet():
+                    stats_table(stats, starting_capital=STARTING_CAPITAL)
+                write_result_path({
+                    "kind": "train",
+                    "tickers": tickers,
+                    "timesteps": args.timesteps,
+                    "historical_ratio": historical_ratio,
+                    "model_path": str(dated_path) if dated_path else None,
+                    "plot_path": str(plot_path),
+                    "series_path": str(series_path),
+                    "stats": stats,
+                })
+            except Exception as exc:  # noqa: BLE001 - best-effort UI integration
+                logger.debug("Rich/result emit skipped: %s", exc)
             if send_training_complete_embed(
                 args.timesteps, stats, plot_path, dated_name,
                 historical_ratio=historical_ratio,
@@ -602,8 +640,12 @@ def _backtest_stats(
     strategy_returns: pd.Series,
     bh_returns: pd.Series,
     starting_capital: float | None = None,
-) -> None:
-    """Log final backtest statistics (P/L, drawdown, etc.). Optionally scale to starting_capital for dollar values."""
+) -> dict:
+    """Log final backtest statistics (P/L, drawdown, etc.). Optionally scale to starting_capital for dollar values.
+
+    Returns the computed stats dict so callers can render them with Rich or
+    persist them via BOARDROOM_RESULT_PATH.
+    """
     stats = _compute_backtest_stats(equity, strategy_returns, bh_returns, starting_capital)
     logger.info("--- Backtest final stats ---")
     if starting_capital is not None and starting_capital > 0 and "final_value" in stats:
@@ -619,6 +661,7 @@ def _backtest_stats(
     logger.info("Buy-and-hold return: %.2f%%", stats["bh_return_pct"])
     logger.info("Strategy vs B&H: %+.2f%%", stats["vs_bh"])
     logger.info("----------------------------")
+    return stats
 
 
 def _proxy_specialists_from_returns(
@@ -634,13 +677,23 @@ def _run_backtest(
     tickers: list[str],
     trader: PPOTrader,
     aligned_df: pd.DataFrame | None = None,
-) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, list, list, list[list[tuple[str, float]]]] | None:
+) -> tuple[
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    list,
+    list,
+    list[list[tuple[str, float]]],
+    np.ndarray,
+] | None:
     """
     Run backtest day-by-day with live-style threshold.
     When aligned_df is provided (e.g. test window), use it for out-of-sample evaluation.
     Otherwise load and align OHLCV internally.
     Return (equity, strategy_returns, bh_returns, equity_dollars, rebalance_dates,
-    rebalance_direction, rebalance_trades) or None if insufficient data.
+    rebalance_direction, rebalance_trades, weights_history) or None if insufficient data.
+    weights_history: shape (n_bars, n_assets), per-bar effective weights (zeros before warmup).
     """
     if aligned_df is not None:
         aligned = aligned_df
@@ -675,6 +728,7 @@ def _run_backtest(
     min_reentry_bars = 1 if MIN_REENTRY_MINUTES_AFTER_SELL >= _day_minutes else 0
     strategy_returns = pd.Series(0.0, index=aligned.index, dtype=float)
     equity_arr = np.ones(n, dtype=np.float64)
+    weights_history = np.zeros((n, n_assets), dtype=np.float32)
     rebalance_dates: list = []
     rebalance_direction: list = []
     rebalance_trades: list[list[tuple[str, float]]] = []
@@ -779,6 +833,8 @@ def _run_backtest(
         if traded:
             equity_arr[t] *= max(0.0, 1.0 - cost_bps * turnover_pct)
 
+        weights_history[t, :] = effective_weights.astype(np.float32)
+
     strategy_returns = strategy_returns.fillna(0)
     equity = pd.Series(equity_arr, index=aligned.index)
     equity_dollars = equity * STARTING_CAPITAL
@@ -791,6 +847,7 @@ def _run_backtest(
         rebalance_dates,
         rebalance_direction,
         rebalance_trades,
+        weights_history,
     )
 
 
@@ -926,6 +983,19 @@ def cmd_tune(args: argparse.Namespace) -> None:
         if k != "policy_kwargs":
             logger.info("  %s: %s", k, v)
     logger.info("Run 'train --use-historical --use-tuned' to train with these params.")
+    try:
+        from .formatting import write_result_path
+
+        write_result_path({
+            "kind": "tune",
+            "tickers": tickers,
+            "n_trials": n_trials,
+            "timesteps_per_trial": timesteps,
+            "study_name": study_name,
+            "best_params": {k: v for k, v in best.items() if k != "policy_kwargs"},
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Rich/result emit skipped: %s", exc)
 
 
 def cmd_tune_status(args: argparse.Namespace) -> None:
@@ -958,7 +1028,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     from datetime import datetime
 
     from ..meta_learner import PPOTrader
-    from ..utils.plotting import save_performance_plot
+    from ..utils.plotting import save_performance_plot, save_performance_series
 
     tickers = _tickers_from_args(args)
     n_assets = len(tickers)
@@ -1007,9 +1077,18 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     if result is None:
         logger.error("Insufficient data for backtest")
         return
-    equity, returns, bh_returns, equity_dollars, rebalance_dates, rebalance_direction, rebalance_trades = result
+    (
+        equity,
+        returns,
+        bh_returns,
+        equity_dollars,
+        rebalance_dates,
+        rebalance_direction,
+        rebalance_trades,
+        weights_history,
+    ) = result
 
-    _backtest_stats(equity, returns, bh_returns, starting_capital=STARTING_CAPITAL)
+    stats = _backtest_stats(equity, returns, bh_returns, starting_capital=STARTING_CAPITAL)
     plot_filename = f"backtest_portfolio_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
     path = save_performance_plot(
         equity_dollars,
@@ -1020,6 +1099,36 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         rebalance_trades=rebalance_trades,
     )
     logger.info("Saved plot to %s", path)
+
+    series_path = save_performance_series(
+        equity_dollars=equity_dollars,
+        bh_returns=bh_returns,
+        rebalance_dates=rebalance_dates,
+        rebalance_direction=rebalance_direction,
+        rebalance_trades=rebalance_trades,
+        tickers=tickers,
+        weights_history=weights_history,
+        starting_capital=float(STARTING_CAPITAL),
+        filename=Path(plot_filename).with_suffix(".json").name,
+        kind="backtest",
+    )
+
+    # Rich stats panel + machine-readable result for the web UI / JSON consumers.
+    try:
+        from .formatting import is_quiet, stats_table, write_result_path
+
+        if not is_quiet():
+            stats_table(stats, starting_capital=STARTING_CAPITAL)
+        write_result_path({
+            "kind": "backtest",
+            "tickers": tickers,
+            "model": str(model_path) if model_path else None,
+            "plot_path": str(path),
+            "series_path": str(series_path),
+            "stats": stats,
+        })
+    except Exception as exc:  # noqa: BLE001 - best-effort UI integration
+        logger.debug("Rich/result emit skipped: %s", exc)
 
 
 def cmd_paper(args: argparse.Namespace) -> None:

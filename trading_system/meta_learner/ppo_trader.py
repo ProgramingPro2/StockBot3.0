@@ -46,7 +46,9 @@ from ..config import (
 from ..utils.output_cleanup import prune_checkpoints
 from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
 from .eval_helpers import SharpeEvalCallback
+from .metrics_callback import JsonlMetricsCallback, metrics_path
 from .proxy_specialists import normalize_action_max_unit_exposure
+from .runs_index import make_run_id, record_end, record_start, tb_log_dir_for
 
 
 class EarlyStoppingCallback(BaseCallback):
@@ -390,6 +392,21 @@ class PPOTrader:
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cuda",
             )
 
+        # Per-run id + TensorBoard directory.
+        run_kind = os.environ.get("BOARDROOM_RUN_KIND", "train")
+        run_id = make_run_id(run_kind)
+        tb_dir = tb_log_dir_for(run_id)
+        tb_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            record_start(
+                run_id,
+                run_kind,
+                timesteps=int(total_timesteps),
+                extra={"mode": mode, "n_envs": int(getattr(env, "num_envs", 1) or 1)},
+            )
+        except Exception:  # noqa: BLE001 - bookkeeping must never break training
+            pass
+
         env_num_envs = getattr(env, "num_envs", 1)
         if self.model is None:
             policy_kwargs = kwargs.pop("policy_kwargs", None) or PPO_NET_ARCH
@@ -413,6 +430,7 @@ class PPOTrader:
                 policy_kwargs=policy_kwargs,
                 device=device,
                 verbose=1,
+                tensorboard_log=str(tb_dir.parent),
                 **kwargs,
             )
         elif env_num_envs != self.model.n_envs:
@@ -423,10 +441,16 @@ class PPOTrader:
                 self.model.set_env(env)
         else:
             self.model.set_env(env)
+        try:
+            self.model.tensorboard_log = str(tb_dir.parent)
+        except Exception:  # noqa: BLE001
+            pass
 
         checkpoint_dir = META_LEARNER_MODEL_DIR / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         callbacks: list[BaseCallback] = []
+        if metrics_path() is not None:
+            callbacks.append(JsonlMetricsCallback())
         if PPO_CHECKPOINT_FREQ > 0:
             callbacks.append(
                 CheckpointCallback(
@@ -500,11 +524,26 @@ class PPOTrader:
                 PPO_EARLY_STOPPING_PATIENCE,
                 PPO_EARLY_STOPPING_MIN_DELTA,
             )
-        self.model.learn(
-            total_timesteps=total_timesteps,
-            progress_bar=True,
-            callback=callbacks if callbacks else None,
-        )
+        try:
+            self.model.learn(
+                total_timesteps=total_timesteps,
+                progress_bar=True,
+                callback=callbacks if callbacks else None,
+                tb_log_name=run_id,
+                reset_num_timesteps=True,
+            )
+            run_status = "ok"
+        except BaseException:
+            try:
+                record_end(run_id, status="failed")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        else:
+            try:
+                record_end(run_id, status=run_status)
+            except Exception:  # noqa: BLE001
+                pass
 
         if (
             sharpe_eval_callback is not None

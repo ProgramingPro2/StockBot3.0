@@ -2,9 +2,14 @@
 Plotting utilities for The Boardroom.
 Headless only: save to disk, no plt.show().
 """
+from __future__ import annotations
+
+import json
 from pathlib import Path
+from typing import Any
 
 import matplotlib
+import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -132,6 +137,102 @@ def save_performance_plot(
     rotate_output_plots()
     plt.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.25)
     plt.close()
+    rotate_output_plots()
+    return out_path
+
+
+def _index_to_iso(idx: pd.Index) -> list[str]:
+    out: list[str] = []
+    for d in idx:
+        if hasattr(d, "isoformat"):
+            out.append(d.isoformat())  # type: ignore[union-attr]
+        else:
+            out.append(str(d))
+    return out
+
+
+def save_performance_series(
+    equity_dollars: pd.Series,
+    bh_returns: pd.Series,
+    rebalance_dates: list | None,
+    rebalance_direction: list | None,
+    rebalance_trades: list[list[tuple[str, float]]] | None,
+    tickers: list[str],
+    weights_history: np.ndarray,
+    starting_capital: float,
+    filename: str,
+    kind: str,
+    weights_max_points: int = 250,
+) -> Path:
+    """
+    Write interactive-chart payload (JSON) next to the PNG performance plot.
+    Includes equity, buy-and-hold equity, daily returns, drawdown, rebalance events,
+    and sub-sampled per-ticker weights.
+    """
+    idx = equity_dollars.index
+    eq = equity_dollars.astype(float)
+    bh_eq = ((1.0 + bh_returns.reindex(idx).fillna(0.0)).cumprod() * float(starting_capital)).astype(float)
+    cummax = eq.cummax()
+    drawdown = (eq / cummax.replace(0.0, np.nan) - 1.0).fillna(0.0)
+    daily_ret = eq.pct_change().fillna(0.0)
+
+    rebalances: list[dict[str, Any]] = []
+    if rebalance_dates:
+        directions = (
+            rebalance_direction
+            if rebalance_direction and len(rebalance_direction) == len(rebalance_dates)
+            else None
+        )
+        trades_per = (
+            rebalance_trades
+            if rebalance_trades and len(rebalance_trades) == len(rebalance_dates)
+            else None
+        )
+        for i, d in enumerate(rebalance_dates):
+            if d not in eq.index:
+                continue
+            di = int(directions[i]) if directions is not None else 0
+            trades_here = trades_per[i] if trades_per else []
+            rebalances.append(
+                {
+                    "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
+                    "direction": di,
+                    "trades": [{"ticker": t, "pct_delta": float(p)} for t, p in trades_here],
+                }
+            )
+
+    n = len(weights_history)
+    if n <= weights_max_points:
+        row_ix = np.arange(n, dtype=np.int64)
+    else:
+        row_ix = np.unique(np.linspace(0, n - 1, num=weights_max_points).astype(np.int64))
+
+    weight_rows: list[dict[str, Any]] = []
+    for ri in row_ix:
+        d = idx[ri]
+        row: dict[str, Any] = {
+            "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
+        }
+        for j, sym in enumerate(tickers):
+            row[sym] = float(weights_history[ri, j])
+        weight_rows.append(row)
+
+    payload: dict[str, Any] = {
+        "kind": kind,
+        "starting_capital": float(starting_capital),
+        "tickers": list(tickers),
+        "dates": _index_to_iso(idx),
+        "equity": [float(x) for x in eq.values],
+        "bh_equity": [float(x) for x in bh_eq.values],
+        "returns": [float(x) for x in daily_ret.values],
+        "drawdown": [float(x) for x in drawdown.values],
+        "rebalances": rebalances,
+        "weights": weight_rows,
+    }
+
+    out_path = OUTPUT_DIR / filename
+    rotate_output_plots()
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     rotate_output_plots()
     return out_path
 

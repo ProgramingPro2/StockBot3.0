@@ -1,0 +1,124 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background: theme(colors.bg.DEFAULT);
+  color: theme(colors.ink.DEFAULT);
+}
+
+body {
+  font-family: theme(fontFamily.sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-image:
+    radial-gradient(900px 600px at 0% 0%, rgba(124, 92, 255, 0.10), transparent 60%),
+    radial-gradient(900px 700px at 100% 100%, rgba(52, 211, 153, 0.07), transparent 60%);
+  background-attachment: fixed;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: theme(colors.bg.border);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: theme(colors.ink.dim);
+}
+
+@layer components {
+  .panel {
+    @apply rounded-xl border border-bg-border bg-bg-panel/80 backdrop-blur shadow-sm;
+  }
+  .panel-padded {
+    @apply panel p-5;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition focus:outline-none focus:ring-2 focus:ring-accent/40 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent/90 shadow-glow;
+  }
+  .btn-secondary {
+    @apply btn bg-bg-subtle text-ink hover:bg-bg-border;
+  }
+  .btn-ghost {
+    @apply btn text-ink-muted hover:text-ink hover:bg-bg-subtle;
+  }
+  .btn-danger {
+    @apply btn bg-danger text-white hover:bg-danger/90;
+  }
+  .input,
+  .select,
+  .textarea {
+    @apply w-full rounded-lg border border-bg-border bg-bg-subtle px-3 py-2 text-sm text-ink placeholder:text-ink-dim focus:border-accent/60 focus:outline-none focus:ring-2 focus:ring-accent/40;
+  }
+  .label {
+    @apply text-xs font-medium uppercase tracking-wide text-ink-muted;
+  }
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium;
+  }
+  .pill-success {
+    @apply pill border-success/30 bg-success-soft text-success;
+  }
+  .pill-warn {
+    @apply pill border-warn/30 bg-warn-soft text-warn;
+  }
+  .pill-danger {
+    @apply pill border-danger/30 bg-danger-soft text-danger;
+  }
+  .pill-accent {
+    @apply pill border-accent/30 bg-accent-soft text-accent;
+  }
+  .pill-muted {
+    @apply pill border-bg-border bg-bg-subtle text-ink-muted;
+  }
+  .table-clean {
+    @apply w-full text-sm;
+  }
+  .table-clean thead th {
+    @apply text-left text-xs uppercase tracking-wide text-ink-muted font-medium px-3 py-2 border-b border-bg-border;
+  }
+  .table-clean tbody td {
+    @apply px-3 py-2 border-b border-bg-border/60;
+  }
+  .code {
+    @apply font-mono text-[12px] whitespace-pre-wrap break-words;
+  }
+}
+
+.log-stream {
+  font-family: theme(fontFamily.mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.log-stream .log-error {
+  color: theme(colors.danger.DEFAULT);
+}
+.log-stream .log-warn {
+  color: theme(colors.warn.DEFAULT);
+}
+.log-stream .log-info {
+  color: theme(colors.ink.DEFAULT);
+}
+.log-stream .log-debug {
+  color: theme(colors.ink.dim);
+}
