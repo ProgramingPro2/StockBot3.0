@@ -98,6 +98,22 @@ try:
 except (ValueError, TypeError):
     OLLAMA_INTERVAL_MIN = 60
 
+# Backtest / training: bars between proxy-sentiment "refresh" (simulates live Ollama cadence without LLM).
+# Unset = max(1, OLLAMA_INTERVAL_MIN // CYCLE_INTERVAL_MIN) to mirror paper/live ratio.
+try:
+    _be = os.getenv("BACKTEST_OLLAMA_EVERY_N_BARS", "").strip()
+    BACKTEST_OLLAMA_EVERY_N_BARS = max(1, int(_be)) if _be else None
+except (ValueError, TypeError):
+    BACKTEST_OLLAMA_EVERY_N_BARS = None
+
+
+def sentiment_refresh_every_n_bars() -> int:
+    """Trading days between proxy sentiment recomputes in backtest and training stale cadence."""
+    if BACKTEST_OLLAMA_EVERY_N_BARS is not None:
+        return BACKTEST_OLLAMA_EVERY_N_BARS
+    return max(1, OLLAMA_INTERVAL_MIN // CYCLE_INTERVAL_MIN)
+
+
 # Trading: fractional shares and starting capital
 FRACTIONAL = os.getenv("FRACTIONAL", "yes").lower() in ("1", "true", "yes")
 try:
@@ -132,6 +148,23 @@ try:
     SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "5").strip() or "5")
 except (ValueError, TypeError):
     SLIPPAGE_BPS = 5.0
+
+# Pattern day trader (PDT) simulation: backtest, training envs, and live Alpaca loop
+ENV_PDT_RESTRICTIONS = os.getenv("ENV_PDT_RESTRICTIONS", "").strip().lower() in ("1", "true", "yes")
+try:
+    PDT_MIN_ACCOUNT_EQUITY = float(os.getenv("PDT_MIN_ACCOUNT_EQUITY", "25000").strip() or "25000")
+except (ValueError, TypeError):
+    PDT_MIN_ACCOUNT_EQUITY = 25000.0
+try:
+    PDT_MAX_DAY_TRADES = int(os.getenv("PDT_MAX_DAY_TRADES", "3").strip() or "3")
+except (ValueError, TypeError):
+    PDT_MAX_DAY_TRADES = 3
+try:
+    PDT_ROLLING_BUSINESS_DAYS = int(os.getenv("PDT_ROLLING_BUSINESS_DAYS", "5").strip() or "5")
+except (ValueError, TypeError):
+    PDT_ROLLING_BUSINESS_DAYS = 5
+PDT_MAX_DAY_TRADES = max(1, PDT_MAX_DAY_TRADES)
+PDT_ROLLING_BUSINESS_DAYS = max(1, PDT_ROLLING_BUSINESS_DAYS)
 
 # Trade tickers (5 assets; override via TRADE_TICKERS=SPY,IWM,... in .env)
 # Default: ETFs chosen for active-trading fit (volatility, dispersion) vs strong-trend names.

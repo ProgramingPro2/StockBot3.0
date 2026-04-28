@@ -15,9 +15,8 @@ import torch
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecMonitor
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecMonitor
 
 from ..config import (
     META_LEARNER_MODEL_DIR,
@@ -34,9 +33,11 @@ from ..config import (
     TRAIN_HISTORICAL_RATIO_OVERRIDE,
 )
 import numpy as np
+import pandas as pd
 
 from .env import HistoricalTradingEnv, MixedDataEnv
 from .env_helpers import create_proxy_specialist_fn
+from .eval_helpers import SharpeEvalCallback, deterministic_validation_walk
 from .ppo_trader import _make_env_fn
 
 
@@ -64,7 +65,7 @@ def sample_ppo_params(
     else:
         historical_ratio = trial.suggest_float("historical_ratio", 0.1, 0.9)
     return {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True),
         "n_steps": trial.suggest_categorical("n_steps", [1024, 2048, 4096]),
         "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128]),
         "n_epochs": trial.suggest_categorical("n_epochs", [5, 10, 20]),
@@ -78,35 +79,12 @@ def sample_ppo_params(
 
 
 def _sample_net_arch(trial: optuna.Trial) -> dict:
-    arch = trial.suggest_categorical("net_arch", ["tiny", "small", "medium"])
-    if arch == "tiny":
-        net_arch = {"pi": [64], "vf": [64]}
-    elif arch == "small":
+    arch = trial.suggest_categorical("net_arch", ["small", "medium"])
+    if arch == "small":
         net_arch = {"pi": [64, 64], "vf": [64, 64]}
     else:
         net_arch = {"pi": [128, 128], "vf": [128, 128]}
     return {"net_arch": net_arch}
-
-
-class TrialEvalCallback(EvalCallback):
-    """EvalCallback that reports to Optuna for pruning."""
-
-    def __init__(self, eval_env, trial: optuna.Trial, n_eval_episodes: int = 5, eval_freq: int = 10000, **kwargs):
-        super().__init__(eval_env=eval_env, n_eval_episodes=n_eval_episodes, eval_freq=eval_freq, **kwargs)
-        self.trial = trial
-        self.eval_idx = 0
-        self.is_pruned = False
-
-    def _on_step(self) -> bool:
-        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            super()._on_step()
-            self.eval_idx += 1
-            if self.last_mean_reward is not None:
-                self.trial.report(self.last_mean_reward, self.eval_idx)
-            if self.trial.should_prune():
-                self.is_pruned = True
-                return False
-        return True
 
 
 def run_tuning(
@@ -115,7 +93,7 @@ def run_tuning(
     n_trials: int = 50,
     n_timesteps: int = 100_000,
     n_evaluations: int = 5,
-    n_eval_episodes: int = 5,
+    n_eval_episodes: int = 10,
     timeout: int | None = None,
     n_envs: int | None = None,
     study_name: str = "ppo_tune",
@@ -124,6 +102,7 @@ def run_tuning(
     single_thread: bool = False,
     params_path: Path | None = None,
     show_progress: bool = True,
+    historical_trading_dates: Any = None,
 ) -> dict[str, Any]:
     """
     Run Optuna hyperparameter tuning.
@@ -145,6 +124,18 @@ def run_tuning(
     else:
         train_returns = returns_array
         val_returns = returns_array
+
+    train_trading_dates = None
+    val_trading_dates = None
+    if historical_trading_dates is not None:
+        td = pd.DatetimeIndex(historical_trading_dates)
+        if len(td) != n:
+            raise ValueError("historical_trading_dates length must match returns_array")
+        train_trading_dates = td[: len(train_returns)]
+        if n > val_size + 252:
+            val_trading_dates = td[len(train_returns) : n]
+        else:
+            val_trading_dates = td[: len(val_returns)]
 
     proxy_specialist_fn = create_proxy_specialist_fn(train_returns, n_assets)
 
@@ -171,6 +162,7 @@ def run_tuning(
                 specialist_fn=proxy_specialist_fn,
                 seed=trial.number,
                 daily_aux_features=None,
+                historical_trading_dates=train_trading_dates,
             )
         else:
             env_fns = [
@@ -183,6 +175,7 @@ def run_tuning(
                     specialist_fn=proxy_specialist_fn,
                     seed=trial.number * 1000 + i,
                     daily_aux_features=None,
+                    historical_trading_dates=train_trading_dates,
                 )
                 for i in range(n_envs)
             ]
@@ -197,12 +190,6 @@ def run_tuning(
                 env = SubprocVecEnv(env_fns)
 
         env = VecMonitor(env) if isinstance(env, VecEnv) else Monitor(env)
-        eval_inner = HistoricalTradingEnv(returns_array=val_returns, n_assets=n_assets)
-        if isinstance(env, VecMonitor):
-            eval_env = VecMonitor(DummyVecEnv([lambda: eval_inner]))
-        else:
-            eval_env = Monitor(eval_inner)
-
         model = PPO(
             "MlpPolicy",
             env,
@@ -219,36 +206,41 @@ def run_tuning(
             verbose=0,
         )
 
-        eval_callback = TrialEvalCallback(
-            eval_env=eval_env,
-            trial=trial,
-            n_eval_episodes=n_eval_episodes,
-            eval_freq=eval_freq,
-            deterministic=True,
+        sharpe_eval_callback = SharpeEvalCallback(
+            val_returns=val_returns,
+            n_assets=n_assets,
+            eval_freq=max(1, n_timesteps // max(1, n_envs)),
+            min_delta=0.0,
+            trading_dates=val_trading_dates,
             verbose=0,
         )
 
         try:
-            model.learn(total_timesteps=n_timesteps, callback=eval_callback, progress_bar=show_progress)
+            model.learn(
+                total_timesteps=n_timesteps,
+                callback=sharpe_eval_callback,
+                progress_bar=show_progress,
+            )
         except (AssertionError, ValueError):
             return float("nan")
         finally:
             env.close()
-            eval_env.close()
 
-        if eval_callback.is_pruned:
-            raise optuna.TrialPruned()
-
-        return (
-            eval_callback.last_mean_reward
-            if eval_callback.last_mean_reward is not None
-            else float("nan")
+        sharpe, _ = deterministic_validation_walk(
+            model,
+            val_returns,
+            n_assets,
+            trading_dates=val_trading_dates,
         )
+        trial.report(sharpe, 1)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+        return sharpe
 
     device = _get_ppo_device()
     if device == "cpu":
         torch.set_num_threads(1 if single_thread else PPO_CPU_THREADS)
-    sampler = TPESampler(n_startup_trials=5, seed=42)
+    sampler = TPESampler(n_startup_trials=10, seed=42)
     pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=max(n_evaluations // 3, 1))
 
     META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -339,6 +331,9 @@ def _previous_best_to_enqueue(path: Path | None = None) -> dict[str, Any] | None
     if any(data.get(k) is None for k in keys):
         return None
     net_arch = _net_arch_to_name(pk)
+    if net_arch == "tiny":
+        # Tiny is no longer in the tuning search space; map legacy payloads to nearest supported arch.
+        net_arch = "small"
     result = {
         "learning_rate": data["learning_rate"],
         "n_steps": data["n_steps"],

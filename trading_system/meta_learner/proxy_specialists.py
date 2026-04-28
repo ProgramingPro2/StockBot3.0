@@ -19,6 +19,21 @@ def normalize_action_max_unit_exposure(action: np.ndarray) -> np.ndarray:
     return a
 
 
+def sentiment_proxy_from_close_prices(close: np.ndarray | pd.Series) -> float:
+    """
+    Momentum sentiment proxy from a close-price series (point-in-time: use only this slice).
+    Matches live fallback in ``_sentiment_proxy_from_ohlcv`` (mean of last 21 daily returns, scaled).
+    """
+    s = pd.Series(close, dtype=float) if isinstance(close, np.ndarray) else close.astype(float)
+    if s is None or len(s) < 21:
+        return 0.0
+    ret = s.pct_change().dropna().tail(21)
+    if ret.empty:
+        return 0.0
+    mean_ret = float(ret.mean())
+    return float(max(-0.5, min(0.5, mean_ret * 12)))
+
+
 def proxy_specialists_vectorized(returns_2d: np.ndarray) -> np.ndarray:
     """
     returns_2d shape (window, n_assets).

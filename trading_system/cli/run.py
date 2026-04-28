@@ -34,8 +34,11 @@ from ..config import (
     BOARDROOM_SUMMARY_ENABLED,
     CYCLE_INTERVAL_MIN,
     ENV_ALLOW_CASH_EXPOSURE,
+    sentiment_refresh_every_n_bars,
     ENV_OBS_ROLLING_FEATURES,
+    ENV_PDT_RESTRICTIONS,
     FRACTIONAL,
+    PDT_MIN_ACCOUNT_EQUITY,
     LIVE_PPO_MODEL_PATH,
     META_LEARNER_MODEL_DIR,
     MIN_HOLD_MINUTES_AFTER_BUY,
@@ -53,6 +56,11 @@ from ..config import (
     TRADE_TICKERS,
 )
 from ..utils.logger import get_logger, is_debug, set_debug, setup_logger
+from ..utils.pdt import (
+    pdt_tracker_from_config,
+    rebalance_multi_asset,
+    session_date_from_index,
+)
 
 setup_logger()
 logger = get_logger()
@@ -127,15 +135,12 @@ def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = 
 def _sentiment_proxy_from_ohlcv(ticker: str) -> float:
     """Compute momentum-based sentiment proxy from OHLCV when real sentiment unavailable."""
     from ..data.loader import load_ohlcv
+    from ..meta_learner.proxy_specialists import sentiment_proxy_from_close_prices
 
     df = load_ohlcv(ticker)
-    if df.empty or "close" not in df.columns or len(df) < 21:
+    if df.empty or "close" not in df.columns:
         return 0.0
-    ret = df["close"].pct_change().dropna().tail(21)
-    if ret.empty:
-        return 0.0
-    mean_ret = float(ret.mean())
-    return float(max(-0.5, min(0.5, mean_ret * 12)))
+    return sentiment_proxy_from_close_prices(df["close"])
 
 
 def _rolling_features_from_ohlcv(close_series) -> dict:
@@ -421,6 +426,20 @@ def cmd_train(args: argparse.Namespace) -> None:
             tuned_n = ppo_kwargs.get("n_steps")
             if tuned_n is not None and tuned_n > PPO_N_STEPS:
                 ppo_kwargs["n_steps"] = PPO_N_STEPS
+            tuned_lr = ppo_kwargs.get("learning_rate")
+            if (
+                tuned_lr is not None
+                and args.timesteps >= 200_000
+                and float(tuned_lr) < 1e-4
+            ):
+                new_lr = 1e-4
+                logger.warning(
+                    "Tuned LR %.2e is small for %d steps; clamping to %.2e",
+                    float(tuned_lr),
+                    args.timesteps,
+                    new_lr,
+                )
+                ppo_kwargs["learning_rate"] = new_lr
             logger.info("Using tuned hyperparameters from previous tune run")
         else:
             logger.warning("No tuned params found; run 'tune' first")
@@ -431,6 +450,13 @@ def cmd_train(args: argparse.Namespace) -> None:
         if historical_returns is not None
         else None
     )
+    historical_trading_dates = None
+    validation_trading_dates = None
+    if historical_returns is not None and aligned_full is not None:
+        nh = len(historical_returns)
+        historical_trading_dates = aligned_full.index[:nh]
+        if validation_returns is not None:
+            validation_trading_dates = aligned_full.index[nh : nh + len(validation_returns)]
     dated_path = trader.train(
         total_timesteps=args.timesteps,
         specialist_fn=specialist_fn_for_train,
@@ -440,6 +466,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         ppo_kwargs=ppo_kwargs,
         n_envs=getattr(args, "n_envs", None),
         daily_aux_features=daily_aux_features,
+        historical_trading_dates=historical_trading_dates,
+        validation_trading_dates=validation_trading_dates,
     )
     logger.info("Training complete. Models saved.")
 
@@ -656,31 +684,31 @@ def _run_backtest(
     last_sell_bar: np.ndarray = np.full(n_assets, -999, dtype=np.int64)
     cost_bps = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
     turnover_pct = 0.0
+    pdt_tracker = pdt_tracker_from_config()
 
     returns_mat = aligned[return_cols].fillna(0).values.astype(np.float32)
-    from ..meta_learner.proxy_specialists import precompute_proxy_feature_matrix, tuple_to_specialist_dict
+    from ..meta_learner.proxy_specialists import (
+        precompute_proxy_feature_matrix,
+        sentiment_proxy_from_close_prices,
+        tuple_to_specialist_dict,
+    )
 
     precomp = precompute_proxy_feature_matrix(returns_mat, window)
-
-    def _can_trade_after_buy(bar: int, last_buy: int, min_hold: int) -> bool:
-        if last_buy < 0:
-            return True
-        if min_hold <= 0:
-            return bar > last_buy
-        return (bar - last_buy) >= min_hold
-
-    def _can_trade_after_sell(bar: int, last_sell: int, min_re: int) -> bool:
-        if last_sell < 0:
-            return True
-        if min_re <= 0:
-            return bar > last_sell
-        return (bar - last_sell) >= min_re
+    ollama_every_n_bars = sentiment_refresh_every_n_bars()
+    cached_sentiment = np.zeros(n_assets, dtype=np.float64)
 
     for t in range(window, n):
         specialist_list = [
             tuple_to_specialist_dict(tuple(float(x) for x in precomp[t, i]))
             for i in range(n_assets)
         ]
+        bar_off = t - window
+        if bar_off % ollama_every_n_bars == 0:
+            for i, sym in enumerate(tickers):
+                close_slice = aligned[sym].iloc[: t + 1]
+                cached_sentiment[i] = sentiment_proxy_from_close_prices(close_slice)
+        for i in range(n_assets):
+            specialist_list[i]["sentiment"] = float(cached_sentiment[i])
         # Pass current portfolio weights so PPO sees same observation structure as in training
         current_holdings = (
             effective_weights.copy()
@@ -701,32 +729,38 @@ def _run_backtest(
         rebalance_band = max(MIN_TRADE_NOTIONAL, portfolio_value * REBALANCE_BAND_PCT)
         traded = False
 
+        sessd = session_date_from_index(aligned.index, t)
         if effective_weights is None:
-            effective_weights = np.array(target_holdings, dtype=np.float64)
-            for i in range(n_assets):
-                if target_holdings[i] > 1e-6:
-                    last_buy_bar[i] = t
-            prev_position_sum = float(np.sum(effective_weights))
-            rebalance_dates.append(aligned.index[t])
-            rebalance_trades.append([(tickers[i], float(target_holdings[i] * 100)) for i in range(n_assets) if target_holdings[i] > 1e-6])
-            rebalance_direction.append(1 if exposure > 0 else 0)
-            turnover_pct = float(np.sum(np.abs(effective_weights)))
-            traded = True
-        else:
-            new_effective = effective_weights.copy()
-            for i in range(n_assets):
-                current_value_i = portfolio_value * effective_weights[i]
-                target_value_i = portfolio_value * target_holdings[i]
-                is_increase = target_value_i > current_value_i + rebalance_band
-                is_decrease = current_value_i > target_value_i + rebalance_band
-                if is_increase:
-                    if _can_trade_after_sell(t, last_sell_bar[i], min_reentry_bars):
-                        new_effective[i] = target_holdings[i]
+            if ENV_PDT_RESTRICTIONS and pdt_tracker.should_block_new_opens(portfolio_value, sessd):
+                effective_weights = np.zeros(n_assets, dtype=np.float64)
+                prev_position_sum = 0.0
+                traded = False
+            else:
+                effective_weights = np.array(target_holdings, dtype=np.float64)
+                for i in range(n_assets):
+                    if target_holdings[i] > 1e-6:
                         last_buy_bar[i] = t
-                elif is_decrease:
-                    if _can_trade_after_buy(t, last_buy_bar[i], min_hold_bars):
-                        new_effective[i] = target_holdings[i]
-                        last_sell_bar[i] = t
+                prev_position_sum = float(np.sum(effective_weights))
+                rebalance_dates.append(aligned.index[t])
+                rebalance_trades.append([(tickers[i], float(target_holdings[i] * 100)) for i in range(n_assets) if target_holdings[i] > 1e-6])
+                rebalance_direction.append(1 if exposure > 0 else 0)
+                turnover_pct = float(np.sum(np.abs(effective_weights)))
+                traded = True
+        else:
+            new_effective, last_buy_bar, last_sell_bar = rebalance_multi_asset(
+                effective_weights,
+                target_holdings,
+                portfolio_value,
+                rebalance_band,
+                t,
+                last_buy_bar,
+                last_sell_bar,
+                min_hold_bars,
+                min_reentry_bars,
+                pdt_tracker,
+                sessd,
+                portfolio_value,
+            )
             traded = np.any(np.abs(new_effective - effective_weights) > 1e-6)
             turnover_pct = float(np.sum(np.abs(new_effective - effective_weights)))
             if traded:
@@ -861,6 +895,7 @@ def cmd_tune(args: argparse.Namespace) -> None:
         study_name,
         n_envs if n_envs is not None else PPO_N_ENVS,
     )
+    tune_trading_dates = aligned.index[: len(tuning_returns)]
     best = run_tuning(
         returns_array=tuning_returns,
         n_assets=n_assets,
@@ -872,6 +907,7 @@ def cmd_tune(args: argparse.Namespace) -> None:
         load_if_exists=load_if_exists,
         fixed_historical_ratio=fixed_historical_ratio,
         single_thread=single_thread,
+        historical_trading_dates=tune_trading_dates,
     )
     logger.info("Tuning complete. Best params saved to %s", PPO_TUNE_PARAMS_PATH)
     try:
@@ -1183,13 +1219,18 @@ def cmd_live(args: argparse.Namespace) -> None:
     last_trading_date: date | None = None
     last_ollama_time = 0.0
     cached_boardroom_summary: str | None = None
+    pdt_tracker = pdt_tracker_from_config()
 
     while True:
         try:
-            today = date.today()
-            if last_trading_date is not None and today != last_trading_date:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo("America/New_York")
+            ny_today = datetime.now(tz).date()
+            if last_trading_date is not None and ny_today != last_trading_date:
                 bought_today.clear()
-            last_trading_date = today
+            last_trading_date = ny_today
 
             account = broker.get_account()
             cash = float(account.get("cash", 0))
@@ -1209,10 +1250,9 @@ def cmd_live(args: argparse.Namespace) -> None:
                 logger.debug("Alpaca positions: none")
 
             position_symbols = [p["symbol"] for p in alpaca_positions]
-            from zoneinfo import ZoneInfo
 
             bought_today = broker.get_symbols_bought_on_date(
-                today, position_symbols, ZoneInfo("America/New_York")
+                ny_today, position_symbols, tz
             )
 
             do_ollama = (time.time() - last_ollama_time) >= (OLLAMA_INTERVAL_MIN * 60)
@@ -1278,8 +1318,8 @@ def cmd_live(args: argparse.Namespace) -> None:
                 continue
 
             # Cooldowns: do not sell if bought recently; do not buy if sold recently
-            from datetime import datetime, timedelta
-            tz = ZoneInfo("America/New_York")
+            from datetime import timedelta
+
             now_dt = datetime.now(tz)
             since_hold = now_dt - timedelta(minutes=MIN_HOLD_MINUTES_AFTER_BUY)
             since_reentry = now_dt - timedelta(minutes=MIN_REENTRY_MINUTES_AFTER_SELL)
@@ -1321,6 +1361,10 @@ def cmd_live(args: argparse.Namespace) -> None:
                 if target_value > current_value + rebalance_band:
                     if t in sold_since:
                         logger.info("HOLD %s: skip buy (re-entry cooldown)", t)
+                    elif ENV_PDT_RESTRICTIONS and pdt_tracker.should_block_new_opens(
+                        portfolio_value, ny_today
+                    ):
+                        logger.info("HOLD %s: skip buy (PDT new-open freeze)", t)
                     elif cash <= 0:
                         logger.debug("HOLD %s: skip buy (no margin)", t)
                     else:
@@ -1343,9 +1387,24 @@ def cmd_live(args: argparse.Namespace) -> None:
                             else:
                                 logger.warning("No price for %s; skipping buy", t)
                 elif current_value > target_value + rebalance_band:
-                    if t in bought_today or t in bought_since:
-                        logger.info("HOLD %s: skip sell (bought today or within hold period)", t)
-                    elif current_value <= 0:
+                    if t in bought_since:
+                        logger.info("HOLD %s: skip sell (within hold period)", t)
+                        continue
+                    if t in bought_today:
+                        if not ENV_PDT_RESTRICTIONS:
+                            logger.info("HOLD %s: skip sell (bought today)", t)
+                            continue
+                        if portfolio_value < PDT_MIN_ACCOUNT_EQUITY and not pdt_tracker.can_open_new_day_trade(
+                            ny_today
+                        ):
+                            logger.info("HOLD %s: skip sell (PDT rolling day-trade limit)", t)
+                            continue
+                    record_pdt_on_sell = (
+                        ENV_PDT_RESTRICTIONS
+                        and portfolio_value < PDT_MIN_ACCOUNT_EQUITY
+                        and t in bought_today
+                    )
+                    if current_value <= 0:
                         logger.debug("HOLD %s: no long position to reduce (current_value=%.2f)", t, current_value)
                     else:
                         notional = min(current_value - target_value, current_value)
@@ -1357,6 +1416,8 @@ def cmd_live(args: argparse.Namespace) -> None:
                             if sell_all:
                                 if broker.close_position(t):
                                     logger.info("SELL ALL %s (was $%.2f)", t, current_value)
+                                    if record_pdt_on_sell:
+                                        pdt_tracker.record_day_trade(ny_today)
                                     send_discord_notification(
                                         t, "SELL", position_pct, outputs,
                                         {"close_position": True, "notional": current_value, "status": "closed"},
@@ -1367,6 +1428,8 @@ def cmd_live(args: argparse.Namespace) -> None:
                                 order = broker.place_order(t, notional=notional, side="sell")
                                 if order:
                                     logger.info("SELL %s: $%.2f", t, notional)
+                                    if record_pdt_on_sell:
+                                        pdt_tracker.record_day_trade(ny_today)
                                     send_discord_notification(t, "SELL", position_pct, outputs, order)
                             else:
                                 current_qty = float(current_pos.get("qty", 0))
@@ -1376,6 +1439,8 @@ def cmd_live(args: argparse.Namespace) -> None:
                                     if would_sell_qty >= current_qty * 0.95:
                                         if broker.close_position(t):
                                             logger.info("SELL ALL %s (was %d shares)", t, int(current_qty))
+                                            if record_pdt_on_sell:
+                                                pdt_tracker.record_day_trade(ny_today)
                                             send_discord_notification(
                                                 t, "SELL", position_pct, outputs,
                                                 {"close_position": True, "notional": current_value, "status": "closed"},
@@ -1384,6 +1449,8 @@ def cmd_live(args: argparse.Namespace) -> None:
                                         order = broker.place_order(t, qty=would_sell_qty, side="sell")
                                         if order:
                                             logger.info("SELL %s: %d shares @ ~$%.2f", t, would_sell_qty, price)
+                                            if record_pdt_on_sell:
+                                                pdt_tracker.record_day_trade(ny_today)
                                             send_discord_notification(t, "SELL", position_pct, outputs, order)
                                 else:
                                     logger.warning("No position or price for %s; skipping sell", t)

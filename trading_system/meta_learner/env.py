@@ -5,8 +5,11 @@ Observation: per-asset [sentiment, quant_prob, fund_score, regime_flag, momentum
 Action: position size % per asset (normalized so sum <= 1 before execution, matching live/backtest).
 Reward: log utility of portfolio return minus drawdown and turnover costs.
 """
+from __future__ import annotations
+
 import gymnasium as gym
 import numpy as np
+import pandas as pd
 from gymnasium import spaces
 
 from ..config import (
@@ -14,11 +17,15 @@ from ..config import (
     ENV_OBS_ROLLING_FEATURES,
     ENV_REWARD_DRAWDOWN_PENALTY,
     ENV_ROLLING_SHARPE_DAYS,
+    MIN_HOLD_MINUTES_AFTER_BUY,
+    MIN_REENTRY_MINUTES_AFTER_SELL,
     MIN_TRADE_NOTIONAL,
+    REBALANCE_BAND_PCT,
     SLIPPAGE_BPS,
     STARTING_CAPITAL,
     TRANSACTION_COST_BPS,
 )
+from ..utils.pdt import pdt_tracker_from_config, rebalance_multi_asset, session_date_from_index
 from .proxy_specialists import (
     merge_daily_aux_into_proxy_row,
     normalize_action_max_unit_exposure,
@@ -121,6 +128,9 @@ class TradingEnv(gym.Env):
         self._rolling_vols: np.ndarray | None = None
         self._bootstrap_returns: np.ndarray | None = None
         self._bootstrap_idx: int = 0
+        self._pdt_tracker = pdt_tracker_from_config()
+        self._last_buy_bar = np.full(self.n_assets, -999, dtype=np.int64)
+        self._last_sell_bar = np.full(self.n_assets, -999, dtype=np.int64)
 
     def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
@@ -129,6 +139,9 @@ class TradingEnv(gym.Env):
         self._equity_peak = 1.0
         self._holdings = np.zeros(self.n_assets, dtype=np.float32)
         self._step_count = 0
+        self._pdt_tracker = pdt_tracker_from_config()
+        self._last_buy_bar = np.full(self.n_assets, -999, dtype=np.int64)
+        self._last_sell_bar = np.full(self.n_assets, -999, dtype=np.int64)
         specialist = options.get("specialist_outputs", []) if options else []
         if isinstance(specialist, dict):
             specialist = [specialist] * self.n_assets
@@ -150,9 +163,32 @@ class TradingEnv(gym.Env):
         self._step_count += 1
         action = normalize_action_max_unit_exposure(action)
 
-        min_trade_equity = MIN_TRADE_NOTIONAL / STARTING_CAPITAL
         equity = float(self._equity_history[-1])
-        effective_holdings = _effective_holdings_min_trade(action, self._holdings, equity, min_trade_equity)
+        portfolio_value = equity * STARTING_CAPITAL
+        rebalance_band = max(MIN_TRADE_NOTIONAL, portfolio_value * REBALANCE_BAND_PCT)
+        _day_m = 24 * 60
+        min_hold_bars = 1 if MIN_HOLD_MINUTES_AFTER_BUY >= _day_m else 0
+        min_reentry_bars = 1 if MIN_REENTRY_MINUTES_AFTER_SELL >= _day_m else 0
+        bar = int(self._step_count)
+        sess = int(bar)
+        h = self._holdings.astype(np.float64)
+        target = np.asarray(action, dtype=np.float64)
+        eh, lb, ls = rebalance_multi_asset(
+            h,
+            target,
+            portfolio_value,
+            rebalance_band,
+            bar,
+            self._last_buy_bar,
+            self._last_sell_bar,
+            min_hold_bars,
+            min_reentry_bars,
+            self._pdt_tracker,
+            sess,
+            portfolio_value,
+        )
+        self._last_buy_bar, self._last_sell_bar = lb, ls
+        effective_holdings = eh.astype(np.float32)
         turnover = float(np.sum(np.abs(effective_holdings - self._holdings)))
         self._holdings = effective_holdings
 
@@ -252,12 +288,14 @@ class HistoricalTradingEnv(gym.Env):
         drawdown_penalty: float | None = None,
         render_mode: str | None = None,
         daily_aux_features: np.ndarray | None = None,
+        trading_dates: np.ndarray | pd.DatetimeIndex | list | None = None,
     ):
         """
         Args:
             returns_array: Shape (n_days, n_assets), daily returns per asset.
             n_assets: Number of assets.
             daily_aux_features: Optional (n_days, n_assets, 2) for atr_pct, volume_ratio.
+            trading_dates: Optional length n_days calendar index for PDT session keys.
         """
         super().__init__()
         self.returns_array = np.asarray(returns_array, dtype=np.float32)
@@ -306,6 +344,13 @@ class HistoricalTradingEnv(gym.Env):
         from .proxy_specialists import precompute_proxy_feature_matrix
         self._proxy_cache = precompute_proxy_feature_matrix(self.returns_array, window=21)
 
+        self._trading_dates: pd.DatetimeIndex | None = None
+        if trading_dates is not None:
+            td = pd.DatetimeIndex(trading_dates)
+            if len(td) != self.n_days:
+                raise ValueError("trading_dates length must match returns_array n_days")
+            self._trading_dates = td
+
     def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
         min_start = 21 + self.rolling_sharpe_days
@@ -320,6 +365,9 @@ class HistoricalTradingEnv(gym.Env):
         self._equity_history = [1.0]
         self._equity_peak = 1.0
         self._holdings = np.zeros(self.n_assets, dtype=np.float32)
+        self._pdt_tracker = pdt_tracker_from_config()
+        self._last_buy_bar = np.full(self.n_assets, -999, dtype=np.int64)
+        self._last_sell_bar = np.full(self.n_assets, -999, dtype=np.int64)
 
         obs = self._get_obs()
         return obs, {}
@@ -328,9 +376,35 @@ class HistoricalTradingEnv(gym.Env):
         self._step_in_episode += 1
         action = normalize_action_max_unit_exposure(action)
 
-        min_trade_equity = MIN_TRADE_NOTIONAL / STARTING_CAPITAL
         equity = float(self._equity_history[-1])
-        effective_holdings = _effective_holdings_min_trade(action, self._holdings, equity, min_trade_equity)
+        portfolio_value = equity * STARTING_CAPITAL
+        rebalance_band = max(MIN_TRADE_NOTIONAL, portfolio_value * REBALANCE_BAND_PCT)
+        _day_m = 24 * 60
+        min_hold_bars = 1 if MIN_HOLD_MINUTES_AFTER_BUY >= _day_m else 0
+        min_reentry_bars = 1 if MIN_REENTRY_MINUTES_AFTER_SELL >= _day_m else 0
+        bar = int(self._cursor)
+        if self._trading_dates is not None:
+            sess = session_date_from_index(self._trading_dates, bar)
+        else:
+            sess = int(bar)
+        h = self._holdings.astype(np.float64)
+        target = np.asarray(action, dtype=np.float64)
+        eh, lb, ls = rebalance_multi_asset(
+            h,
+            target,
+            portfolio_value,
+            rebalance_band,
+            bar,
+            self._last_buy_bar,
+            self._last_sell_bar,
+            min_hold_bars,
+            min_reentry_bars,
+            self._pdt_tracker,
+            sess,
+            portfolio_value,
+        )
+        self._last_buy_bar, self._last_sell_bar = lb, ls
+        effective_holdings = eh.astype(np.float32)
         turnover = float(np.sum(np.abs(effective_holdings - self._holdings)))
         self._holdings = effective_holdings
 

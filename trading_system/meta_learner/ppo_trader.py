@@ -18,8 +18,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from ..config import (
     ENV_EPISODE_DAYS,
@@ -45,6 +45,7 @@ from ..config import (
 )
 from ..utils.output_cleanup import prune_checkpoints
 from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
+from .eval_helpers import SharpeEvalCallback
 from .proxy_specialists import normalize_action_max_unit_exposure
 
 
@@ -57,7 +58,7 @@ class EarlyStoppingCallback(BaseCallback):
 
     def __init__(
         self,
-        eval_callback: EvalCallback,
+        eval_callback: BaseCallback,
         patience: int = 5,
         min_delta: float = 0.01,
         verbose: int = 0,
@@ -195,6 +196,7 @@ def _make_env_fn(
     specialist_fn: Callable[[], list[dict]] | None,
     seed: int,
     daily_aux_features: np.ndarray | None = None,
+    historical_trading_dates: Any = None,
 ) -> gym.Env:
     """
     Picklable factory that creates one env for SubprocVecEnv.
@@ -211,12 +213,14 @@ def _make_env_fn(
             returns_array=historical_returns,
             n_assets=n_assets,
             daily_aux_features=daily_aux_features,
+            trading_dates=historical_trading_dates,
         )
     elif mode == "mixed" and historical_returns is not None and 0 < historical_ratio < 1:
         hist_env = HistoricalTradingEnv(
             returns_array=historical_returns,
             n_assets=n_assets,
             daily_aux_features=daily_aux_features,
+            trading_dates=historical_trading_dates,
         )
         synth_env = SpecialistWrapper(
             n_assets=n_assets,
@@ -294,6 +298,8 @@ class PPOTrader:
         ppo_kwargs: dict[str, Any] | None = None,
         n_envs: int | None = None,
         daily_aux_features: np.ndarray | None = None,
+        historical_trading_dates: Any = None,
+        validation_trading_dates: Any = None,
     ) -> Path | None:
         """
         Train PPO on simulated or historical episodes.
@@ -343,6 +349,7 @@ class PPOTrader:
                 specialist_fn=specialist_fn,
                 seed=0,
                 daily_aux_features=daily_aux_features,
+                historical_trading_dates=historical_trading_dates,
             )
         else:
             env_fns = [
@@ -355,6 +362,7 @@ class PPOTrader:
                     specialist_fn=specialist_fn,
                     seed=i,
                     daily_aux_features=daily_aux_features,
+                    historical_trading_dates=historical_trading_dates,
                 )
                 for i in range(n_envs)
             ]
@@ -427,12 +435,13 @@ class PPOTrader:
                     name_prefix="ppo_trader",
                 )
             )
+        sharpe_eval_callback: SharpeEvalCallback | None = None
+        best_snapshot_path = META_LEARNER_MODEL_DIR / "ppo_best.zip"
         if (
             (historical_returns is not None or validation_returns is not None)
             and PPO_EARLY_STOPPING_EVAL_FREQ > 0
             and PPO_EARLY_STOPPING_PATIENCE > 0
         ):
-            from stable_baselines3.common.monitor import Monitor
             eval_returns = validation_returns if validation_returns is not None and len(validation_returns) > 0 else historical_returns
             eval_aux = None
             if (
@@ -440,26 +449,44 @@ class PPOTrader:
                 and daily_aux_features.shape[0] == len(eval_returns)
             ):
                 eval_aux = daily_aux_features
-            eval_env = HistoricalTradingEnv(
-                returns_array=eval_returns,
-                n_assets=self.n_assets,
-                daily_aux_features=eval_aux,
+            if (
+                validation_returns is not None
+                and validation_trading_dates is not None
+                and len(validation_trading_dates) == len(eval_returns)
+            ):
+                eval_trading_dates = validation_trading_dates
+            elif historical_trading_dates is not None:
+                eval_trading_dates = historical_trading_dates[: len(eval_returns)]
+            else:
+                eval_trading_dates = None
+            # Keep eval env type aligned with vec env usage (and avoid Subproc vs Monitor mismatch warnings).
+            _ = DummyVecEnv(
+                [
+                    lambda: HistoricalTradingEnv(
+                        returns_array=eval_returns,
+                        n_assets=self.n_assets,
+                        daily_aux_features=eval_aux,
+                        trading_dates=eval_trading_dates,
+                    )
+                ]
             )
-            eval_env = Monitor(eval_env)
             eval_freq_calls = max(
                 1, PPO_EARLY_STOPPING_EVAL_FREQ // max(1, getattr(env, "num_envs", 1))
             )
-            eval_callback = EvalCallback(
-                eval_env,
-                n_eval_episodes=5,
+            sharpe_eval_callback = SharpeEvalCallback(
+                val_returns=eval_returns,
+                n_assets=self.n_assets,
                 eval_freq=eval_freq_calls,
-                deterministic=True,
+                min_delta=PPO_EARLY_STOPPING_MIN_DELTA,
+                best_model_save_path=best_snapshot_path,
+                daily_aux_features=eval_aux,
+                trading_dates=eval_trading_dates,
                 verbose=0,
             )
-            callbacks.append(eval_callback)
+            callbacks.append(sharpe_eval_callback)
             callbacks.append(
                 EarlyStoppingCallback(
-                    eval_callback,
+                    sharpe_eval_callback,
                     patience=PPO_EARLY_STOPPING_PATIENCE,
                     min_delta=PPO_EARLY_STOPPING_MIN_DELTA,
                     verbose=1,
@@ -478,6 +505,29 @@ class PPOTrader:
             progress_bar=True,
             callback=callbacks if callbacks else None,
         )
+
+        if (
+            sharpe_eval_callback is not None
+            and sharpe_eval_callback.has_improved
+            and best_snapshot_path.exists()
+        ):
+            try:
+                self.model = PPO.load(str(best_snapshot_path), env=env, device=device)
+                logging.getLogger("boardroom").info(
+                    "Restored best snapshot at Sharpe=%.4f from %s",
+                    sharpe_eval_callback.best_mean_reward,
+                    best_snapshot_path,
+                )
+            except Exception as ex:
+                logging.getLogger("boardroom").warning(
+                    "Failed to restore best snapshot from %s: %s",
+                    best_snapshot_path,
+                    ex,
+                )
+        elif sharpe_eval_callback is not None:
+            logging.getLogger("boardroom").info(
+                "No Sharpe improvement over min_delta; saving final model state"
+            )
 
         ck_dir = META_LEARNER_MODEL_DIR / "checkpoints"
         prune_checkpoints(ck_dir, keep=PPO_CHECKPOINT_KEEP_LAST)

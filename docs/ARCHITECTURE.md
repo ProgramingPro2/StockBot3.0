@@ -143,21 +143,21 @@ config/
 
 ## Day-trading prevention
 
-The system enforces a single rule everywhere: **do not reduce a position in the same period it was increased**.
+By default the system avoids same-period buy-then-sell on the same asset using `last_buy_bar` / `last_sell_bar` and min-hold / min-reentry rules aligned with live cooldowns.
 
-- **Live**: A set `bought_today` records tickers that were bought on the current calendar day. When the PPO signals a sell (target value below current), the live loop skips the sell for that ticker if it is in `bought_today`. The set is cleared when the date changes.
-- **Backtest**: For each bar, a per-asset `last_buy_bar[i]` stores the bar index where asset `i` was last increased. A decrease (sell) is applied only when the dollar gap exceeds `MIN_TRADE_NOTIONAL` and `last_buy_bar[i] != current_bar`, so we never sell on the same bar we bought.
-- **Training (TradingEnv and HistoricalTradingEnv)**: In each `step()`, updates are applied in two phases: (1) apply all increases that meet the notional threshold and record those assets in `increased_this_step`; (2) apply decreases only for assets that meet the threshold and are not in `increased_this_step`. So the agent never reduces a position in the same step it increased it.
+- **Live**: A set `bought_today` records tickers bought on the current America/New_York session date. When `ENV_PDT_RESTRICTIONS` is off, sells are skipped if the symbol is in `bought_today` (same as before). When PDT mode is on and portfolio value is below `PDT_MIN_ACCOUNT_EQUITY`, same-day sells are allowed only up to `PDT_MAX_DAY_TRADES` within a rolling `PDT_ROLLING_BUSINESS_DAYS` window (each qualifying sell is recorded); at the limit, new buys are skipped until the window rolls forward. Above the equity threshold, PDT limits do not apply.
+- **Backtest**: Shared `rebalance_multi_asset` logic applies the same band, cooldown bars, and optional PDT rules (`trading_system/utils/pdt.py`) per bar.
+- **Training (`TradingEnv`, `HistoricalTradingEnv`)**: Each step uses the same rebalance helper as the backtest so policy training matches execution semantics. `HistoricalTradingEnv` accepts optional `trading_dates` (aligned index) for calendar-based PDT windows; otherwise an integer cursor is used.
 
-This keeps behavior consistent across live, backtest, and training and avoids day-trade patterns.
+Alpaca may enforce PDT independently; local flags mirror policy for simulation and logging.
 
 ## Trading Modes
 
-**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` for pure historical returns, `--historical-ratio 0.7` for mixed (70% historical, 30% synthetic), or `TRAIN_HISTORICAL_RATIO` in config. When `TRAIN_HISTORICAL_RATIO` is set in `.env`, it is used as the fixed ratio for both training and tuning. Use `--use-tuned` to apply tuned hyperparameters.
+**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` for pure historical returns, `--historical-ratio 0.7` for mixed (70% historical, 30% synthetic), or `TRAIN_HISTORICAL_RATIO` in config. When `TRAIN_HISTORICAL_RATIO` is set in `.env`, it is used as the fixed ratio for both training and tuning. Use `--use-tuned` to apply tuned hyperparameters. Random historical episodes from `ProxySpecialistFn` apply the same **proxy sentiment staleness** expectation as backtest (probabilistic refresh vs carry-over, no Ollama); other proxy features still vary each sampled day.
 
 **Tune**: Run Optuna hyperparameter tuning on historical data. Best params saved to `models/meta_learner/ppo_tune_best.json`.
 
-**Backtest**: Portfolio backtest over all tickers; aligned OHLCV, proxy specialists per ticker, one portfolio equity curve and plot (`backtest_portfolio.png`).
+**Backtest**: Portfolio backtest over all tickers; aligned OHLCV, proxy specialists per ticker, one portfolio equity curve and plot (`backtest_portfolio.png`). Sentiment uses the same **OHLCV momentum proxy** as live when the LLM is not used (`sentiment_proxy_from_close_prices`), with **staleness** between refreshes: recomputed every `N` trading days where `N` = `BACKTEST_OLLAMA_EVERY_N_BARS` if set, else `max(1, OLLAMA_INTERVAL_MIN // CYCLE_INTERVAL_MIN)` so the bar cadence matches the paper/live Ollama-to-cycle ratio without any Ollama requests. Other proxy specialist fields still update every bar from the precomputed return window.
 
 **Paper**: Run specialists for all tickers each interval; one PPO prediction (5 position sizes); log exposure and weights; Discord per ticker. Use `--autodiscover` to resolve the trade list via universe autodiscovery (top N by scorer) at start.
 

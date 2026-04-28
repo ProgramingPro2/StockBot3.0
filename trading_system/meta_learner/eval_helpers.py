@@ -1,0 +1,131 @@
+"""Deterministic evaluation helpers shared by training and tuning."""
+from __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from stable_baselines3.common.callbacks import BaseCallback
+
+from .env import HistoricalTradingEnv
+
+
+def _compute_annualized_sharpe(returns: np.ndarray) -> float:
+    """Compute annualized Sharpe ratio from daily returns."""
+    if returns.size == 0:
+        return 0.0
+    mu = float(np.mean(returns))
+    sigma = float(np.std(returns))
+    if sigma <= 1e-12:
+        return 0.0
+    sharpe = (mu / sigma) * math.sqrt(252.0)
+    if not np.isfinite(sharpe):
+        return 0.0
+    return float(sharpe)
+
+
+def deterministic_validation_walk(
+    model: Any,
+    val_returns: np.ndarray,
+    n_assets: int,
+    daily_aux_features: np.ndarray | None = None,
+    trading_dates: np.ndarray | pd.DatetimeIndex | list | None = None,
+) -> tuple[float, np.ndarray]:
+    """Evaluate model on a deterministic full validation walk."""
+    returns = np.asarray(val_returns, dtype=np.float32)
+    if returns.ndim != 2 or returns.shape[1] != n_assets:
+        raise ValueError("val_returns must have shape (n_days, n_assets)")
+    if returns.shape[0] <= 2:
+        return 0.0, np.asarray([], dtype=np.float32)
+
+    env = HistoricalTradingEnv(
+        returns_array=returns,
+        n_assets=n_assets,
+        episode_days=max(1, returns.shape[0] - 1),
+        daily_aux_features=daily_aux_features,
+        trading_dates=trading_dates,
+    )
+
+    try:
+        obs, _ = env.reset(seed=0)
+        # Make evaluation deterministic and full-window (no random start offset).
+        min_start = int(21 + env.rolling_sharpe_days)
+        env._cursor = min(min_start, max(1, env.n_days - 2))
+        env._step_in_episode = 0
+        env._returns_history = []
+        env._equity_history = [1.0]
+        env._equity_peak = 1.0
+        env._holdings = np.zeros(n_assets, dtype=np.float32)
+        obs = env._get_obs()
+
+        daily_returns: list[float] = []
+        while env._cursor < env.n_days - 1:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, terminated, truncated, info = env.step(action)
+            daily_returns.append(float(info.get("return", 0.0)))
+            if terminated or truncated:
+                break
+
+        ret_arr = np.asarray(daily_returns, dtype=np.float32)
+        return _compute_annualized_sharpe(ret_arr), ret_arr
+    finally:
+        env.close()
+
+
+class SharpeEvalCallback(BaseCallback):
+    """Evaluate policy by deterministic validation Sharpe at fixed cadence."""
+
+    def __init__(
+        self,
+        val_returns: np.ndarray,
+        n_assets: int,
+        eval_freq: int,
+        *,
+        min_delta: float = 0.0,
+        best_model_save_path: Path | str | None = None,
+        daily_aux_features: np.ndarray | None = None,
+        trading_dates: np.ndarray | pd.DatetimeIndex | list | None = None,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose=verbose)
+        self.val_returns = np.asarray(val_returns, dtype=np.float32)
+        self.n_assets = n_assets
+        self.eval_freq = int(eval_freq)
+        self.min_delta = float(min_delta)
+        self.daily_aux_features = daily_aux_features
+        self.trading_dates = trading_dates
+        self.best_model_save_path = (
+            Path(best_model_save_path) if best_model_save_path is not None else None
+        )
+        self.last_mean_reward: float | None = None
+        self.best_mean_reward: float | None = None
+        self.eval_idx = 0
+        self.has_improved = False
+
+    def _on_step(self) -> bool:
+        if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
+            return True
+
+        self.eval_idx += 1
+        sharpe, _ = deterministic_validation_walk(
+            self.model,
+            self.val_returns,
+            self.n_assets,
+            daily_aux_features=self.daily_aux_features,
+            trading_dates=self.trading_dates,
+        )
+        self.last_mean_reward = float(sharpe)
+
+        improved = (
+            self.best_mean_reward is None
+            or self.last_mean_reward > (self.best_mean_reward + self.min_delta)
+        )
+        if improved:
+            self.best_mean_reward = self.last_mean_reward
+            self.has_improved = True
+            if self.best_model_save_path is not None:
+                self.best_model_save_path.parent.mkdir(parents=True, exist_ok=True)
+                self.model.save(str(self.best_model_save_path))
+        return True
