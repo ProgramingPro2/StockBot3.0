@@ -94,6 +94,10 @@ Options:
 
 Training runs specialists (TFT on all tickers, fundamental/regime as before) and the PPO meta-learner. Use `--use-historical` for pure historical data, or `--historical-ratio 0.7` for 70% historical / 30% synthetic. Set `TRAIN_HISTORICAL_RATIO` in `.env` for a default ratio.
 
+### Performance and benchmarking
+
+See [docs/perf-sprint.md](docs/perf-sprint.md) for wall-clock tuning notes, `BENCH_TRACE=1`, `PPO_USE_DUMMY_VEC`, `PPO_TORCH_COMPILE`, specialist throughput env vars (`TFT_*`, `XGB_*`, `REGIME_VAE_*`), and baseline commands.
+
 ### Hyperparameter Tuning (Optuna)
 
 Run automatic hyperparameter tuning before training to find better PPO settings:

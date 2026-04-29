@@ -6,12 +6,10 @@ import random
 from typing import Callable
 
 import numpy as np
-import pandas as pd
 
 from ..config import sentiment_refresh_every_n_bars
 from .proxy_specialists import (
     proxy_specialists_from_returns_np,
-    sentiment_proxy_from_close_prices,
     tuple_to_specialist_dict,
 )
 
@@ -44,17 +42,13 @@ class ProxySpecialistFn:
         n_every = sentiment_refresh_every_n_bars()
         refresh = self._last_sentiment_vec is None or random.random() < (1.0 / n_every)
         if refresh:
-            sentiments: list[float] = []
-            for i in range(self.n_assets):
-                # Synthetic cumulative close from daily returns up to ``start`` (scale-free for pct_change).
-                rets = self.returns_array[1 : start + 1, i]
-                if len(rets) == 0:
-                    sentiments.append(0.0)
-                else:
-                    r = np.nan_to_num(rets.astype(np.float64), nan=0.0)
-                    closes = np.cumprod(np.concatenate([[1.0], 1.0 + r]))
-                    sentiments.append(sentiment_proxy_from_close_prices(pd.Series(closes)))
-            self._last_sentiment_vec = np.array(sentiments, dtype=np.float64)
+            rets_block = self.returns_array[1 : start + 1, :]
+            if rets_block.shape[0] == 0:
+                self._last_sentiment_vec = np.zeros(self.n_assets, dtype=np.float64)
+            else:
+                from .proxy_specialists import sentiment_proxy_batch_from_returns_block
+
+                self._last_sentiment_vec = sentiment_proxy_batch_from_returns_block(rets_block)
         out: list[dict] = []
         for i in range(self.n_assets):
             d = tuple_to_specialist_dict(

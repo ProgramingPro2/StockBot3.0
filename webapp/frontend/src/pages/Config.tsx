@@ -65,7 +65,7 @@ export default function ConfigPage() {
     <div className="space-y-6">
       <PageHeader
         title="Environment configuration"
-        description="Edit values backed by the project's .env file. Comments are preserved."
+        description="Edit values backed by the project's .env file. Comments on each key override hints. Extra or override hints live in webapp/backend/data/env_var_hints.json."
         icon={<Settings className="h-6 w-6" />}
         actions={
           <div className="flex items-center gap-2">
@@ -123,14 +123,15 @@ export default function ConfigPage() {
                   <input
                     type={v.secret && !reveal && !revealed[v.key] ? "password" : "text"}
                     className="input mt-1"
+                    title={v.description ?? undefined}
                     value={drafts[v.key] ?? ""}
                     onChange={(e) =>
                       setDrafts((d) => ({ ...d, [v.key]: e.target.value }))
                     }
                   />
-                  {v.description && (
+                  {v.description ? (
                     <p className="text-xs text-ink-muted mt-1">{v.description}</p>
-                  )}
+                  ) : null}
                 </div>
               ))}
             </div>

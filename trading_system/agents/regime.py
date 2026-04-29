@@ -1,6 +1,7 @@
 """
 Market Regime Specialist: VAE for regime detection.
 """
+import os
 import pickle
 from pathlib import Path
 
@@ -130,14 +131,16 @@ def _ensure_model(retrain: bool = False) -> bool:
     X = np.nan_to_num(X, nan=0.0)
 
     dataset = torch.FloatTensor(X)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=True)
+    _bs = int(os.getenv("REGIME_VAE_BATCH_SIZE", "64").strip() or "64")
+    loader = torch.utils.data.DataLoader(dataset, batch_size=_bs, shuffle=True)
 
     vae = VAE(input_dim, VAE_LATENT_DIM, VAE_HIDDEN_DIMS)
     vae.to(_get_device())
     opt = torch.optim.Adam(vae.parameters(), lr=1e-3)
 
     from tqdm import tqdm
-    for epoch in tqdm(range(50), desc="Regime VAE", unit="epoch"):
+    _epochs = int(os.getenv("REGIME_VAE_EPOCHS", "50").strip() or "50")
+    for epoch in tqdm(range(_epochs), desc="Regime VAE", unit="epoch"):
         for batch in loader:
             batch = batch.to(_get_device())
             opt.zero_grad()

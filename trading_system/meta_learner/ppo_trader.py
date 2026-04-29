@@ -47,8 +47,9 @@ from ..utils.graceful_shutdown import should_stop
 from ..utils.output_cleanup import prune_checkpoints
 from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
 from .eval_helpers import SharpeEvalCallback
+from .bench_trace import trace_block, trace_enabled
 from .metrics_callback import JsonlMetricsCallback, metrics_path
-from .proxy_specialists import normalize_action_max_unit_exposure
+from .proxy_specialists import normalize_action_max_unit_exposure, precompute_proxy_feature_matrix
 from .runs_index import (
     make_run_id,
     record_end,
@@ -230,6 +231,7 @@ def _make_env_fn(
     seed: int,
     daily_aux_features: np.ndarray | None = None,
     historical_trading_dates: Any = None,
+    proxy_feature_cache: np.ndarray | None = None,
 ) -> gym.Env:
     """
     Picklable factory that creates one env for SubprocVecEnv.
@@ -247,6 +249,7 @@ def _make_env_fn(
             n_assets=n_assets,
             daily_aux_features=daily_aux_features,
             trading_dates=historical_trading_dates,
+            proxy_feature_cache=proxy_feature_cache,
         )
     elif mode == "mixed" and historical_returns is not None and 0 < historical_ratio < 1:
         hist_env = HistoricalTradingEnv(
@@ -254,6 +257,7 @@ def _make_env_fn(
             n_assets=n_assets,
             daily_aux_features=daily_aux_features,
             trading_dates=historical_trading_dates,
+            proxy_feature_cache=proxy_feature_cache,
         )
         synth_env = SpecialistWrapper(
             n_assets=n_assets,
@@ -333,6 +337,8 @@ class PPOTrader:
         daily_aux_features: np.ndarray | None = None,
         historical_trading_dates: Any = None,
         validation_trading_dates: Any = None,
+        proxy_feature_cache: np.ndarray | None = None,
+        ignore_early_stopping: bool = False,
     ) -> Path | None:
         """
         Train PPO on simulated or historical episodes.
@@ -344,6 +350,7 @@ class PPOTrader:
         validation_returns: if provided, used for early-stopping eval (out-of-sample vs training).
         ppo_kwargs: optional overrides for PPO hyperparameters (e.g. from tuning).
         n_envs: parallel env count for SubprocVecEnv; None = use PPO_N_ENVS.
+        ignore_early_stopping: if True, run full timesteps even when early stopping is configured.
         """
         kwargs = dict(ppo_kwargs or {})
         best_value = kwargs.pop("best_value", None)
@@ -373,17 +380,29 @@ class PPOTrader:
         if n_envs > 1:
             os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-        if n_envs <= 1:
-            env = _make_env_fn(
-                mode=mode,
-                historical_returns=historical_returns,
-                n_assets=self.n_assets,
-                historical_ratio=historical_ratio,
-                specialist_fn=specialist_fn,
-                seed=0,
-                daily_aux_features=daily_aux_features,
-                historical_trading_dates=historical_trading_dates,
+        use_dummy_vec = os.environ.get("PPO_USE_DUMMY_VEC", "").strip().lower() in ("1", "true", "yes")
+
+        if trace_enabled():
+            logging.getLogger("boardroom").info(
+                "BENCH_TRACE train build_env n_envs=%s dummy_vec=%s cache=%s",
+                n_envs,
+                use_dummy_vec,
+                proxy_feature_cache is not None,
             )
+
+        if n_envs <= 1:
+            with trace_block("ppo_train_make_env_single"):
+                env = _make_env_fn(
+                    mode=mode,
+                    historical_returns=historical_returns,
+                    n_assets=self.n_assets,
+                    historical_ratio=historical_ratio,
+                    specialist_fn=specialist_fn,
+                    seed=0,
+                    daily_aux_features=daily_aux_features,
+                    historical_trading_dates=historical_trading_dates,
+                    proxy_feature_cache=proxy_feature_cache,
+                )
         else:
             env_fns = [
                 partial(
@@ -396,19 +415,27 @@ class PPOTrader:
                     seed=i,
                     daily_aux_features=daily_aux_features,
                     historical_trading_dates=historical_trading_dates,
+                    proxy_feature_cache=proxy_feature_cache,
                 )
                 for i in range(n_envs)
             ]
-            try:
-                if sys.platform != "win32":
-                    env = SubprocVecEnv(env_fns, start_method="forkserver")
+            with trace_block("ppo_train_make_vec_env", n_envs=n_envs):
+                if use_dummy_vec:
+                    env = DummyVecEnv(env_fns)
+                    logging.getLogger("boardroom").info(
+                        "PPO training with %d parallel envs (DummyVecEnv)", n_envs
+                    )
                 else:
-                    env = SubprocVecEnv(env_fns)
-            except TypeError:
-                env = SubprocVecEnv(env_fns)
-            logging.getLogger("boardroom").info(
-                "PPO training with %d parallel envs (SubprocVecEnv)", n_envs
-            )
+                    try:
+                        if sys.platform != "win32":
+                            env = SubprocVecEnv(env_fns, start_method="forkserver")
+                        else:
+                            env = SubprocVecEnv(env_fns)
+                    except TypeError:
+                        env = SubprocVecEnv(env_fns)
+                    logging.getLogger("boardroom").info(
+                        "PPO training with %d parallel envs (SubprocVecEnv)", n_envs
+                    )
 
         device = _get_ppo_device()
         if device == "cpu":
@@ -506,7 +533,8 @@ class PPOTrader:
         sharpe_eval_callback: SharpeEvalCallback | None = None
         best_snapshot_path = META_LEARNER_MODEL_DIR / "ppo_best.zip"
         if (
-            (historical_returns is not None or validation_returns is not None)
+            not ignore_early_stopping
+            and (historical_returns is not None or validation_returns is not None)
             and PPO_EARLY_STOPPING_EVAL_FREQ > 0
             and PPO_EARLY_STOPPING_PATIENCE > 0
         ):
@@ -527,17 +555,11 @@ class PPOTrader:
                 eval_trading_dates = historical_trading_dates[: len(eval_returns)]
             else:
                 eval_trading_dates = None
-            # Keep eval env type aligned with vec env usage (and avoid Subproc vs Monitor mismatch warnings).
-            _ = DummyVecEnv(
-                [
-                    lambda: HistoricalTradingEnv(
-                        returns_array=eval_returns,
-                        n_assets=self.n_assets,
-                        daily_aux_features=eval_aux,
-                        trading_dates=eval_trading_dates,
-                    )
-                ]
-            )
+            eval_proxy_cache = None
+            if len(eval_returns) > 21:
+                eval_proxy_cache = precompute_proxy_feature_matrix(
+                    np.asarray(eval_returns, dtype=np.float32)
+                )
             eval_freq_calls = max(
                 1, PPO_EARLY_STOPPING_EVAL_FREQ // max(1, getattr(env, "num_envs", 1))
             )
@@ -549,6 +571,7 @@ class PPOTrader:
                 best_model_save_path=best_snapshot_path,
                 daily_aux_features=eval_aux,
                 trading_dates=eval_trading_dates,
+                proxy_feature_cache=eval_proxy_cache,
                 verbose=0,
             )
             callbacks.append(sharpe_eval_callback)
@@ -568,14 +591,33 @@ class PPOTrader:
                 PPO_EARLY_STOPPING_PATIENCE,
                 PPO_EARLY_STOPPING_MIN_DELTA,
             )
-        try:
-            self.model.learn(
-                total_timesteps=total_timesteps,
-                progress_bar=True,
-                callback=callbacks if callbacks else None,
-                tb_log_name=run_id,
-                reset_num_timesteps=True,
+        elif (
+            ignore_early_stopping
+            and (historical_returns is not None or validation_returns is not None)
+            and PPO_EARLY_STOPPING_EVAL_FREQ > 0
+            and PPO_EARLY_STOPPING_PATIENCE > 0
+        ):
+            logging.getLogger("boardroom").info(
+                "Early stopping skipped for this run (ignore_early_stopping=True); training for full timesteps."
             )
+        if (
+            device == "cuda"
+            and os.environ.get("PPO_TORCH_COMPILE", "").strip().lower() in ("1", "true", "yes")
+        ):
+            try:
+                self.model.policy = torch.compile(self.model.policy, mode="reduce-overhead")
+            except Exception as ex:
+                logging.getLogger("boardroom").warning("PPO_TORCH_COMPILE skipped: %s", ex)
+
+        try:
+            with trace_block("ppo_train_learn", timesteps=total_timesteps):
+                self.model.learn(
+                    total_timesteps=total_timesteps,
+                    progress_bar=True,
+                    callback=callbacks if callbacks else None,
+                    tb_log_name=run_id,
+                    reset_num_timesteps=True,
+                )
             run_status = "ok"
         except BaseException:
             try:
@@ -718,10 +760,12 @@ def benchmark_device(
     timesteps: int = 20_000,
     historical_returns: np.ndarray | None = None,
     specialist_fn=None,
+    ppo_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, float | None]:
     """
     Run a short PPO training burst on CPU and (if available) GPU; return seconds per run.
     Use to compare CPU vs GPU speed. Does not save any model.
+    Optional ``ppo_kwargs`` (e.g. from ``load_tuned_params()``) overrides LR, n_steps, batch, epochs, gamma, gae_lambda, clip_range, ent_coef, and policy_kwargs.
     """
     def _default_specialist_fn():
         return [
@@ -742,6 +786,8 @@ def benchmark_device(
 
     specialist_fn = specialist_fn or _default_specialist_fn
     results: dict[str, float | None] = {}
+    pk = dict(ppo_kwargs or {})
+    policy_kw = pk.get("policy_kwargs") or PPO_NET_ARCH or {}
 
     def _make_env():
         if historical_returns is not None:
@@ -771,15 +817,15 @@ def benchmark_device(
         model = PPO(
             "MlpPolicy",
             env,
-            learning_rate=PPO_LEARNING_RATE,
-            n_steps=PPO_N_STEPS,
-            batch_size=PPO_BATCH_SIZE,
-            n_epochs=PPO_N_EPOCHS,
-            gamma=PPO_GAMMA,
-            gae_lambda=PPO_GAE_LAMBDA,
-            clip_range=PPO_CLIP_RANGE,
-            ent_coef=PPO_ENT_COEF,
-            policy_kwargs=PPO_NET_ARCH or {},
+            learning_rate=float(pk.get("learning_rate", PPO_LEARNING_RATE)),
+            n_steps=int(pk.get("n_steps", PPO_N_STEPS)),
+            batch_size=int(pk.get("batch_size", PPO_BATCH_SIZE)),
+            n_epochs=int(pk.get("n_epochs", PPO_N_EPOCHS)),
+            gamma=float(pk.get("gamma", PPO_GAMMA)),
+            gae_lambda=float(pk.get("gae_lambda", PPO_GAE_LAMBDA)),
+            clip_range=float(pk.get("clip_range", PPO_CLIP_RANGE)),
+            ent_coef=float(pk.get("ent_coef", PPO_ENT_COEF)),
+            policy_kwargs=policy_kw,
             device=device,
             verbose=0,
         )

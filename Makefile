@@ -2,7 +2,7 @@
         docker-build docker-up docker-up-ollama docker-down test cli
 
 PYTHON ?= python
-HOST ?= 127.0.0.1
+HOST ?= 0.0.0.0
 PORT ?= 28473
 
 help:

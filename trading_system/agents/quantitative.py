@@ -2,6 +2,7 @@
 Quantitative Specialist: TFT for trend probability.
 """
 import math
+import os
 import warnings
 
 import numpy as np
@@ -115,7 +116,15 @@ def _ensure_model(
 
     combined = pd.concat(parts, ignore_index=True)
     _training_dataset = _build_dataset(combined)
-    train_dl = _training_dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
+    _bs = int(os.getenv("TFT_BATCH_SIZE", "32").strip() or "32")
+    _nw = int(os.getenv("TFT_DATALOADER_NUM_WORKERS", "0").strip() or "0")
+    _persist = os.getenv("TFT_DATALOADER_PERSISTENT", "").strip().lower() in ("1", "true", "yes")
+    train_dl = _training_dataset.to_dataloader(
+        train=True,
+        batch_size=_bs,
+        num_workers=_nw,
+        persistent_workers=bool(_nw and _persist),
+    )
 
     model = TemporalFusionTransformer.from_dataset(
         _training_dataset,
@@ -139,15 +148,20 @@ def _ensure_model(
     except Exception:  # noqa: BLE001
         pass
 
-    trainer = Trainer(
-        max_epochs=10,
-        accelerator=_get_device(),
-        devices=1,
-        logger=tb_logger,
-        callbacks=[EpochProgressCallback(phase="specialist_quant")],
-        enable_progress_bar=False,
-        enable_model_summary=False,
-    )
+    _epochs = int(os.getenv("TFT_MAX_EPOCHS", "10").strip() or "10")
+    trainer_kw: dict = {
+        "max_epochs": _epochs,
+        "accelerator": _get_device(),
+        "devices": 1,
+        "logger": tb_logger,
+        "callbacks": [EpochProgressCallback(phase="specialist_quant")],
+        "enable_progress_bar": False,
+        "enable_model_summary": False,
+    }
+    _prec = os.getenv("TFT_PRECISION", "").strip()
+    if _prec in ("16-mixed", "16", "bf16-mixed", "32"):
+        trainer_kw["precision"] = _prec
+    trainer = Trainer(**trainer_kw)
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",

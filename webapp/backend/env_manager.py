@@ -3,18 +3,28 @@
 The web UI exposes a friendly grouped-form view; under the hood we keep the
 file's structure intact so users can still edit it by hand without losing
 notes/sections.
+
+UI hint text merge order (first non-empty wins): (1) leading comment in the
+user's ``.env`` for that key, (2) ``webapp/backend/data/env_var_hints.json``,
+(3) prose gathered from ``.env.example``, (4) a generic fallback sentence.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
-from .paths import ENV_EXAMPLE_FILE, ENV_FILE
+from .paths import ENV_EXAMPLE_FILE, ENV_FILE, ENV_HINTS_FILE
 
 ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$")
 COMMENT_RE = re.compile(r"^\s*#\s?(.*)$")
+# Commented-out template lines in .env.example: # KEY=value or # KEY=value (hint)
+COMMENTED_ASSIGN_RE = re.compile(
+    r"^\s*#\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$"
+)
 
 
 SECRET_KEYS = {
@@ -100,14 +110,46 @@ def serialize(lines: list[EnvLine]) -> str:
     return "\n".join(line.raw for line in lines).rstrip() + "\n"
 
 
+def _strip_example_value_tail(value: str) -> str:
+    """Drop trailing `` ( ... )`` notes common in .env.example commented templates."""
+    v = value.strip()
+    prev = None
+    while prev != v:
+        prev = v
+        v = re.sub(r"\s+\([^)]*\)\s*$", "", v)
+    return v.strip()
+
+
+def _unquote_env_value(value: str) -> str:
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        return v[1:-1]
+    return v
+
+
 def _example_documentation() -> dict[str, str]:
-    """Pull short comments from .env.example to enrich the UI form."""
+    """Pull short comments from .env.example to enrich the UI form.
+
+    Treats ``# KEY=value`` template lines like active assignments for attaching
+    the preceding comment block. Blank lines reset ``pending`` so unrelated
+    sections do not merge.
+    """
     if not ENV_EXAMPLE_FILE.exists():
         return {}
-    _, _ = parse(_read(ENV_EXAMPLE_FILE))
     docs: dict[str, str] = {}
     pending: list[str] = []
     for raw in _read(ENV_EXAMPLE_FILE).splitlines():
+        if not raw.strip():
+            pending.clear()
+            continue
+        m_commented = COMMENTED_ASSIGN_RE.match(raw)
+        if m_commented:
+            key = m_commented.group(1)
+            if pending:
+                docs[key] = " ".join(pending)
+            # Keep pending so consecutive ``# KEY=value`` templates under one
+            # comment block (e.g. MIN_TRADE / REBALANCE) share the same hint.
+            continue
         m_comment = COMMENT_RE.match(raw)
         if m_comment:
             pending.append(m_comment.group(1).strip())
@@ -117,10 +159,81 @@ def _example_documentation() -> dict[str, str]:
             key = m_assign.group(1)
             if pending:
                 docs[key] = " ".join(pending)
-            pending = []
+            pending.clear()
         else:
-            pending = []
+            pending.clear()
     return docs
+
+
+_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+@lru_cache(maxsize=1)
+def _load_env_hints() -> dict[str, str]:
+    """Static UI hints; keys starting with ``_`` are ignored."""
+    if not ENV_HINTS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(ENV_HINTS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in data.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        if k.startswith("_") or not _KEY_RE.match(k):
+            continue
+        t = v.strip()
+        if t:
+            out[k] = t
+    return out
+
+
+def clear_env_hints_cache() -> None:
+    """Invalidate hint registry (tests)."""
+    _load_env_hints.cache_clear()
+
+
+def _fallback_hint(key: str) -> str:
+    return f"Configuration option {key}. See .env.example."
+
+
+def _resolve_description(
+    key: str,
+    user_comment: str | None,
+    docs: dict[str, str],
+    hints: dict[str, str],
+) -> str:
+    if user_comment and user_comment.strip():
+        return user_comment.strip()
+    if key in hints:
+        return hints[key]
+    if key in docs:
+        return docs[key]
+    return _fallback_hint(key)
+
+
+def _ordered_example_keys_and_defaults() -> tuple[list[str], dict[str, str]]:
+    """All assignment keys from .env.example (active or commented), in file order."""
+    if not ENV_EXAMPLE_FILE.exists():
+        return [], {}
+    order: list[str] = []
+    defaults: dict[str, str] = {}
+    for raw in _read(ENV_EXAMPLE_FILE).splitlines():
+        m = ASSIGN_RE.match(raw)
+        if not m:
+            m = COMMENTED_ASSIGN_RE.match(raw)
+        if not m:
+            continue
+        key = m.group(1)
+        raw_val = m.group(2)
+        val = _unquote_env_value(_strip_example_value_tail(raw_val))
+        if key not in defaults:
+            order.append(key)
+            defaults[key] = val
+    return order, defaults
 
 
 def load() -> tuple[list[EnvLine], dict[str, str], dict[str, str]]:
@@ -129,33 +242,54 @@ def load() -> tuple[list[EnvLine], dict[str, str], dict[str, str]]:
     return lines, kv, _example_documentation()
 
 
+def _user_first_key_comments(lines: list[EnvLine]) -> dict[str, str | None]:
+    """First-seen leading comment per key in the user's ``.env``."""
+    comments: dict[str, str | None] = {}
+    for line in lines:
+        if not line.key or line.key in comments:
+            continue
+        comments[line.key] = line.comment
+    return comments
+
+
 def variables_for_ui() -> list[dict[str, str | bool]]:
-    """Return enriched variables for the UI form."""
+    """Return enriched variables for the UI form.
+
+    Includes every key from ``.env.example`` (commented or active), then any
+    extra keys only present in the user's ``.env``.
+    """
     lines, kv, docs = load()
-    out: list[dict[str, str | bool]] = []
+    hints = _load_env_hints()
+    example_order, example_defaults = _ordered_example_keys_and_defaults()
+    user_comments = _user_first_key_comments(lines)
     seen: set[str] = set()
+    out: list[dict[str, str | bool]] = []
+
+    for key in example_order:
+        seen.add(key)
+        desc = _resolve_description(key, user_comments.get(key), docs, hints)
+        value = kv[key] if key in kv else example_defaults.get(key, "")
+        out.append({
+            "key": key,
+            "value": value,
+            "description": desc,
+            "secret": key in SECRET_KEYS,
+            "group": _group_for(key),
+        })
+
     for line in lines:
         if not line.key or line.key in seen:
             continue
         seen.add(line.key)
+        desc = _resolve_description(line.key, line.comment, docs, hints)
         out.append({
             "key": line.key,
             "value": kv.get(line.key, ""),
-            "description": line.comment or docs.get(line.key) or None,
+            "description": desc,
             "secret": line.key in SECRET_KEYS,
             "group": _group_for(line.key),
         })
-    # Append documented keys missing from the user's .env so the UI can suggest them.
-    for key, doc in docs.items():
-        if key in seen:
-            continue
-        out.append({
-            "key": key,
-            "value": "",
-            "description": doc,
-            "secret": key in SECRET_KEYS,
-            "group": _group_for(key),
-        })
+
     return out
 
 

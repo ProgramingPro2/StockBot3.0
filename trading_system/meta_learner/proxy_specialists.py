@@ -34,6 +34,31 @@ def sentiment_proxy_from_close_prices(close: np.ndarray | pd.Series) -> float:
     return float(max(-0.5, min(0.5, mean_ret * 12)))
 
 
+def sentiment_proxy_batch_from_returns_block(rets: np.ndarray) -> np.ndarray:
+    """
+    Vectorized sentiment proxy for all assets at once.
+    rets shape (n_days, n_assets) daily returns used to build cumulative closes from 1.0 (same as per-column loop).
+    Returns shape (n_assets,) float64.
+    """
+    r = np.asarray(rets, dtype=np.float64)
+    if r.size == 0:
+        return np.zeros(r.shape[1] if r.ndim == 2 else 0, dtype=np.float64)
+    if r.ndim != 2:
+        raise ValueError("rets must be 2d")
+    n, m = r.shape
+    if n == 0:
+        return np.zeros(m, dtype=np.float64)
+    r = np.nan_to_num(r, nan=0.0)
+    ones = np.ones((1, m), dtype=np.float64)
+    closes = np.cumprod(np.vstack([ones, 1.0 + r]), axis=0)
+    if closes.shape[0] < 3:
+        return np.zeros(m, dtype=np.float64)
+    dr = (closes[1:] - closes[:-1]) / np.maximum(closes[:-1], 1e-12)
+    last = dr[-21:] if dr.shape[0] >= 21 else dr
+    mu = np.mean(last, axis=0)
+    return np.clip(mu * 12.0, -0.5, 0.5).astype(np.float64)
+
+
 def proxy_specialists_vectorized(returns_2d: np.ndarray) -> np.ndarray:
     """
     returns_2d shape (window, n_assets).
@@ -86,6 +111,63 @@ def proxy_specialists_vectorized(returns_2d: np.ndarray) -> np.ndarray:
             vol_21d_norm,
         )
     )
+
+
+def proxy_specialists_vectorized_batch(windows: np.ndarray) -> np.ndarray:
+    """
+    Batch over trailing windows. windows shape (B, window, n_assets).
+    Returns (B, n_assets, 13).
+    """
+    win = np.asarray(windows, dtype=np.float32)
+    if win.ndim != 3:
+        raise ValueError("windows must have shape (batch, window, n_assets)")
+    B, W, M = win.shape
+    mean_ret = np.nanmean(win, axis=1).astype(np.float32)
+    std_ret = np.nanstd(win, axis=1).astype(np.float32)
+    std_ret = np.where(std_ret < 1e-8, 0.01, std_ret)
+
+    sentiment = np.clip(mean_ret * 24, -1.0, 1.0)
+    trend = np.clip(mean_ret * 20, -0.5, 0.5)
+    quant_prob = np.clip(0.5 + trend, 0.0, 1.0)
+    fund_score = np.clip(-mean_ret * 30, -1.0, 1.0)
+    vol_norm = np.clip((std_ret - 0.01) * 50, -0.5, 0.5)
+    regime_flag = np.clip(0.5 + vol_norm, 0.0, 1.0)
+    momentum = np.clip(mean_ret * 15, -1.0, 1.0)
+    mean_reversion = np.clip(-mean_ret * 40, -1.0, 1.0)
+    volatility = np.clip((vol_norm + 1.0) / 2.0, 0.0, 1.0)
+    event_risk = np.zeros((B, M), dtype=np.float32)
+    relative_strength = np.zeros((B, M), dtype=np.float32)
+    liquidity = np.full((B, M), 0.5, dtype=np.float32)
+
+    tail5 = win[:, -5:, :] if W >= 5 else win
+    tail21 = win[:, -21:, :] if W >= 21 else win
+    ret_5d = np.nanmean(tail5, axis=1)
+    ret_21d = np.nanmean(tail21, axis=1)
+    vol_21d = np.nanstd(tail21, axis=1)
+    vol_21d = np.where(vol_21d < 1e-8, 0.01, vol_21d)
+
+    ret_5d_norm = np.clip(ret_5d * 50, -1, 1)
+    ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
+    vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
+
+    return np.stack(
+        (
+            sentiment,
+            quant_prob,
+            fund_score,
+            regime_flag,
+            momentum,
+            mean_reversion,
+            volatility,
+            event_risk,
+            relative_strength,
+            liquidity,
+            ret_5d_norm,
+            ret_21d_norm,
+            vol_21d_norm,
+        ),
+        axis=-1,
+    ).astype(np.float32)
 
 
 def proxy_specialists_from_returns_np(
@@ -161,12 +243,19 @@ def precompute_proxy_feature_matrix(returns_matrix: np.ndarray, window: int = 21
     returns_matrix (n_days, n_assets).
     Returns (n_days, n_assets, 13); rows t < window are zeros (unused in backtest).
     """
+    from numpy.lib.stride_tricks import sliding_window_view
+
     returns_matrix = np.asarray(returns_matrix, dtype=np.float32)
     n, m = returns_matrix.shape
     out = np.zeros((n, m, 13), dtype=np.float32)
-    for t in range(window, n):
-        w = returns_matrix[t - window : t, :]
-        out[t] = proxy_specialists_vectorized(w)
+    if n <= window:
+        return out
+    # sliding_window_view(..., axis=0) on (n, m) yields (n-window+1, m, window); we need (n-window+1, window, m).
+    win_mwt = sliding_window_view(returns_matrix, window_shape=window, axis=0)
+    win = np.transpose(win_mwt, (0, 2, 1))
+    n_feat = n - window
+    batch = win[:n_feat]
+    out[window:] = proxy_specialists_vectorized_batch(batch)
     return out
 
 
@@ -188,3 +277,20 @@ def merge_daily_aux_into_proxy_row(
     if np.isfinite(vr):
         row[9] = np.clip(vr / 5.0, 0.0, 1.0)
     return row
+
+
+def merge_daily_aux_into_proxy_matrix(features: np.ndarray, aux_row: np.ndarray | None) -> np.ndarray:
+    """
+    Vectorized aux merge. features shape (n_assets, 13), aux_row shape (n_assets, 2).
+    Returns a new array (does not mutate features).
+    """
+    if aux_row is None or aux_row.size == 0:
+        return features
+    out = np.asarray(features, dtype=np.float32).copy()
+    atr = aux_row[:, 0]
+    vr = aux_row[:, 1]
+    mask_atr = np.isfinite(atr)
+    out[mask_atr, 8] = np.clip((atr[mask_atr] / 0.25) * 2.0 - 1.0, -1.0, 1.0).astype(np.float32)
+    mask_vr = np.isfinite(vr)
+    out[mask_vr, 9] = np.clip(vr[mask_vr] / 5.0, 0.0, 1.0).astype(np.float32)
+    return out

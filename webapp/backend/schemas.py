@@ -42,8 +42,10 @@ class TrainParams(BaseModel):
     use_historical: bool = False
     historical_ratio: Optional[float] = None
     use_tuned: bool = False
+    tuned_study: Optional[str] = None
     retrain: bool = False
     n_envs: Optional[int] = None
+    ignore_early_stopping: bool = False
     debug: bool = False
 
 

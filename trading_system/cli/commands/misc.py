@@ -30,6 +30,7 @@ def register(app: typer.Typer) -> None:
         tickers: Optional[str] = typer.Option(None, "--tickers"),
         timesteps: int = typer.Option(20_000, "--timesteps"),
         use_historical: bool = typer.Option(False, "--use-historical"),
+        use_tuned: bool = typer.Option(False, "--use-tuned", help="Use hyperparameters from ppo_tune_best.json"),
     ) -> None:
         from ..run import cmd_benchmark_device
 
@@ -38,5 +39,6 @@ def register(app: typer.Typer) -> None:
                 tickers=tickers,
                 timesteps=timesteps,
                 use_historical=use_historical,
+                use_tuned=use_tuned,
             )
         )

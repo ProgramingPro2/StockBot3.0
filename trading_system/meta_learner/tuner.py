@@ -4,48 +4,117 @@ Samples PPO and env hyperparameters, trains on HistoricalTradingEnv, maximizes e
 Uses same env design as training: SubprocVecEnv, proxy-from-returns specialists.
 """
 import json
+import logging
 import math
+import os
 from functools import partial
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import optuna
-from optuna.trial import TrialState
+import pandas as pd
 import torch
-from optuna.pruners import MedianPruner
+from optuna.pruners import HyperbandPruner, MedianPruner
 from optuna.samplers import TPESampler
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecMonitor
 
 from ..config import (
     META_LEARNER_MODEL_DIR,
-    PPO_BATCH_SIZE,
-    PPO_CLIP_RANGE,
     PPO_CPU_THREADS,
-    PPO_GAMMA,
-    PPO_GAE_LAMBDA,
-    PPO_LEARNING_RATE,
-    PPO_N_EPOCHS,
-    PPO_N_STEPS,
     PPO_N_ENVS,
     TRAIN_HISTORICAL_RATIO,
     TRAIN_HISTORICAL_RATIO_OVERRIDE,
 )
-import numpy as np
-import pandas as pd
-
 from ..utils.graceful_shutdown import should_stop
+from .bench_trace import trace_block, trace_enabled
 from .env import HistoricalTradingEnv, MixedDataEnv
 from .env_helpers import create_proxy_specialist_fn
 from .eval_helpers import SharpeEvalCallback, deterministic_validation_walk
 from .metrics_callback import JsonlMetricsCallback, metrics_path
 from .ppo_trader import GracefulShutdownCallback, _make_env_fn
+from .proxy_specialists import precompute_proxy_feature_matrix
 from .runs_index import make_run_id, record_end, record_start, tb_log_dir_for
+
+_log = logging.getLogger("boardroom")
+
+# SubprocVecEnv / multiprocessing teardown after SIGTERM: workers may already be gone.
+_VEC_ENV_CLOSE_IPC_ERRORS: tuple[type[BaseException], ...] = (
+    BrokenPipeError,
+    EOFError,
+    OSError,
+    ConnectionError,
+    AttributeError,
+)
+
+
+def _safe_vec_env_close(env: Any) -> None:
+    """Close vec env; ignore IPC errors when workers already exited (e.g. graceful shutdown)."""
+    try:
+        env.close()
+    except _VEC_ENV_CLOSE_IPC_ERRORS as exc:
+        _log.debug(
+            "Ignored vec env close IPC error%s: %s",
+            " after graceful shutdown" if should_stop() else "",
+            exc,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("Ignored vec env close error: %s", exc)
 
 
 PPO_TUNE_PARAMS_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_best.json"
 PPO_TUNE_STUDY_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_study.db"
+
+
+def tune_best_params_json_path(study_name: str) -> Path:
+    """Per-study JSON path so concurrent or sequential studies do not clobber each other."""
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in (study_name or "").strip()) or "study"
+    return META_LEARNER_MODEL_DIR / f"ppo_tune_best_{safe}.json"
+
+
+def _pack_best_params_from_trial_raw(raw: dict[str, Any], best_value: float | None) -> dict[str, Any]:
+    """Serialize Optuna trial.params (plus optional best_value) to the ppo_tune_best.json shape."""
+    best: dict[str, Any] = {
+        "learning_rate": raw["learning_rate"],
+        "n_steps": raw["n_steps"],
+        "batch_size": raw["batch_size"],
+        "n_epochs": raw["n_epochs"],
+        "gamma": raw["gamma"],
+        "gae_lambda": raw["gae_lambda"],
+        "clip_range": raw["clip_range"],
+        "ent_coef": raw["ent_coef"],
+        "policy_kwargs": _net_arch_from_name(raw.get("net_arch", "small")),
+        "historical_ratio": raw.get("historical_ratio", 1.0),
+    }
+    if best_value is not None and not math.isnan(best_value):
+        best["best_value"] = best_value
+    return best
+
+
+def load_tuned_params_from_study(study_name: str) -> dict[str, Any] | None:
+    """Load best PPO hyperparameters from a named Optuna study (same storage as tune)."""
+    name = (study_name or "").strip()
+    if not name:
+        return None
+    storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
+    if not PPO_TUNE_STUDY_PATH.exists():
+        return None
+    try:
+        study = optuna.load_study(study_name=name, storage=storage)
+    except Exception:
+        return None
+    if study.best_trial is None:
+        return None
+    try:
+        bv = float(study.best_value) if study.best_value is not None else float("nan")
+    except Exception:
+        bv = float("nan")
+    try:
+        return _pack_best_params_from_trial_raw(dict(study.best_trial.params), bv if math.isfinite(bv) else None)
+    except KeyError:
+        return None
 
 
 def _get_ppo_device() -> str:
@@ -113,8 +182,8 @@ def run_tuning(
     Returns best params dict.
     """
     n_envs = n_envs if n_envs is not None else PPO_N_ENVS
-    # EvalCallback n_calls scales with vec env rollouts; align eval cadence with n_envs
-    eval_freq = max((n_timesteps // n_evaluations) // max(1, n_envs), 1)
+    # SB3 callback n_calls advances per vec-env rollout; spread evals across the trial
+    eval_freq = max(1, n_timesteps // (max(1, n_evaluations) * max(1, n_envs)))
     params_path = params_path or PPO_TUNE_PARAMS_PATH
     returns_array = np.asarray(returns_array, dtype=np.float32)
 
@@ -140,6 +209,11 @@ def run_tuning(
         else:
             val_trading_dates = td[: len(val_returns)]
 
+    train_proxy_cache = precompute_proxy_feature_matrix(train_returns)
+    val_proxy_cache = None
+    if len(val_returns) > 21:
+        val_proxy_cache = precompute_proxy_feature_matrix(val_returns)
+
     proxy_specialist_fn = create_proxy_specialist_fn(train_returns, n_assets)
 
     def _save_best_cb(study: optuna.Study, trial: optuna.Trial) -> None:
@@ -149,7 +223,12 @@ def run_tuning(
         if should_stop():
             study.stop()
 
+    use_dummy_vec = os.environ.get("PPO_USE_DUMMY_VEC", "").strip().lower() in ("1", "true", "yes")
+
     def objective(trial: optuna.Trial) -> float:
+        if n_envs > 1:
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+
         params = sample_ppo_params(trial, fixed_historical_ratio=fixed_historical_ratio)
         historical_ratio = params.pop("historical_ratio")
 
@@ -160,17 +239,30 @@ def run_tuning(
         else:
             mode = "synthetic"
 
-        if n_envs <= 1:
-            env = _make_env_fn(
-                mode=mode,
-                historical_returns=train_returns,
-                n_assets=n_assets,
-                historical_ratio=historical_ratio,
-                specialist_fn=proxy_specialist_fn,
-                seed=trial.number,
-                daily_aux_features=None,
-                historical_trading_dates=train_trading_dates,
+        if trace_enabled():
+            import logging
+
+            logging.getLogger("boardroom").info(
+                "BENCH_TRACE tune trial=%s n_envs=%s eval_freq=%s dummy_vec=%s",
+                trial.number,
+                n_envs,
+                eval_freq,
+                use_dummy_vec,
             )
+
+        if n_envs <= 1:
+            with trace_block("tune_make_env_single", trial=trial.number):
+                env = _make_env_fn(
+                    mode=mode,
+                    historical_returns=train_returns,
+                    n_assets=n_assets,
+                    historical_ratio=historical_ratio,
+                    specialist_fn=proxy_specialist_fn,
+                    seed=trial.number,
+                    daily_aux_features=None,
+                    historical_trading_dates=train_trading_dates,
+                    proxy_feature_cache=train_proxy_cache,
+                )
         else:
             env_fns = [
                 partial(
@@ -183,18 +275,23 @@ def run_tuning(
                     seed=trial.number * 1000 + i,
                     daily_aux_features=None,
                     historical_trading_dates=train_trading_dates,
+                    proxy_feature_cache=train_proxy_cache,
                 )
                 for i in range(n_envs)
             ]
-            try:
-                import sys
-
-                if sys.platform != "win32":
-                    env = SubprocVecEnv(env_fns, start_method="forkserver")
+            with trace_block("tune_make_vec_env", trial=trial.number, n_envs=n_envs):
+                if use_dummy_vec:
+                    env = DummyVecEnv(env_fns)
                 else:
-                    env = SubprocVecEnv(env_fns)
-            except TypeError:
-                env = SubprocVecEnv(env_fns)
+                    try:
+                        import sys
+
+                        if sys.platform != "win32":
+                            env = SubprocVecEnv(env_fns, start_method="forkserver")
+                        else:
+                            env = SubprocVecEnv(env_fns)
+                    except TypeError:
+                        env = SubprocVecEnv(env_fns)
 
         env = VecMonitor(env) if isinstance(env, VecEnv) else Monitor(env)
         run_id = make_run_id(f"tune_t{trial.number}")
@@ -242,9 +339,11 @@ def run_tuning(
         sharpe_eval_callback = SharpeEvalCallback(
             val_returns=val_returns,
             n_assets=n_assets,
-            eval_freq=max(1, n_timesteps // max(1, n_envs)),
+            eval_freq=eval_freq,
             min_delta=0.0,
             trading_dates=val_trading_dates,
+            proxy_feature_cache=val_proxy_cache,
+            optuna_trial=trial,
             verbose=0,
         )
         callbacks: list = [GracefulShutdownCallback(verbose=1), sharpe_eval_callback]
@@ -253,43 +352,71 @@ def run_tuning(
 
         trial_status = "ok"
         try:
-            model.learn(
-                total_timesteps=n_timesteps,
-                callback=callbacks,
-                progress_bar=show_progress,
-                tb_log_name=run_id,
-                reset_num_timesteps=True,
-            )
+            with trace_block("tune_learn", trial=trial.number, timesteps=n_timesteps):
+                model.learn(
+                    total_timesteps=n_timesteps,
+                    callback=callbacks,
+                    progress_bar=show_progress,
+                    tb_log_name=run_id,
+                    reset_num_timesteps=True,
+                )
+        except optuna.TrialPruned:
+            trial_status = "pruned"
+            try:
+                record_end(run_id, status=trial_status)
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         except (AssertionError, ValueError):
             trial_status = "failed"
             try:
                 record_end(run_id, status=trial_status)
             except Exception:  # noqa: BLE001
                 pass
-            return float("nan")
+        else:
+            try:
+                record_end(run_id, status=trial_status)
+            except Exception:  # noqa: BLE001
+                pass
         finally:
-            env.close()
-        try:
-            record_end(run_id, status=trial_status)
-        except Exception:  # noqa: BLE001
-            pass
+            sharpe_eval_callback.close_eval_env()
+            _safe_vec_env_close(env)
 
-        sharpe, _ = deterministic_validation_walk(
-            model,
-            val_returns,
-            n_assets,
-            trading_dates=val_trading_dates,
-        )
-        trial.report(sharpe, 1)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+        if trial_status == "failed":
+            return float("nan")
+
+        if should_stop() and trial_status == "ok":
+            try:
+                record_end(run_id, status="stopped")
+            except Exception:  # noqa: BLE001
+                pass
+            return float("nan")
+
+        last = sharpe_eval_callback.last_mean_reward
+        if last is None or not math.isfinite(float(last)):
+            sharpe, _ = deterministic_validation_walk(
+                model,
+                val_returns,
+                n_assets,
+                trading_dates=val_trading_dates,
+                proxy_feature_cache=val_proxy_cache,
+            )
+        else:
+            sharpe = float(last)
         return sharpe
 
     device = _get_ppo_device()
     if device == "cpu":
         torch.set_num_threads(1 if single_thread else PPO_CPU_THREADS)
     sampler = TPESampler(n_startup_trials=10, seed=42)
-    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=max(n_evaluations // 3, 1))
+    if os.environ.get("OPTUNA_PRUNER", "hyperband").strip().lower() == "median":
+        pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=max(n_evaluations // 3, 1))
+    else:
+        pruner = HyperbandPruner(
+            min_resource=1,
+            max_resource=max(n_evaluations, 2),
+            reduction_factor=3,
+        )
 
     META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
@@ -322,25 +449,19 @@ def run_tuning(
     if study.best_trial is None:
         return load_tuned_params(params_path) or {}
 
-    raw = study.best_trial.params
+    raw = dict(study.best_trial.params)
     best_value = float(study.best_value)
-    best = {
-        "learning_rate": raw["learning_rate"],
-        "n_steps": raw["n_steps"],
-        "batch_size": raw["batch_size"],
-        "n_epochs": raw["n_epochs"],
-        "gamma": raw["gamma"],
-        "gae_lambda": raw["gae_lambda"],
-        "clip_range": raw["clip_range"],
-        "ent_coef": raw["ent_coef"],
-        "policy_kwargs": _net_arch_from_name(raw.get("net_arch", "small")),
-        "historical_ratio": raw.get("historical_ratio", 1.0),
-    }
-    if not math.isnan(best_value):
-        best["best_value"] = best_value
+    best = _pack_best_params_from_trial_raw(raw, best_value if not math.isnan(best_value) else None)
 
     with open(params_path, "w") as f:
         json.dump(best, f, indent=2)
+
+    if params_path.resolve() != PPO_TUNE_PARAMS_PATH.resolve():
+        try:
+            with open(PPO_TUNE_PARAMS_PATH, "w") as f:
+                json.dump(best, f, indent=2)
+        except OSError:
+            pass
 
     return best
 
@@ -409,26 +530,19 @@ def _save_best_params(
     """Callback: save best params JSON whenever this trial is the new best."""
     if study.best_trial is not trial:
         return
-    raw = trial.params
+    raw = dict(trial.params)
     best_value = float(study.best_value)
-    best = {
-        "learning_rate": raw["learning_rate"],
-        "n_steps": raw["n_steps"],
-        "batch_size": raw["batch_size"],
-        "n_epochs": raw["n_epochs"],
-        "gamma": raw["gamma"],
-        "gae_lambda": raw["gae_lambda"],
-        "clip_range": raw["clip_range"],
-        "ent_coef": raw["ent_coef"],
-        "policy_kwargs": _net_arch_from_name(raw.get("net_arch", "small")),
-        "historical_ratio": raw.get("historical_ratio", 1.0),
-    }
-    if not math.isnan(best_value):
-        best["best_value"] = best_value
+    best = _pack_best_params_from_trial_raw(raw, best_value if not math.isnan(best_value) else None)
     META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     p = params_path or PPO_TUNE_PARAMS_PATH
     with open(p, "w") as f:
         json.dump(best, f, indent=2)
+    if p.resolve() != PPO_TUNE_PARAMS_PATH.resolve():
+        try:
+            with open(PPO_TUNE_PARAMS_PATH, "w") as f:
+                json.dump(best, f, indent=2)
+        except OSError:
+            pass
 
 
 def get_tune_status(

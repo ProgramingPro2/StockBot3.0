@@ -27,6 +27,7 @@ from ..config import (
 )
 from ..utils.pdt import pdt_tracker_from_config, rebalance_multi_asset, session_date_from_index
 from .proxy_specialists import (
+    merge_daily_aux_into_proxy_matrix,
     merge_daily_aux_into_proxy_row,
     normalize_action_max_unit_exposure,
 )
@@ -235,32 +236,50 @@ class TradingEnv(gym.Env):
 
     def _get_obs(self, holdings: np.ndarray) -> np.ndarray:
         outputs = self._specialist_outputs or [{}] * self.n_assets
-        parts: list[float] = []
+        per = _obs_features_per_asset()
+        row = np.empty((self.n_assets, per), dtype=np.float32)
+        h = np.asarray(holdings, dtype=np.float32).reshape(self.n_assets)
         for i in range(self.n_assets):
             s = outputs[i] if i < len(outputs) else {}
-            parts.append(float(s.get("sentiment", 0.0)))
-            parts.append(float(s.get("quant_prob", 0.5)))
-            parts.append(float(s.get("fund_score", 0.0)))
-            parts.append(float(s.get("regime_flag", 0.5)))
-            parts.append(float(s.get("momentum_score", 0.0)))
-            parts.append(float(s.get("mean_reversion_score", 0.0)))
-            parts.append(float(s.get("volatility_score", 0.5)))
-            parts.append(float(s.get("event_risk_score", 0.0)))
-            parts.append(float(s.get("relative_strength_score", 0.0)))
-            parts.append(float(s.get("liquidity_score", 0.5)))
-            parts.append(float(holdings[i]))
+            j = 0
+            row[i, j] = float(s.get("sentiment", 0.0))
+            j += 1
+            row[i, j] = float(s.get("quant_prob", 0.5))
+            j += 1
+            row[i, j] = float(s.get("fund_score", 0.0))
+            j += 1
+            row[i, j] = float(s.get("regime_flag", 0.5))
+            j += 1
+            row[i, j] = float(s.get("momentum_score", 0.0))
+            j += 1
+            row[i, j] = float(s.get("mean_reversion_score", 0.0))
+            j += 1
+            row[i, j] = float(s.get("volatility_score", 0.5))
+            j += 1
+            row[i, j] = float(s.get("event_risk_score", 0.0))
+            j += 1
+            row[i, j] = float(s.get("relative_strength_score", 0.0))
+            j += 1
+            row[i, j] = float(s.get("liquidity_score", 0.5))
+            j += 1
+            row[i, j] = float(h[i])
+            j += 1
             if ENV_OBS_ROLLING_FEATURES:
                 if self._rolling_returns is not None and self._rolling_vols is not None:
                     valid = self._rolling_returns[i][~np.isnan(self._rolling_returns[i])]
                     ret_5d = float(np.mean(valid[-5:])) if len(valid) >= 5 else 0.0
                     ret_21d = float(np.mean(valid)) if len(valid) > 0 else 0.0
-                    vol_21d = self._rolling_vols[i]
-                    parts.append(np.clip(ret_5d * 50, -1, 1))
-                    parts.append(np.clip(ret_21d * 50, -1, 1))
-                    parts.append(np.clip((vol_21d - 0.01) * 50, -1, 1))
+                    vol_21d = float(self._rolling_vols[i])
+                    row[i, j] = np.clip(ret_5d * 50, -1, 1)
+                    j += 1
+                    row[i, j] = np.clip(ret_21d * 50, -1, 1)
+                    j += 1
+                    row[i, j] = np.clip((vol_21d - 0.01) * 50, -1, 1)
+                    j += 1
                 else:
-                    parts.extend([0.0, 0.0, 0.0])
-        obs = np.array(parts, dtype=np.float32)
+                    row[i, j : j + 3] = 0.0
+                    j += 3
+        obs = row.reshape(-1).astype(np.float32)
         return _sanitize_obs(obs)
 
     def render(self) -> None:
@@ -289,6 +308,7 @@ class HistoricalTradingEnv(gym.Env):
         render_mode: str | None = None,
         daily_aux_features: np.ndarray | None = None,
         trading_dates: np.ndarray | pd.DatetimeIndex | list | None = None,
+        proxy_feature_cache: np.ndarray | None = None,
     ):
         """
         Args:
@@ -296,6 +316,8 @@ class HistoricalTradingEnv(gym.Env):
             n_assets: Number of assets.
             daily_aux_features: Optional (n_days, n_assets, 2) for atr_pct, volume_ratio.
             trading_dates: Optional length n_days calendar index for PDT session keys.
+            proxy_feature_cache: Optional (n_days, n_assets, 13) from precompute_proxy_feature_matrix;
+                when set, skips recomputing the proxy matrix (faster for tuning / SubprocVecEnv).
         """
         super().__init__()
         self.returns_array = np.asarray(returns_array, dtype=np.float32)
@@ -342,7 +364,16 @@ class HistoricalTradingEnv(gym.Env):
         # Pre-compute proxy features once; _get_obs() becomes a cheap array lookup.
         # Shape (n_days, n_assets, 13) — row t uses returns_array[t-21:t].
         from .proxy_specialists import precompute_proxy_feature_matrix
-        self._proxy_cache = precompute_proxy_feature_matrix(self.returns_array, window=21)
+
+        if proxy_feature_cache is not None:
+            pc = np.asarray(proxy_feature_cache, dtype=np.float32)
+            if pc.shape != (self.n_days, self.n_assets, 13):
+                raise ValueError(
+                    f"proxy_feature_cache must have shape {(self.n_days, self.n_assets, 13)}, got {pc.shape}"
+                )
+            self._proxy_cache = pc
+        else:
+            self._proxy_cache = precompute_proxy_feature_matrix(self.returns_array, window=21)
 
         self._trading_dates: pd.DatetimeIndex | None = None
         if trading_dates is not None:
@@ -440,13 +471,10 @@ class HistoricalTradingEnv(gym.Env):
             features[:, 9] = 0.5
             features[:, 12] = 0.01
         else:
-            features = self._proxy_cache[self._cursor].copy()  # (n_assets, 13)
+            features = self._proxy_cache[self._cursor]
             if self.daily_aux_features is not None:
                 aux_row = self.daily_aux_features[self._cursor - 1]
-                for j in range(self.n_assets):
-                    features[j] = merge_daily_aux_into_proxy_row(
-                        features[j], aux_row[j]
-                    )
+                features = merge_daily_aux_into_proxy_matrix(features, aux_row)
 
         holdings = self._holdings if self._holdings is not None else np.zeros(self.n_assets, dtype=np.float32)
         if ENV_OBS_ROLLING_FEATURES:

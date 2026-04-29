@@ -2,6 +2,7 @@
 Fundamental Specialist: XGBoost classifier for intrinsic value.
 """
 import json
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -176,12 +177,22 @@ def _ensure_model(tickers: list[str] | None = None) -> bool:
     X_imp = _imputer.fit_transform(X)
     _scaler = StandardScaler()
     X_scaled = _scaler.fit_transform(X_imp)
-    _model = xgb.XGBClassifier(
-        n_estimators=XGB_N_ESTIMATORS,
-        max_depth=XGB_MAX_DEPTH,
-        learning_rate=XGB_LEARNING_RATE,
-        eval_metric="mlogloss",
-    )
+    _tree = os.getenv("XGB_TREE_METHOD", "hist").strip() or "hist"
+    _device = os.getenv("XGB_DEVICE", "cpu").strip().lower() or "cpu"
+    _njobs_raw = os.getenv("XGB_N_JOBS", "0").strip()
+    _njobs = int(_njobs_raw) if _njobs_raw else 0
+    clf_kw: dict = {
+        "n_estimators": XGB_N_ESTIMATORS,
+        "max_depth": XGB_MAX_DEPTH,
+        "learning_rate": XGB_LEARNING_RATE,
+        "eval_metric": "mlogloss",
+        "tree_method": _tree,
+    }
+    if _njobs != 0:
+        clf_kw["n_jobs"] = _njobs
+    if _device == "cuda":
+        clf_kw["device"] = "cuda"
+    _model = xgb.XGBClassifier(**clf_kw)
     _model.fit(X_scaled, labels)
     FUNDAMENTAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     _model.save_model(str(path))

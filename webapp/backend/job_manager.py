@@ -130,6 +130,7 @@ def _argv_for(kind: JobKind, params: dict[str, Any]) -> list[str]:
         "use_historical": "--use-historical",
         "use_tuned": "--use-tuned",
         "retrain": "--retrain",
+        "ignore_early_stopping": "--ignore-early-stopping",
         "autodiscover": "--autodiscover",
         "save": "--save",
         "single_thread": "--single-thread",
@@ -152,6 +153,7 @@ def _argv_for(kind: JobKind, params: dict[str, Any]) -> list[str]:
         "n_estimators": "--n-estimators",
         "max_depth": "--max-depth",
         "learning_rate": "--learning-rate",
+        "tuned_study": "--tuned-study",
     }
     for key, flag in value_flags.items():
         if key in params and params[key] is not None and params[key] != "":
@@ -167,12 +169,15 @@ def _open_log(path: Path) -> Any:
     return path.open("ab", buffering=0)
 
 
-def _persist_registry(jobs: Iterable[_Job]) -> None:
-    ensure_dirs()
-    rows = [job.info.model_dump() for job in jobs]
-    tmp = JOBS_REGISTRY.with_suffix(".tmp.json")
-    tmp.write_text(json.dumps(rows, indent=2, default=str))
-    tmp.replace(JOBS_REGISTRY)
+def _signal_pid_process_group(pid: int, sig: int) -> None:
+    """Send ``sig`` to the process group for ``pid``, then fall back to ``pid`` alone."""
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
 
 def _load_registry() -> list[JobInfo]:
@@ -200,10 +205,105 @@ class JobManager:
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._history: list[JobInfo] = _load_registry()
+        self._reconcile_stale_registry_rows()
 
     # --- runtime wiring ---
     def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+
+    def _write_registry_disk(self, active_jobs: Iterable[_Job]) -> None:
+        """Persist merged job rows so restarts do not drop archived entries.
+
+        Active (in-memory) jobs overwrite same-id rows from ``_history``.
+        """
+        ensure_dirs()
+        with self._lock:
+            by_id: dict[str, JobInfo] = {h.id: h.model_copy() for h in self._history}
+            for job in active_jobs:
+                by_id[job.info.id] = job.info.model_copy()
+            rows = sorted(by_id.values(), key=lambda x: (x.started or 0.0, x.id))
+            payload = [r.model_dump() for r in rows]
+        tmp = JOBS_REGISTRY.with_suffix(".tmp.json")
+        tmp.write_text(json.dumps(payload, indent=2, default=str))
+        tmp.replace(JOBS_REGISTRY)
+
+    def _reconcile_stale_registry_rows(self) -> None:
+        """Turn non-terminal on-disk jobs into cancelled after a process restart.
+
+        Without this, the UI keeps showing ``running`` while ``stop``/``kill``
+        only touch live ``_Job`` handles, so controls appear broken.
+        """
+        terminal = frozenset({"completed", "failed", "cancelled"})
+        now = time.time()
+        note = (
+            "Closed after server restart (job was no longer tracked). "
+            "If a pid was recorded, SIGTERM was sent to its process group."
+        )
+        changed = False
+        new_list: list[JobInfo] = []
+        for h in self._history:
+            if h.status in terminal:
+                new_list.append(h)
+                continue
+            changed = True
+            if h.pid:
+                _signal_pid_process_group(h.pid, signal.SIGTERM)
+            new_list.append(
+                h.model_copy(
+                    update={
+                        "status": "cancelled",
+                        "ended": now,
+                        "exit_code": -1,
+                        "note": note + (f" pid={h.pid}" if h.pid else ""),
+                    }
+                )
+            )
+        if changed:
+            self._history = new_list
+            self._write_registry_disk(())
+
+    def _signal_history_job(self, job_id: str, *, use_kill: bool) -> JobInfo | None:
+        """Stop/kill a job that only exists in persisted history (orphan row)."""
+        with self._lock:
+            idx: int | None = None
+            snapshot: JobInfo | None = None
+            for i, h in enumerate(self._history):
+                if h.id == job_id:
+                    idx, snapshot = i, h
+                    break
+        if idx is None or snapshot is None:
+            return None
+        if snapshot.status not in {"pending", "running", "stopping"}:
+            return snapshot.model_copy()
+        pid = snapshot.pid
+        if pid:
+            if use_kill:
+                _signal_pid_process_group(pid, signal.SIGTERM)
+                time.sleep(0.5)
+                _signal_pid_process_group(pid, signal.SIGKILL)
+            else:
+                _signal_pid_process_group(pid, signal.SIGTERM)
+        now = time.time()
+        note = (
+            "Force-killed orphaned subprocess (job was not tracked by this server process)."
+            if use_kill
+            else "SIGTERM sent to orphaned subprocess (job was not tracked by this server process)."
+        )
+        with self._lock:
+            for i, h in enumerate(self._history):
+                if h.id == job_id:
+                    upd = h.model_copy(
+                        update={
+                            "status": "cancelled",
+                            "ended": now,
+                            "exit_code": -1 if use_kill else None,
+                            "note": note + (f" pid={pid}" if pid else ""),
+                        }
+                    )
+                    self._history[i] = upd
+                    break
+        self._write_registry_disk(self._jobs.values())
+        return self.get_info(job_id)
 
     # --- queries ---
     def list_running(self) -> list[JobInfo]:
@@ -321,7 +421,7 @@ class JobManager:
 
         with self._lock:
             self._jobs[job_id] = job
-            _persist_registry(self._jobs.values())
+        self._write_registry_disk(self._jobs.values())
         return info.model_copy()
 
     def stop(self, job_id: str) -> JobInfo | None:
@@ -333,35 +433,35 @@ class JobManager:
         """
         with self._lock:
             job = self._jobs.get(job_id)
-        if not job or not job.process or job.process.poll() is not None:
-            if job:
-                return job.info.model_copy()
-            return None
-        job.cancel_event.set()
-        job.info.status = "stopping"
-        self._send_signal(job, signal.SIGTERM)
-        return job.info.model_copy()
+        if job and job.process and job.process.poll() is None:
+            job.cancel_event.set()
+            job.info.status = "stopping"
+            self._send_signal(job, signal.SIGTERM)
+            return job.info.model_copy()
+        if job:
+            return job.info.model_copy()
+        return self._signal_history_job(job_id, use_kill=False)
 
     def kill(self, job_id: str, grace_seconds: float = 0.5) -> JobInfo | None:
         """Force-kill the job: brief SIGTERM, then SIGKILL the process group."""
         with self._lock:
             job = self._jobs.get(job_id)
-        if not job or not job.process or job.process.poll() is not None:
-            if job:
-                return job.info.model_copy()
-            return None
-        job.cancel_event.set()
-        job.info.status = "stopping"
-        self._send_signal(job, signal.SIGTERM)
-        try:
-            job.process.wait(timeout=max(0.0, grace_seconds))
-        except subprocess.TimeoutExpired:
-            self._send_signal(job, signal.SIGKILL)
+        if job and job.process and job.process.poll() is None:
+            job.cancel_event.set()
+            job.info.status = "stopping"
+            self._send_signal(job, signal.SIGTERM)
             try:
-                job.process.wait(timeout=5)
+                job.process.wait(timeout=max(0.0, grace_seconds))
             except subprocess.TimeoutExpired:
-                pass
-        return job.info.model_copy()
+                self._send_signal(job, signal.SIGKILL)
+                try:
+                    job.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            return job.info.model_copy()
+        if job:
+            return job.info.model_copy()
+        return self._signal_history_job(job_id, use_kill=True)
 
     def _send_signal(self, job: _Job, sig: int) -> None:
         if not job.process:
@@ -369,7 +469,7 @@ class JobManager:
         try:
             os.killpg(os.getpgid(job.process.pid), sig)
             return
-        except (ProcessLookupError, PermissionError):
+        except (ProcessLookupError, PermissionError, OSError):
             pass
         try:
             if sig == signal.SIGKILL:
@@ -485,7 +585,7 @@ class JobManager:
             with self._lock:
                 self._history.insert(0, job.info.model_copy())
                 self._history = self._history[:200]
-                _persist_registry([*self._jobs.values()])
+            self._write_registry_disk(self._jobs.values())
 
     def _metrics_tail_loop(self, job: _Job) -> None:
         path = job.metrics_path

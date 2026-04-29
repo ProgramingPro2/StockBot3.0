@@ -31,7 +31,7 @@ export default defineConfig(({ mode }) => {
     },
     plugins: [react()],
     server: {
-      host: "127.0.0.1",
+      host: "0.0.0.0",
       port: 5173,
       // Ignore heavy trees; polling default avoids EMFILE on low ulimit / inotify limits.
       watch: {

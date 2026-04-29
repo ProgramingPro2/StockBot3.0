@@ -10,7 +10,7 @@ import random
 import sys
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..meta_learner import PPOTrader
@@ -331,6 +331,18 @@ def _chronological_train_test_split(
     return train_returns, test_returns, aligned_train, aligned_test
 
 
+def _tuned_params_payload_for_train(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Best tuned hyperparameters dict for training, or None."""
+    if not getattr(args, "use_tuned", False):
+        return None
+    from ..meta_learner.tuner import load_tuned_params, load_tuned_params_from_study
+
+    study = getattr(args, "tuned_study", None)
+    if study and str(study).strip():
+        return load_tuned_params_from_study(str(study).strip())
+    return load_tuned_params()
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     """Train specialists and meta-learner on TRADE_TICKERS (5 stocks)."""
     import numpy as np
@@ -365,10 +377,36 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     logger.info("Training specialists for %d tickers: %s", n_assets, tickers)
     try:
-        ensure_quantitative(tickers, retrain=args.retrain)
-        ensure_fundamental(tickers)
-        ensure_regime(retrain=args.retrain)
-        ensure_momentum(tickers, retrain=args.retrain)
+        parallel = os.environ.get("TRAIN_SPECIALISTS_PARALLEL", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+        def _run_specialists_sequential() -> None:
+            ensure_quantitative(tickers, retrain=args.retrain)
+            ensure_fundamental(tickers)
+            ensure_regime(retrain=args.retrain)
+            ensure_momentum(tickers, retrain=args.retrain)
+
+        if parallel:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            futures = {}
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures[ex.submit(ensure_quantitative, tickers, args.retrain)] = "quantitative"
+                futures[ex.submit(ensure_fundamental, tickers)] = "fundamental"
+                futures[ex.submit(ensure_regime, args.retrain)] = "regime"
+                futures[ex.submit(ensure_momentum, tickers, args.retrain)] = "momentum"
+                for fut in as_completed(futures):
+                    name = futures[fut]
+                    try:
+                        fut.result()
+                    except BaseException:
+                        logger.exception("Specialist %s failed", name)
+                        raise
+        else:
+            _run_specialists_sequential()
     except BaseException:
         try:
             record_end(run_boardroom_id, status="failed")
@@ -386,8 +424,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     user_set_ratio = (getattr(args, "historical_ratio", None) is not None) or getattr(args, "use_historical", False) or TRAIN_HISTORICAL_RATIO_OVERRIDE
     if not user_set_ratio and getattr(args, "use_tuned", False):
-        from ..meta_learner.tuner import load_tuned_params
-        tuned = load_tuned_params()
+        tuned = _tuned_params_payload_for_train(args)
         if tuned and "historical_ratio" in tuned:
             historical_ratio = tuned["historical_ratio"]
             logger.info("Using historical_ratio from tuned params: %.2f", historical_ratio)
@@ -452,14 +489,21 @@ def cmd_train(args: argparse.Namespace) -> None:
     ppo_kwargs = None
     if getattr(args, "use_tuned", False):
         from ..config import PPO_N_STEPS
-        from ..meta_learner.tuner import load_tuned_params
-        ppo_kwargs = load_tuned_params()
+
+        ppo_kwargs = _tuned_params_payload_for_train(args)
         if ppo_kwargs:
             ppo_kwargs = dict(ppo_kwargs)
             ppo_kwargs.pop("historical_ratio", None)
             ppo_kwargs.pop("best_value", None)
             tuned_n = ppo_kwargs.get("n_steps")
-            if tuned_n is not None and tuned_n > PPO_N_STEPS:
+            use_full_tuned_n = os.environ.get(
+                "PPO_TRAIN_USE_FULL_TUNED_N_STEPS", ""
+            ).strip().lower() in ("1", "true", "yes")
+            if (
+                not use_full_tuned_n
+                and tuned_n is not None
+                and tuned_n > PPO_N_STEPS
+            ):
                 ppo_kwargs["n_steps"] = PPO_N_STEPS
             tuned_lr = ppo_kwargs.get("learning_rate")
             if (
@@ -475,9 +519,20 @@ def cmd_train(args: argparse.Namespace) -> None:
                     new_lr,
                 )
                 ppo_kwargs["learning_rate"] = new_lr
-            logger.info("Using tuned hyperparameters from previous tune run")
+            ts = getattr(args, "tuned_study", None)
+            if ts and str(ts).strip():
+                logger.info("Using tuned hyperparameters from Optuna study %r", str(ts).strip())
+            else:
+                logger.info("Using tuned hyperparameters from ppo_tune_best.json")
         else:
-            logger.warning("No tuned params found; run 'tune' first")
+            ts = getattr(args, "tuned_study", None)
+            if ts and str(ts).strip():
+                logger.warning(
+                    "No tuned params for study %r (no completed trials or study missing); run tune for this study first",
+                    str(ts).strip(),
+                )
+            else:
+                logger.warning("No tuned params found; run 'tune' first")
 
     # Training uses proxy-from-returns only (no LLM sentiment). Matches backtest.
     specialist_fn_for_train = (
@@ -492,6 +547,14 @@ def cmd_train(args: argparse.Namespace) -> None:
         historical_trading_dates = aligned_full.index[:nh]
         if validation_returns is not None:
             validation_trading_dates = aligned_full.index[nh : nh + len(validation_returns)]
+    train_proxy_cache = None
+    if historical_returns is not None and len(historical_returns) > 21:
+        from ..meta_learner.proxy_specialists import precompute_proxy_feature_matrix
+
+        train_proxy_cache = precompute_proxy_feature_matrix(
+            np.asarray(historical_returns, dtype=np.float32)
+        )
+
     dated_path = trader.train(
         total_timesteps=args.timesteps,
         specialist_fn=specialist_fn_for_train,
@@ -503,6 +566,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         daily_aux_features=daily_aux_features,
         historical_trading_dates=historical_trading_dates,
         validation_trading_dates=validation_trading_dates,
+        proxy_feature_cache=train_proxy_cache,
+        ignore_early_stopping=getattr(args, "ignore_early_stopping", False),
     )
     logger.info("Training complete. Models saved.")
 
@@ -607,12 +672,24 @@ def cmd_benchmark_device(args: argparse.Namespace) -> None:
     if historical_returns is None:
         logger.info("Using synthetic env for benchmark (use --use-historical to match train setup)")
 
+    ppo_kwargs = None
+    if getattr(args, "use_tuned", False):
+        from ..meta_learner.tuner import load_tuned_params
+
+        tuned = load_tuned_params()
+        if tuned:
+            ppo_kwargs = dict(tuned)
+            ppo_kwargs.pop("historical_ratio", None)
+            ppo_kwargs.pop("best_value", None)
+            logger.info("Benchmark using tuned PPO hyperparameters from ppo_tune_best.json")
+
     logger.info("Running PPO for %d timesteps on each device...", timesteps)
     results = benchmark_device(
         n_assets=n_assets,
         timesteps=timesteps,
         historical_returns=historical_returns,
         specialist_fn=None,
+        ppo_kwargs=ppo_kwargs,
     )
 
     cpu_sec = results.get("cpu")
@@ -973,7 +1050,7 @@ def cmd_tune(args: argparse.Namespace) -> None:
     import time
 
     from ..config import PPO_N_ENVS
-    from ..meta_learner.tuner import PPO_TUNE_PARAMS_PATH, run_tuning
+    from ..meta_learner.tuner import PPO_TUNE_PARAMS_PATH, run_tuning, tune_best_params_json_path
 
     tickers = _tickers_from_args(args)
     n_assets = len(tickers)
@@ -1051,6 +1128,7 @@ def cmd_tune(args: argparse.Namespace) -> None:
         n_envs if n_envs is not None else PPO_N_ENVS,
     )
     tune_trading_dates = aligned.index[: len(tuning_returns)]
+    per_study_params_path = tune_best_params_json_path(study_name)
     best = run_tuning(
         returns_array=tuning_returns,
         n_assets=n_assets,
@@ -1062,9 +1140,15 @@ def cmd_tune(args: argparse.Namespace) -> None:
         load_if_exists=load_if_exists,
         fixed_historical_ratio=fixed_historical_ratio,
         single_thread=single_thread,
+        params_path=per_study_params_path,
         historical_trading_dates=tune_trading_dates,
     )
-    logger.info("Tuning complete. Best params saved to %s", PPO_TUNE_PARAMS_PATH)
+    logger.info(
+        "Tuning complete. Best params for study %r: %s (also mirrored to %s for train --use-tuned without --tuned-study).",
+        study_name,
+        per_study_params_path,
+        PPO_TUNE_PARAMS_PATH,
+    )
     try:
         from ..broker.discord_notifier import send_hpo_complete_embed
         if send_hpo_complete_embed(
@@ -1080,7 +1164,11 @@ def cmd_tune(args: argparse.Namespace) -> None:
     for k, v in best.items():
         if k != "policy_kwargs":
             logger.info("  %s: %s", k, v)
-    logger.info("Run 'train --use-historical --use-tuned' to train with these params.")
+    logger.info(
+        "Run e.g. train --use-historical --use-tuned --tuned-study %s (or omit --tuned-study to use %s).",
+        study_name,
+        PPO_TUNE_PARAMS_PATH.name,
+    )
     try:
         from .formatting import write_result_path
 

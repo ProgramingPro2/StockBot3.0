@@ -1,0 +1,8 @@
+{
+  "ALPACA_SECRET_KEY": "Alpaca API secret key; pair with ALPACA_API_KEY. Never commit real values.",
+  "ALPACA_BASE_URL": "Alpaca REST API base URL. Use https://paper-api.alpaca.markets/v2 for paper trading.",
+  "UNIVERSE_SOURCE": "How the tradable universe is built (e.g. file reads UNIVERSE_FILE; other modes if configured).",
+  "UNIVERSE_FILE": "Path to the universe list file when UNIVERSE_SOURCE=file (relative to project root unless absolute).",
+  "STARTING_CAPITAL": "Starting portfolio value in dollars for backtests, training envs, and sizing context in paper/live.",
+  "LIVE_PPO_MODEL_PATH": "Filesystem path to the PPO meta-learner checkpoint used when running live Alpaca trading."
+}

@@ -27,7 +27,17 @@ def register(app: typer.Typer) -> None:
             help="Fraction of episodes on historical vs synthetic data (0.0-1.0).",
         ),
         use_tuned: bool = typer.Option(False, "--use-tuned", help="Use hyperparameters from a previous tune run."),
+        tuned_study: Optional[str] = typer.Option(
+            None,
+            "--tuned-study",
+            help="Optuna study name to load best params from (see: tune status). Omit to use models/meta_learner/ppo_tune_best.json.",
+        ),
         n_envs: Optional[int] = typer.Option(None, "--n-envs", help="Parallel envs for SubprocVecEnv (default: PPO_N_ENVS)."),
+        ignore_early_stopping: bool = typer.Option(
+            False,
+            "--ignore-early-stopping",
+            help="Train for the full timestep budget; do not stop on validation plateau.",
+        ),
         debug: bool = typer.Option(False, "--debug", help="Enable verbose specialist verification logging."),
         json_output: bool = typer.Option(False, "--json", help="Emit only machine-readable result and suppress Rich output."),
     ) -> None:
@@ -54,8 +64,10 @@ def register(app: typer.Typer) -> None:
                     "Timesteps": f"{timesteps:,}",
                     "Historical ratio": f"{ratio:.2f}",
                     "Use tuned": str(use_tuned),
+                    "Tuned study": tuned_study or "(default JSON)",
                     "Retrain specialists": str(retrain),
                     "Parallel envs": str(n_envs or PPO_N_ENVS),
+                    "Ignore early stopping": str(ignore_early_stopping),
                 },
             )
             trade_list((tickers or ",".join(TRADE_TICKERS)).split(","), title="Trade list")
@@ -67,7 +79,9 @@ def register(app: typer.Typer) -> None:
             use_historical=use_historical,
             historical_ratio=historical_ratio,
             use_tuned=use_tuned,
+            tuned_study=tuned_study,
             n_envs=n_envs,
+            ignore_early_stopping=ignore_early_stopping,
             debug=debug,
         )
         cmd_train(args)

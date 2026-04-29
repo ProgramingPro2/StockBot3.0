@@ -317,6 +317,8 @@ def _build_train_argv(options: dict[str, Any]) -> list[str]:
         argv.append("--use-historical")
     if opts.get("use_tuned"):
         argv.append("--use-tuned")
+    if opts.get("tuned_study"):
+        argv.extend(["--tuned-study", str(opts["tuned_study"])])
     if opts.get("retrain"):
         argv.append("--retrain")
     if opts.get("historical_ratio") is not None:

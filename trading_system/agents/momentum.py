@@ -1,6 +1,8 @@
 """
 Momentum Specialist: LightGBM for short-horizon momentum score.
 """
+import os
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -87,12 +89,15 @@ def _ensure_model(tickers: list[str] | None = None, retrain: bool = False) -> bo
     _scaler = StandardScaler()
     X_scaled = _scaler.fit_transform(X_imp)
 
+    _njobs_raw = os.getenv("LIGHTGBM_N_JOBS", "-1").strip()
+    _njobs = int(_njobs_raw) if _njobs_raw else -1
     _model = lgb.LGBMRegressor(
         n_estimators=MOMENTUM_N_ESTIMATORS,
         max_depth=MOMENTUM_MAX_DEPTH,
         learning_rate=MOMENTUM_LEARNING_RATE,
         verbosity=-1,
         force_col_wise=True,
+        n_jobs=_njobs,
     )
     _model.fit(X_scaled, y)
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Flame, Play, ExternalLink } from "lucide-react";
-import { ApiClient } from "../lib/api";
+import { ApiClient, type TuneStudySummary } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import JobControl from "../components/JobControl";
 import LogStream from "../components/LogStream";
@@ -14,6 +14,16 @@ import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import EquitySeriesChart from "../components/EquitySeriesChart";
 
+function studyOptionLabel(s: TuneStudySummary): string {
+  if (s.error) return `${s.name} (load error)`;
+  const bits: string[] = [`${s.n_trials} trials`];
+  if (s.best_value != null && Number.isFinite(s.best_value)) {
+    bits.push(`best ${s.best_value.toFixed(4)}`);
+    if (s.best_trial != null) bits.push(`trial #${s.best_trial}`);
+  }
+  return `${s.name} — ${bits.join(", ")}`;
+}
+
 export default function Train() {
   const defaults = useDefaultTickers();
   const [tickers, setTickers] = useState("");
@@ -21,7 +31,9 @@ export default function Train() {
   const [historicalRatio, setHistoricalRatio] = useState<number | "">("");
   const [useHistorical, setUseHistorical] = useState(true);
   const [useTuned, setUseTuned] = useState(false);
+  const [tunedStudy, setTunedStudy] = useState("");
   const [retrain, setRetrain] = useState(false);
+  const [ignoreEarlyStopping, setIgnoreEarlyStopping] = useState(false);
   const [nEnvs, setNEnvs] = useState<number | "">("");
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
 
@@ -33,6 +45,13 @@ export default function Train() {
     queryFn: () => (jobId ? ApiClient.jobResult(jobId) : Promise.resolve(null)),
     enabled: !!jobId,
     refetchInterval: jobId ? 4_000 : false,
+  });
+
+  const tuneStudies = useQuery({
+    queryKey: ["tune-studies"],
+    queryFn: () => ApiClient.getTuneStudies(),
+    enabled: useTuned,
+    staleTime: 60_000,
   });
 
   const trainResult = result.data as { plot_path?: string; series_path?: string } | null;
@@ -52,7 +71,9 @@ export default function Train() {
       use_historical: useHistorical,
       use_tuned: useTuned,
       retrain,
+      ignore_early_stopping: ignoreEarlyStopping,
     };
+    if (useTuned && tunedStudy.trim()) params.tuned_study = tunedStudy.trim();
     if (tickers) params.tickers = tickers;
     if (historicalRatio !== "") params.historical_ratio = historicalRatio;
     if (nEnvs !== "") params.n_envs = nEnvs;
@@ -134,12 +155,46 @@ export default function Train() {
             <Toggle
               label="Use tuned hyperparameters"
               checked={useTuned}
-              onChange={setUseTuned}
+              onChange={(v) => {
+                setUseTuned(v);
+                if (!v) setTunedStudy("");
+              }}
             />
+            {useTuned && (
+              <Field
+                label="Tuned hyperparameters source"
+                hint="Choose an Optuna study for a specific tune run, or leave default to use ppo_tune_best.json from the last completed tune."
+              >
+                <select
+                  className="input w-full"
+                  value={tunedStudy}
+                  onChange={(e) => setTunedStudy(e.target.value)}
+                >
+                  <option value="">Default (ppo_tune_best.json)</option>
+                  {(tuneStudies.data ?? []).map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {studyOptionLabel(s)}
+                    </option>
+                  ))}
+                </select>
+                {tuneStudies.isLoading && (
+                  <p className="text-xs text-ink-muted mt-1">Loading studies…</p>
+                )}
+                {tuneStudies.isError && (
+                  <p className="text-xs text-rose-600 mt-1">Could not load tuning studies.</p>
+                )}
+              </Field>
+            )}
             <Toggle
               label="Force retrain specialists"
               checked={retrain}
               onChange={setRetrain}
+            />
+            <Toggle
+              label="Ignore early stopping"
+              hint="Run the full timestep budget; PPO will not stop on validation plateau."
+              checked={ignoreEarlyStopping}
+              onChange={setIgnoreEarlyStopping}
             />
           </div>
 
@@ -194,19 +249,24 @@ export default function Train() {
 
 function Toggle({
   label,
+  hint,
   checked,
   onChange,
 }: {
   label: string;
+  hint?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
 }) {
   return (
-    <label className="flex items-center justify-between gap-3 rounded-lg border border-bg-border bg-bg-subtle px-3 py-2 text-sm cursor-pointer">
-      <span>{label}</span>
+    <label className="flex items-start justify-between gap-3 rounded-lg border border-bg-border bg-bg-subtle px-3 py-2 text-sm cursor-pointer">
+      <span className="min-w-0">
+        <span className="block">{label}</span>
+        {hint ? <span className="mt-0.5 block text-xs text-ink-muted font-normal">{hint}</span> : null}
+      </span>
       <input
         type="checkbox"
-        className="h-4 w-4 accent-accent"
+        className="mt-0.5 h-4 w-4 shrink-0 accent-accent"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
       />

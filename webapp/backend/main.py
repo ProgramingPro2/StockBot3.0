@@ -2,7 +2,7 @@
 
 Run locally (default port 28473, override with BOARDROOM_PORT):
 
-    uvicorn webapp.backend.main:app --reload --port 28473
+    uvicorn webapp.backend.main:app --reload --host 0.0.0.0 --port 28473
 """
 from __future__ import annotations
 
