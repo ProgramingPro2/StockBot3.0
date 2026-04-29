@@ -108,6 +108,8 @@ Options:
 - `--n-trials`: Number of Optuna trials (default: 50)
 - `--timesteps`: PPO timesteps per trial (default: 100000)
 - `--timeout`: Max seconds for tuning; 0 = no limit (default)
+- `--study-name`: Optuna study name to create or resume (non-interactive resume of a specific study)
+- `--pick-study`: When continuing an existing run (omit `--new`), print studies from storage and prompt for index or name; requires a TTY unless `--study-name` is already set. List studies without tuning: `python -m trading_system tune status`.
 
 Best parameters are saved to `trading_system/models/meta_learner/ppo_tune_best.json`, including `historical_ratio` (tuned). Then train with them:
 
@@ -292,7 +294,7 @@ The default HTTP port is **28473** (set `BOARDROOM_PORT` in `.env` or the shell 
 ### Pages
 
 - **Dashboard**: running jobs, GPU/CPU/memory pills, latest backtest/training previews (interactive Recharts from sibling JSON next to each PNG), quick-start tiles.
-- **Train / Tune**: typed forms, live log stream, recharts panels for `ep_rew_mean`, policy/value/entropy losses and KL.
+- **Train / Tune**: typed forms, live log stream, recharts panels for `ep_rew_mean`, policy/value/entropy losses and KL. On **Tune**, when not starting a new study, the UI loads existing Optuna studies from storage and offers a resume dropdown (plus optional custom name override).
 - **Backtest**: model picker, ticker chips, interactive equity curve (B&H overlay, drawdown, histogram, weights, brush zoom) from `outputs/*.json`, static PNG link, final stats table.
 - **Paper / Live**: start/stop with a guard so paper and live cannot run simultaneously; live mode requires an explicit confirmation toggle.
 - **Models**: list `ppo_trader*.zip`, set the live default (writes `LIVE_PPO_MODEL_PATH`), delete with confirm.

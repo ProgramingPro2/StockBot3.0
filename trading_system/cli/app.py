@@ -49,6 +49,9 @@ _register_all()
 
 def main() -> None:
     """Entry point for ``python -m trading_system`` and ``boardroom`` console script."""
+    from ..utils.graceful_shutdown import install_signal_handlers
+
+    install_signal_handlers()
     app()
 
 

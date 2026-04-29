@@ -110,6 +110,39 @@ def record_end(run_id: str, *, status: str = "ok", extra: dict[str, Any] | None 
         _write(rows)
 
 
+def current_run_id() -> str | None:
+    """Return ``BOARDROOM_RUN_ID`` when set (``cmd_train`` / job manager set this before specialists)."""
+    forced = os.environ.get("BOARDROOM_RUN_ID", "").strip()
+    return forced or None
+
+
+def record_subphase(run_id: str, phase: str, *, tb_path: str) -> None:
+    """Append a specialist or other sub-run entry to ``subphases`` on the matching run row."""
+    entry: dict[str, Any] = {"phase": phase, "tb_path": tb_path, "started": _isoformat()}
+    with _lock:
+        rows = _read()
+        for row in rows:
+            if row.get("run_id") == run_id:
+                subs = list(row.get("subphases") or [])
+                subs.append(entry)
+                row["subphases"] = subs
+                _write(rows)
+                return
+
+
+def record_merge_extra(run_id: str, extra: dict[str, Any]) -> None:
+    """Merge ``extra`` keys into an existing run row (e.g. PPO ``mode`` after env is built)."""
+    if not extra:
+        return
+    with _lock:
+        rows = _read()
+        for row in rows:
+            if row.get("run_id") == run_id:
+                row.update(extra)
+                _write(rows)
+                return
+
+
 def list_runs() -> list[dict[str, Any]]:
     with _lock:
         return list(reversed(_read()))
@@ -118,9 +151,12 @@ def list_runs() -> list[dict[str, Any]]:
 __all__ = [
     "RUNS_INDEX_PATH",
     "TENSORBOARD_DIR",
+    "current_run_id",
     "list_runs",
     "make_run_id",
     "record_end",
+    "record_merge_extra",
     "record_start",
+    "record_subphase",
     "tb_log_dir_for",
 ]

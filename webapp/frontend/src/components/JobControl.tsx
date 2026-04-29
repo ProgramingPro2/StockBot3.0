@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Play, Square } from "lucide-react";
+import { Loader2, Play, Square, XOctagon } from "lucide-react";
 import { useState } from "react";
 import { ApiClient, type JobInfo } from "../lib/api";
 import StatusPill from "./StatusPill";
@@ -41,16 +41,33 @@ export default function JobControl({
   const stopMut = useMutation({
     mutationFn: (id: string) => ApiClient.stopJob(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+    onError: (err: Error) => setError(err.message),
+  });
+  const killMut = useMutation({
+    mutationFn: (id: string) => ApiClient.killJob(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+    onError: (err: Error) => setError(err.message),
   });
 
   const isRunning =
     job?.status === "running" ||
     job?.status === "pending" ||
     job?.status === "stopping";
+  const isStopping = job?.status === "stopping";
+
+  const onKillClick = () => {
+    if (!job) return;
+    const ok = window.confirm(
+      "Force-kill this job? Partial progress (best params, checkpoints) may not be saved. Use Stop first for a clean exit."
+    );
+    if (!ok) return;
+    setError(null);
+    killMut.mutate(job.id);
+  };
 
   return (
     <div className="space-y-2">
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 flex-wrap">
         {!isRunning ? (
           <button
             type="button"
@@ -70,19 +87,40 @@ export default function JobControl({
             {startMut.isPending ? busyLabel : startLabel}
           </button>
         ) : (
-          <button
-            type="button"
-            disabled={stopMut.isPending || job?.status === "stopping"}
-            onClick={() => job && stopMut.mutate(job.id)}
-            className="btn-secondary"
-          >
-            {stopMut.isPending ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Square className="h-4 w-4" />
-            )}
-            Stop
-          </button>
+          <>
+            <button
+              type="button"
+              disabled={stopMut.isPending || isStopping}
+              onClick={() => {
+                if (!job) return;
+                setError(null);
+                stopMut.mutate(job.id);
+              }}
+              className="btn-secondary"
+              title="Graceful stop: finish current trial/rollout/cycle then exit"
+            >
+              {stopMut.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Square className="h-4 w-4" />
+              )}
+              {isStopping ? "Stopping…" : "Stop"}
+            </button>
+            <button
+              type="button"
+              disabled={killMut.isPending}
+              onClick={onKillClick}
+              className="btn-danger"
+              title="Force kill: SIGKILL the subprocess immediately (no graceful save)"
+            >
+              {killMut.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <XOctagon className="h-4 w-4" />
+              )}
+              Kill
+            </button>
+          </>
         )}
         {job && <StatusPill status={job.status} />}
         {job?.id && <span className="text-xs text-ink-muted">id: {job.id}</span>}

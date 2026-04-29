@@ -47,6 +47,18 @@ class TrainParams(BaseModel):
     debug: bool = False
 
 
+class TuneStudySummary(BaseModel):
+    name: str
+    n_trials: int = 0
+    best_value: Optional[float] = None
+    best_trial: Optional[int] = None
+    error: Optional[str] = None
+
+
+class TuneStudiesResponse(BaseModel):
+    studies: list[TuneStudySummary]
+
+
 class TuneParams(BaseModel):
     n_trials: int = 50
     timesteps: int = 100_000

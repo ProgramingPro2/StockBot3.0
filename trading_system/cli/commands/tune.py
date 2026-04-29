@@ -30,6 +30,11 @@ def register(app: typer.Typer) -> None:
         use_historical: bool = typer.Option(False, "--use-historical"),
         historical_ratio: Optional[float] = typer.Option(None, "--historical-ratio"),
         interactive: bool = typer.Option(False, "--interactive", help="Prompt for options."),
+        pick_study: bool = typer.Option(
+            False,
+            "--pick-study",
+            help="When continuing (not --new), list studies and prompt which to resume (needs a TTY unless --study-name is set).",
+        ),
         single_thread: bool = typer.Option(False, "--single-thread"),
         debug: bool = typer.Option(False, "--debug"),
         json_output: bool = typer.Option(False, "--json"),
@@ -51,6 +56,7 @@ def register(app: typer.Typer) -> None:
                     "Timeout (s)": timeout or 0,
                     "Study name": study_name or "ppo_tune",
                     "New study": str(new),
+                    "Pick study": str(pick_study),
                     "Use historical": str(use_historical),
                 },
             )
@@ -65,8 +71,10 @@ def register(app: typer.Typer) -> None:
             use_historical=use_historical,
             historical_ratio=historical_ratio,
             interactive=interactive,
+            pick_study=pick_study,
             single_thread=single_thread,
             debug=debug,
+            json_output=json_output,
             tune_action="run",
         )
         cmd_tune(args)
@@ -83,6 +91,11 @@ def register(app: typer.Typer) -> None:
         use_historical: bool = typer.Option(False, "--use-historical"),
         historical_ratio: Optional[float] = typer.Option(None, "--historical-ratio"),
         interactive: bool = typer.Option(False, "--interactive"),
+        pick_study: bool = typer.Option(
+            False,
+            "--pick-study",
+            help="When continuing (not --new), list studies and prompt which to resume (needs a TTY unless --study-name is set).",
+        ),
         single_thread: bool = typer.Option(False, "--single-thread"),
         debug: bool = typer.Option(False, "--debug"),
         json_output: bool = typer.Option(False, "--json"),
@@ -102,8 +115,10 @@ def register(app: typer.Typer) -> None:
             use_historical=use_historical,
             historical_ratio=historical_ratio,
             interactive=interactive,
+            pick_study=pick_study,
             single_thread=single_thread,
             debug=debug,
+            json_output=json_output,
             tune_action="run",
         )
         cmd_tune(args)

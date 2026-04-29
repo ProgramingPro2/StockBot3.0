@@ -43,12 +43,43 @@ from ..config import (
     PPO_N_ENVS,
     PPO_N_STEPS,
 )
+from ..utils.graceful_shutdown import should_stop
 from ..utils.output_cleanup import prune_checkpoints
 from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
 from .eval_helpers import SharpeEvalCallback
 from .metrics_callback import JsonlMetricsCallback, metrics_path
 from .proxy_specialists import normalize_action_max_unit_exposure
-from .runs_index import make_run_id, record_end, record_start, tb_log_dir_for
+from .runs_index import (
+    make_run_id,
+    record_end,
+    record_merge_extra,
+    record_start,
+    tb_log_dir_for,
+)
+
+
+class GracefulShutdownCallback(BaseCallback):
+    """Stop SB3 training cleanly when a graceful shutdown is requested.
+
+    Returning ``False`` from ``_on_step`` causes ``model.learn()`` to exit
+    after the current rollout, which lets the caller run their post-training
+    save / notification path before the process terminates.
+    """
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose=verbose)
+        self._announced = False
+
+    def _on_step(self) -> bool:
+        if should_stop():
+            if not self._announced:
+                self._announced = True
+                if self.verbose > 0:
+                    logging.getLogger("boardroom").info(
+                        "GracefulShutdown: stop requested; ending training after current rollout"
+                    )
+            return False
+        return True
 
 
 class EarlyStoppingCallback(BaseCallback):
@@ -392,18 +423,31 @@ class PPOTrader:
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cuda",
             )
 
-        # Per-run id + TensorBoard directory.
+        # Per-run id + TensorBoard directory (shared with specialist phase when cmd_train set BOARDROOM_RUN_ID).
         run_kind = os.environ.get("BOARDROOM_RUN_KIND", "train")
-        run_id = make_run_id(run_kind)
+        run_id_from_env = os.environ.get("BOARDROOM_RUN_ID", "").strip()
+        if run_id_from_env:
+            run_id = run_id_from_env
+        else:
+            run_id = make_run_id(run_kind)
         tb_dir = tb_log_dir_for(run_id)
         tb_dir.mkdir(parents=True, exist_ok=True)
         try:
-            record_start(
-                run_id,
-                run_kind,
-                timesteps=int(total_timesteps),
-                extra={"mode": mode, "n_envs": int(getattr(env, "num_envs", 1) or 1)},
-            )
+            if run_id_from_env:
+                record_merge_extra(
+                    run_id,
+                    {
+                        "mode": mode,
+                        "n_envs": int(getattr(env, "num_envs", 1) or 1),
+                    },
+                )
+            else:
+                record_start(
+                    run_id,
+                    run_kind,
+                    timesteps=int(total_timesteps),
+                    extra={"mode": mode, "n_envs": int(getattr(env, "num_envs", 1) or 1)},
+                )
         except Exception:  # noqa: BLE001 - bookkeeping must never break training
             pass
 
@@ -448,7 +492,7 @@ class PPOTrader:
 
         checkpoint_dir = META_LEARNER_MODEL_DIR / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        callbacks: list[BaseCallback] = []
+        callbacks: list[BaseCallback] = [GracefulShutdownCallback(verbose=1)]
         if metrics_path() is not None:
             callbacks.append(JsonlMetricsCallback())
         if PPO_CHECKPOINT_FREQ > 0:

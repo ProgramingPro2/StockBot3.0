@@ -35,11 +35,12 @@ from ..config import (
 import numpy as np
 import pandas as pd
 
+from ..utils.graceful_shutdown import should_stop
 from .env import HistoricalTradingEnv, MixedDataEnv
 from .env_helpers import create_proxy_specialist_fn
 from .eval_helpers import SharpeEvalCallback, deterministic_validation_walk
 from .metrics_callback import JsonlMetricsCallback, metrics_path
-from .ppo_trader import _make_env_fn
+from .ppo_trader import GracefulShutdownCallback, _make_env_fn
 from .runs_index import make_run_id, record_end, record_start, tb_log_dir_for
 
 
@@ -144,6 +145,10 @@ def run_tuning(
     def _save_best_cb(study: optuna.Study, trial: optuna.Trial) -> None:
         _save_best_params(study, trial, params_path)
 
+    def _graceful_stop_cb(study: optuna.Study, trial: optuna.Trial) -> None:
+        if should_stop():
+            study.stop()
+
     def objective(trial: optuna.Trial) -> float:
         params = sample_ppo_params(trial, fixed_historical_ratio=fixed_historical_ratio)
         historical_ratio = params.pop("historical_ratio")
@@ -242,7 +247,7 @@ def run_tuning(
             trading_dates=val_trading_dates,
             verbose=0,
         )
-        callbacks: list = [sharpe_eval_callback]
+        callbacks: list = [GracefulShutdownCallback(verbose=1), sharpe_eval_callback]
         if metrics_path() is not None:
             callbacks.insert(0, JsonlMetricsCallback())
 
@@ -307,7 +312,10 @@ def run_tuning(
             study.enqueue_trial(prev)
 
     study.optimize(
-        objective, n_trials=n_trials, timeout=timeout, callbacks=[_save_best_cb],
+        objective,
+        n_trials=n_trials,
+        timeout=timeout,
+        callbacks=[_save_best_cb, _graceful_stop_cb],
         show_progress_bar=show_progress,
     )
 

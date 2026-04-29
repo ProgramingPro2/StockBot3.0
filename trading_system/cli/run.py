@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import warnings
@@ -55,6 +56,7 @@ from ..config import (
     TRADE_LIST_SIZE,
     TRADE_TICKERS,
 )
+from ..utils.graceful_shutdown import should_stop, stop_event
 from ..utils.logger import get_logger, is_debug, set_debug, setup_logger
 from ..utils.pdt import (
     pdt_tracker_from_config,
@@ -64,6 +66,16 @@ from ..utils.pdt import (
 
 setup_logger()
 logger = get_logger()
+
+
+def _interruptible_sleep(seconds: float) -> bool:
+    """Sleep up to ``seconds`` while watching the graceful-shutdown event.
+
+    Returns True if a stop was requested and the sleep was cut short.
+    """
+    if seconds <= 0:
+        return should_stop()
+    return stop_event().wait(timeout=seconds)
 
 
 def _verify_specialist_outputs(outputs: list[dict], tickers: list[str] | None = None) -> None:
@@ -328,6 +340,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     from ..agents.quantitative import _ensure_model as ensure_quantitative
     from ..agents.regime import _ensure_model as ensure_regime
     from ..meta_learner import PPOTrader
+    from ..meta_learner.runs_index import make_run_id, record_end, record_start
 
     tickers = _tickers_from_args(args)
     n_assets = len(tickers)
@@ -335,11 +348,33 @@ def cmd_train(args: argparse.Namespace) -> None:
         logger.error("No tickers specified; use --tickers or set TRADE_TICKERS in config")
         return
 
+    run_kind = os.environ.get("BOARDROOM_RUN_KIND", "train")
+    if not os.environ.get("BOARDROOM_RUN_ID", "").strip():
+        os.environ["BOARDROOM_RUN_ID"] = make_run_id(run_kind)
+    run_boardroom_id = os.environ["BOARDROOM_RUN_ID"].strip()
+    try:
+        record_start(
+            run_boardroom_id,
+            run_kind,
+            tickers=tickers,
+            timesteps=getattr(args, "timesteps", None),
+            extra={"phase": "specialists"},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     logger.info("Training specialists for %d tickers: %s", n_assets, tickers)
-    ensure_quantitative(tickers, retrain=args.retrain)
-    ensure_fundamental(tickers)
-    ensure_regime(retrain=args.retrain)
-    ensure_momentum(tickers, retrain=args.retrain)
+    try:
+        ensure_quantitative(tickers, retrain=args.retrain)
+        ensure_fundamental(tickers)
+        ensure_regime(retrain=args.retrain)
+        ensure_momentum(tickers, retrain=args.retrain)
+    except BaseException:
+        try:
+            record_end(run_boardroom_id, status="failed")
+        except Exception:  # noqa: BLE001
+            pass
+        raise
 
     historical_ratio = getattr(args, "historical_ratio", None)
     if historical_ratio is not None:
@@ -851,6 +886,57 @@ def _run_backtest(
     )
 
 
+def _prompt_resume_study_name() -> str | None:
+    """List studies in Optuna storage and prompt which to resume.
+
+    Returns ``None`` if storage has no studies (caller keeps default ``ppo_tune``).
+    Otherwise returns the chosen study name (including default on empty input).
+    """
+    from ..meta_learner.tuner import get_tune_status
+
+    status = get_tune_status(study_name=None)
+    names = sorted(status.get("study_names", []))
+    studies = status.get("studies", {})
+    if not names:
+        print("No existing studies in storage; will use default study name ppo_tune.")
+        return None
+
+    print("Existing studies:")
+    for i, name in enumerate(names, start=1):
+        info = studies.get(name, {})
+        if "error" in info:
+            extra = " (load error)"
+        else:
+            n_tr = info.get("n_trials", 0)
+            bv = info.get("best_value")
+            bt = info.get("best_trial")
+            if bv is not None:
+                extra = f"  n_trials={n_tr}  best_value={bv:.4f}  trial={bt}"
+            else:
+                extra = f"  n_trials={n_tr}  (no completed trials)"
+        print(f"  {i}. {name}{extra}")
+
+    default = "ppo_tune" if "ppo_tune" in names else names[0]
+    print(
+        f"Resume which study? Index (1-{len(names)}) or exact name "
+        f"[default: {default}]: ",
+        end="",
+    )
+    for _ in range(3):
+        raw = input().strip()
+        if not raw:
+            return default
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(names):
+                return names[idx - 1]
+        if raw in names:
+            return raw
+        print(f"Invalid. Enter 1-{len(names)} or exact study name [default: {default}]: ", end="")
+    print(f"Using default after invalid input: {default}")
+    return default
+
+
 def _tune_interactive_prompt() -> dict:
     """Prompt for tuning options; return dict of n_trials, timesteps, timeout, new, study_name, n_envs, use_historical, single_thread."""
     from ..config import PPO_N_ENVS
@@ -862,7 +948,7 @@ def _tune_interactive_prompt() -> dict:
         print("Study name (optional; press Enter for auto-generated): ", end="")
         result["study_name"] = input().strip() or None
     else:
-        result["study_name"] = None
+        result["study_name"] = _prompt_resume_study_name()
     print("Number of trials (default: 50): ", end="")
     raw = input().strip()
     result["n_trials"] = int(raw) if raw.isdigit() else 50
@@ -905,6 +991,8 @@ def cmd_tune(args: argparse.Namespace) -> None:
     historical_ratio_arg = getattr(args, "historical_ratio", None)
     interactive = getattr(args, "interactive", False)
     single_thread = getattr(args, "single_thread", False)
+    pick_study = getattr(args, "pick_study", False)
+    json_output = getattr(args, "json_output", False)
 
     if interactive:
         prompted = _tune_interactive_prompt()
@@ -916,6 +1004,16 @@ def cmd_tune(args: argparse.Namespace) -> None:
         n_envs = prompted.get("n_envs") if prompted.get("n_envs") is not None else n_envs
         use_historical = prompted.get("use_historical", False)
         single_thread = prompted.get("single_thread", False)
+
+    if pick_study and not start_new and study_name_arg is None:
+        if json_output or not sys.stdin.isatty():
+            logger.error(
+                "--pick-study needs an interactive terminal when --study-name is not set. "
+                "Use --study-name NAME (list studies: python -m trading_system tune status)."
+            )
+            return
+        picked = _prompt_resume_study_name()
+        study_name_arg = picked if picked is not None else study_name_arg
 
     if start_new and not study_name_arg:
         study_name_arg = f"ppo_tune_{int(time.time())}"
@@ -1163,6 +1261,9 @@ def cmd_paper(args: argparse.Namespace) -> None:
     paper_shares: dict[str, float] = {t: 0.0 for t in tickers}
 
     while True:
+        if should_stop():
+            logger.info("Paper trading stop requested; exiting cleanly")
+            break
         try:
             do_ollama = (time.time() - last_ollama_time) >= (OLLAMA_INTERVAL_MIN * 60)
             logger.info("Cycle ollama_refresh=%s (%s)", do_ollama, "sentiment+boardroom from LLM" if do_ollama else "cached sentiment/boardroom")
@@ -1275,13 +1376,17 @@ def cmd_paper(args: argparse.Namespace) -> None:
                 "ollama_refresh" if do_ollama else "cache_only",
                 final_m2m,
             )
-            time.sleep(interval_sec)
+            if _interruptible_sleep(interval_sec):
+                logger.info("Paper trading stop requested; exiting cleanly")
+                break
         except KeyboardInterrupt:
             logger.info("Paper trading stopped")
             break
         except Exception as e:
             logger.exception("Paper loop error: %s", e)
-            time.sleep(60)
+            if _interruptible_sleep(60):
+                logger.info("Paper trading stop requested; exiting cleanly")
+                break
 
 
 def cmd_live(args: argparse.Namespace) -> None:
@@ -1331,6 +1436,9 @@ def cmd_live(args: argparse.Namespace) -> None:
     pdt_tracker = pdt_tracker_from_config()
 
     while True:
+        if should_stop():
+            logger.info("Live trading stop requested; exiting cleanly")
+            break
         try:
             from datetime import datetime
             from zoneinfo import ZoneInfo
@@ -1423,7 +1531,9 @@ def cmd_live(args: argparse.Namespace) -> None:
             if not broker.is_market_open():
                 logger.info("Market closed (Alpaca clock); skipping orders this cycle")
                 logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
-                time.sleep(interval_sec)
+                if _interruptible_sleep(interval_sec):
+                    logger.info("Live trading stop requested; exiting cleanly")
+                    break
                 continue
 
             # Cooldowns: do not sell if bought recently; do not buy if sold recently
@@ -1446,7 +1556,9 @@ def cmd_live(args: argparse.Namespace) -> None:
                 next_midnight = now_dt.date() + timedelta(days=1)
                 next_day = datetime(next_midnight.year, next_midnight.month, next_midnight.day, 0, 0, 1, tzinfo=tz)
                 sec_until = max(1, int((next_day - now_dt).total_seconds()))
-                time.sleep(sec_until)
+                if _interruptible_sleep(sec_until):
+                    logger.info("Live trading stop requested; exiting cleanly")
+                    break
                 continue
 
             # For whole-share orders we need latest price per ticker
@@ -1567,13 +1679,17 @@ def cmd_live(args: argparse.Namespace) -> None:
                     logger.info("HOLD %s | Position=%.1f%%", t, position_pct * 100)
 
             logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
-            time.sleep(interval_sec)
+            if _interruptible_sleep(interval_sec):
+                logger.info("Live trading stop requested; exiting cleanly")
+                break
         except KeyboardInterrupt:
             logger.info("Live trading stopped")
             break
         except Exception as e:
             logger.exception("Live trading error: %s", e)
-            time.sleep(60)
+            if _interruptible_sleep(60):
+                logger.info("Live trading stop requested; exiting cleanly")
+                break
 
 
 def cmd_test(args: argparse.Namespace) -> None:

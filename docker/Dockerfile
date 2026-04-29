@@ -31,6 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
         tzdata \
+        libgl1 \
+        libglib2.0-0 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
     && python -m pip install --upgrade pip setuptools wheel \

@@ -324,43 +324,67 @@ class JobManager:
             _persist_registry(self._jobs.values())
         return info.model_copy()
 
-    def stop(self, job_id: str, timeout: float = 10.0) -> JobInfo | None:
+    def stop(self, job_id: str) -> JobInfo | None:
+        """Request a graceful shutdown: SIGTERM only, no escalation.
+
+        The subprocess listens for SIGTERM and finishes its current unit of
+        work (Optuna trial, SB3 rollout, paper/live cycle) before exiting.
+        Use :meth:`kill` to force-quit if the process refuses to exit.
+        """
         with self._lock:
             job = self._jobs.get(job_id)
         if not job or not job.process or job.process.poll() is not None:
             if job:
                 return job.info.model_copy()
             return None
+        job.cancel_event.set()
         job.info.status = "stopping"
+        self._send_signal(job, signal.SIGTERM)
+        return job.info.model_copy()
+
+    def kill(self, job_id: str, grace_seconds: float = 0.5) -> JobInfo | None:
+        """Force-kill the job: brief SIGTERM, then SIGKILL the process group."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if not job or not job.process or job.process.poll() is not None:
+            if job:
+                return job.info.model_copy()
+            return None
+        job.cancel_event.set()
+        job.info.status = "stopping"
+        self._send_signal(job, signal.SIGTERM)
         try:
-            os.killpg(os.getpgid(job.process.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            try:
-                job.process.terminate()
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            job.process.wait(timeout=timeout)
+            job.process.wait(timeout=max(0.0, grace_seconds))
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(job.process.pid), signal.SIGKILL)
-            except Exception:  # noqa: BLE001
-                try:
-                    job.process.kill()
-                except Exception:  # noqa: BLE001
-                    pass
+            self._send_signal(job, signal.SIGKILL)
             try:
                 job.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
         return job.info.model_copy()
 
+    def _send_signal(self, job: _Job, sig: int) -> None:
+        if not job.process:
+            return
+        try:
+            os.killpg(os.getpgid(job.process.pid), sig)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            if sig == signal.SIGKILL:
+                job.process.kill()
+            else:
+                job.process.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+
     def stop_all(self) -> None:
         with self._lock:
             jobs = list(self._jobs.values())
         for job in jobs:
             if job.info.status in {"running", "pending", "stopping"}:
-                self.stop(job.info.id)
+                self.kill(job.info.id)
 
     # --- streaming ---
     def subscribe_logs(self, job_id: str, replay: bool = True) -> asyncio.Queue[str | None] | None:

@@ -20,9 +20,36 @@ from ..schemas import (
     TrainParams,
     TrainUniverseParams,
     TuneParams,
+    TuneStudiesResponse,
+    TuneStudySummary,
 )
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+@router.get("/tune/studies", response_model=TuneStudiesResponse)
+def list_tune_studies() -> TuneStudiesResponse:
+    """List Optuna studies in local tuning storage (for resume picker in the UI)."""
+    from trading_system.meta_learner.tuner import get_tune_status
+
+    status = get_tune_status(study_name=None)
+    names = sorted(status.get("study_names", []))
+    raw = status.get("studies", {})
+    studies: list[TuneStudySummary] = []
+    for name in names:
+        info = raw.get(name, {})
+        if "error" in info:
+            studies.append(TuneStudySummary(name=name, error=info["error"]))
+            continue
+        studies.append(
+            TuneStudySummary(
+                name=name,
+                n_trials=int(info.get("n_trials", 0)),
+                best_value=info.get("best_value"),
+                best_trial=info.get("best_trial"),
+            )
+        )
+    return TuneStudiesResponse(studies=studies)
 
 
 @router.get("", response_model=JobListResponse)
@@ -90,11 +117,25 @@ def start_benchmark(params: BenchmarkParams) -> StartJobResponse:
 
 @router.post("/{job_id}/stop", response_model=StopJobResponse)
 def stop_job(job_id: str) -> StopJobResponse:
+    """Graceful stop: SIGTERM the subprocess so it can finish its current
+    Optuna trial, SB3 rollout, or paper/live cycle and exit cleanly."""
     mgr = get_manager()
     info = mgr.get_info(job_id)
     if not info:
         raise HTTPException(status_code=404, detail="job not found")
     out = mgr.stop(job_id) or info
+    return StopJobResponse(ok=True, job=out)
+
+
+@router.post("/{job_id}/kill", response_model=StopJobResponse)
+def kill_job(job_id: str) -> StopJobResponse:
+    """Force kill: SIGTERM then SIGKILL the subprocess group immediately.
+    Use when graceful stop is wedged or too slow; partial saves not guaranteed."""
+    mgr = get_manager()
+    info = mgr.get_info(job_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="job not found")
+    out = mgr.kill(job_id) or info
     return StopJobResponse(ok=True, job=out)
 
 

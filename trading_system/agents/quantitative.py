@@ -10,7 +10,7 @@ import torch
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer
 from lightning.pytorch import Trainer
-from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.loggers import TensorBoardLogger
 
 from ..config import (
     DEVICE,
@@ -26,6 +26,8 @@ from ..config import (
 )
 from ..data.loader import load_ohlcv
 from ..data.processor import prepare_tft_data, prepare_tft_data_inference
+from ..meta_learner.runs_index import TENSORBOARD_DIR, current_run_id, record_subphase
+from ..utils.lightning_progress import EpochProgressCallback
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -124,12 +126,26 @@ def _ensure_model(
         attention_head_size=TFT_ATTENTION_HEAD_SIZE,
     )
 
+    run_id = current_run_id() or "manual"
+    tb_subdir = f"{run_id}_specialist_quant"
+    TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
+    tb_logger = TensorBoardLogger(
+        save_dir=str(TENSORBOARD_DIR),
+        name="",
+        version=tb_subdir,
+    )
+    try:
+        record_subphase(run_id, "specialist_quant", tb_path=str(tb_logger.log_dir))
+    except Exception:  # noqa: BLE001
+        pass
+
     trainer = Trainer(
         max_epochs=10,
         accelerator=_get_device(),
         devices=1,
-        logger=CSVLogger(QUANTITATIVE_MODEL_DIR, name="logs"),
-        enable_progress_bar=True,
+        logger=tb_logger,
+        callbacks=[EpochProgressCallback(phase="specialist_quant")],
+        enable_progress_bar=False,
         enable_model_summary=False,
     )
     with warnings.catch_warnings():
