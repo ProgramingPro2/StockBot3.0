@@ -114,6 +114,7 @@ Options:
 - `--timeout`: Max seconds for tuning; 0 = no limit (default)
 - `--study-name`: Optuna study name to create or resume (non-interactive resume of a specific study)
 - `--pick-study`: When continuing an existing run (omit `--new`), print studies from storage and prompt for index or name; requires a TTY unless `--study-name` is already set. List studies without tuning: `python -m trading_system tune status`.
+- Hung parallel workers / resume: see [docs/tune-recovery.md](docs/tune-recovery.md).
 - `--n-envs`: Parallel envs per trial (default: `min(32, cpu_count)`). Wider rollouts improve GPU utilisation when `PPO_DEVICE=cuda`.
 - `--parallel-trials`: Run multiple Optuna worker processes against the same SQLite study (default: `PPO_PARALLEL_TRIALS` in `.env`, or 1). Enable SQLite WAL automatically.
 - `--torch-vec`: Use the batched in-process vec env for historical-only trials (also set `PPO_USE_TORCH_VEC=1` to default it on without the flag).

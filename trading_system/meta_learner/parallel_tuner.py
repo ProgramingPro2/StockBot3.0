@@ -3,10 +3,12 @@ Parallel Optuna workers for tuning (same SQLite study) and optional tune bench.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import sys
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,46 @@ from ..config import PPO_N_ENVS
 from .proxy_specialists import precompute_proxy_feature_matrix
 from .torch_vec_env import BatchedHistoricalTorchVecEnv
 from .tuner import PPO_TUNE_STUDY_PATH, export_best_params_after_study, run_tuning
+
+_log = logging.getLogger("boardroom")
+
+
+def _start_parallel_tune_stall_watchdog(db_path: Path, stop_evt: threading.Event, stall_sec: float) -> threading.Thread:
+    """
+    Parent-only watchdog: if the study DB file sees no mtime change for ``stall_sec``,
+    assume workers wedged and exit the process (so systemd/docker can restart).
+
+    Opt-in via ``PPO_TUNE_STALL_TIMEOUT_SEC`` (seconds). Default 0 = disabled.
+    Long single-trial phases may not touch the DB; set high enough for your
+    ``--timesteps`` and ``--parallel-trials`` or leave disabled.
+    """
+
+    def run() -> None:
+        try:
+            last_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
+        except OSError:
+            last_mtime = 0.0
+        same_since = time.monotonic()
+        poll = min(60.0, max(5.0, stall_sec / 10.0))
+        while not stop_evt.wait(poll):
+            try:
+                mt = db_path.stat().st_mtime if db_path.exists() else 0.0
+            except OSError:
+                mt = last_mtime
+            if mt != last_mtime:
+                last_mtime = mt
+                same_since = time.monotonic()
+            elif time.monotonic() - same_since >= stall_sec:
+                _log.error(
+                    "Parallel tune stall watchdog: no writes to %s for %ss; exiting.",
+                    db_path,
+                    int(stall_sec),
+                )
+                os._exit(2)
+
+    th = threading.Thread(target=run, name="tune-stall-watchdog", daemon=True)
+    th.start()
+    return th
 
 
 def enable_sqlite_wal(db_path: Path) -> None:
@@ -86,12 +128,26 @@ def run_parallel_tuning(
     from concurrent.futures import ProcessPoolExecutor
 
     max_workers = len(payloads)
-    if sys.version_info >= (3, 11):
-        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
-            list(ex.map(_parallel_worker_entry, payloads, chunksize=1))
-    else:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            list(ex.map(_parallel_worker_entry, payloads, chunksize=1))
+    stall_raw = os.environ.get("PPO_TUNE_STALL_TIMEOUT_SEC", "0").strip()
+    try:
+        stall_sec = float(stall_raw)
+    except ValueError:
+        stall_sec = 0.0
+    stop_watchdog = threading.Event()
+    watchdog_thread: threading.Thread | None = None
+    if stall_sec > 0:
+        watchdog_thread = _start_parallel_tune_stall_watchdog(PPO_TUNE_STUDY_PATH, stop_watchdog, stall_sec)
+    try:
+        if sys.version_info >= (3, 11):
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+                list(ex.map(_parallel_worker_entry, payloads, chunksize=1))
+        else:
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                list(ex.map(_parallel_worker_entry, payloads, chunksize=1))
+    finally:
+        stop_watchdog.set()
+        if watchdog_thread is not None:
+            watchdog_thread.join(timeout=2.0)
 
     study_name = str(kwargs.get("study_name", "ppo_tune"))
     params_path = kwargs.get("params_path")

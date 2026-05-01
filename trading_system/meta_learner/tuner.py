@@ -8,6 +8,7 @@ import logging
 import math
 import multiprocessing
 import os
+import warnings
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ import pandas as pd
 import torch
 from optuna.pruners import HyperbandPruner, MedianPruner
 from optuna.samplers import TPESampler
+from optuna.exceptions import ExperimentalWarning
+from optuna.storages import RDBStorage
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecMonitor
@@ -81,6 +84,30 @@ def _safe_vec_env_close(env: Any) -> None:
 PPO_TUNE_PARAMS_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_best.json"
 PPO_TUNE_STUDY_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_study.db"
 
+_tune_rdb_storage: RDBStorage | None = None
+
+
+def get_tune_rdb_storage() -> RDBStorage:
+    """
+    Shared Optuna SQLite backend with a long busy-timeout and heartbeats.
+
+    Parallel ``ProcessPoolExecutor`` workers contend on the same DB; defaults
+    without ``timeout`` can block indefinitely under load. Heartbeats let Optuna
+    mark stale RUNNING trials after ``grace_period`` when a worker dies.
+    """
+    global _tune_rdb_storage
+    if _tune_rdb_storage is None:
+        META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=ExperimentalWarning)
+            _tune_rdb_storage = RDBStorage(
+                url=f"sqlite:///{PPO_TUNE_STUDY_PATH}",
+                engine_kwargs={"connect_args": {"timeout": 120.0}},
+                heartbeat_interval=60,
+                grace_period=120,
+            )
+    return _tune_rdb_storage
+
 
 def tune_best_params_json_path(study_name: str) -> Path:
     """Per-study JSON path so concurrent or sequential studies do not clobber each other."""
@@ -112,11 +139,10 @@ def load_tuned_params_from_study(study_name: str) -> dict[str, Any] | None:
     name = (study_name or "").strip()
     if not name:
         return None
-    storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
     if not PPO_TUNE_STUDY_PATH.exists():
         return None
     try:
-        study = optuna.load_study(study_name=name, storage=storage)
+        study = optuna.load_study(study_name=name, storage=get_tune_rdb_storage())
     except Exception:
         return None
     if study.best_trial is None:
@@ -482,7 +508,7 @@ def run_tuning(
         )
 
     META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
+    storage = get_tune_rdb_storage()
     if not load_if_exists:
         try:
             optuna.delete_study(study_name=study_name, storage=storage)
@@ -517,7 +543,7 @@ def export_best_params_after_study(
     params_path: Path | None = None,
 ) -> dict[str, Any]:
     """Load study from default storage and write best params JSON (same as end of run_tuning)."""
-    storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
+    storage = get_tune_rdb_storage()
     p = params_path or PPO_TUNE_PARAMS_PATH
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
@@ -630,9 +656,9 @@ def get_tune_status(
     Return status of tuning studies: list of study names and summary for each.
     If study_name is given, include best trial and best value for that study.
     """
-    storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
     if not PPO_TUNE_STUDY_PATH.exists():
         return {"study_names": [], "studies": {}}
+    storage = get_tune_rdb_storage()
     try:
         study_names = optuna.study.get_all_study_names(storage=storage)
     except Exception:

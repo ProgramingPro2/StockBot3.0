@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trading_system.meta_learner.tuner import load_tuned_params
+from trading_system.meta_learner.tuner import get_tune_rdb_storage, load_tuned_params
 
 
 class TestTunerLoad(unittest.TestCase):
@@ -23,3 +23,8 @@ class TestTunerLoad(unittest.TestCase):
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded["learning_rate"], 1e-4)
             self.assertEqual(loaded["n_steps"], 512)
+
+    def test_get_tune_rdb_storage_singleton(self) -> None:
+        a = get_tune_rdb_storage()
+        b = get_tune_rdb_storage()
+        self.assertIs(a, b)
