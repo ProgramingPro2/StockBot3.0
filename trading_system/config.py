@@ -190,7 +190,13 @@ YFINANCE_LOOKBACK_YEARS = 10
 
 # Device
 DEVICE = "cuda"  # Specialists (TFT, VAE): GPU when available
-PPO_DEVICE = os.getenv("PPO_DEVICE", "cpu")  # PPO meta-learner: CPU recommended by SB3 for MLP
+# PPO meta-learner: default cuda when unset (falls back to cpu if CUDA unavailable in _get_ppo_device).
+# Set PPO_DEVICE=cpu to force CPU for PPO.
+PPO_DEVICE = os.getenv("PPO_DEVICE", "cuda").strip().lower() or "cuda"
+# Batched CUDA vec env for historical-only tuning (single process, no Subproc IPC). Set to 0/false to disable.
+PPO_USE_TORCH_VEC = os.getenv("PPO_USE_TORCH_VEC", "").strip().lower() in ("1", "true", "yes")
+# Optuna: number of parallel worker processes (each runs study.optimize on the same SQLite study).
+PPO_PARALLEL_TRIALS = max(1, int(os.getenv("PPO_PARALLEL_TRIALS", "1").strip() or "1"))
 
 # TFT (Quantitative Specialist)
 TFT_HIDDEN_SIZE = 64
@@ -238,8 +244,9 @@ PPO_EARLY_STOPPING_MIN_DELTA = float(os.getenv("PPO_EARLY_STOPPING_MIN_DELTA", "
 PPO_WEIGHT_DECAY = float(os.getenv("PPO_WEIGHT_DECAY", "0"))
 # CPU threads for PPO when device=cpu; 0 = use all available
 PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4)
-# Parallel envs for SubprocVecEnv; 1 = single env (no subprocess). With n_envs>1, total rollout = n_steps * n_envs
-PPO_N_ENVS = int(os.getenv("PPO_N_ENVS", "4"))
+# Parallel envs for SubprocVecEnv / batched vec env; 1 = single env (no subprocess). With n_envs>1, total rollout = n_steps * n_envs
+_default_ppo_n_envs = min(32, (os.cpu_count() or 8))
+PPO_N_ENVS = int(os.getenv("PPO_N_ENVS", str(_default_ppo_n_envs)).strip() or str(_default_ppo_n_envs))
 
 # PPO training: fraction of episodes on historical vs synthetic data (0.0 = synthetic only, 1.0 = historical only)
 # Default 1.0 so training learns from market data, not self-fulfilling synthetic simulator

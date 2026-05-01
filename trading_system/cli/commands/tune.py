@@ -1,6 +1,7 @@
 """`boardroom tune` - Optuna hyperparameter search."""
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import typer
@@ -27,6 +28,21 @@ def register(app: typer.Typer) -> None:
         new: bool = typer.Option(False, "--new", help="Start a new study."),
         study_name: Optional[str] = typer.Option(None, "--study-name"),
         n_envs: Optional[int] = typer.Option(None, "--n-envs"),
+        parallel_trials: Optional[int] = typer.Option(
+            None,
+            "--parallel-trials",
+            help="Optuna worker processes sharing the same study (default: PPO_PARALLEL_TRIALS or 1).",
+        ),
+        torch_vec: bool = typer.Option(
+            False,
+            "--torch-vec",
+            help="Use batched single-process vec env for historical-only tuning.",
+        ),
+        bench: bool = typer.Option(
+            False,
+            "--bench",
+            help="Run a short Subproc vs torch-vec benchmark and exit.",
+        ),
         use_historical: bool = typer.Option(False, "--use-historical"),
         historical_ratio: Optional[float] = typer.Option(None, "--historical-ratio"),
         interactive: bool = typer.Option(False, "--interactive", help="Prompt for options."),
@@ -58,6 +74,10 @@ def register(app: typer.Typer) -> None:
                     "New study": str(new),
                     "Pick study": str(pick_study),
                     "Use historical": str(use_historical),
+                    "n_envs": str(n_envs if n_envs is not None else f"min(32, cpu)={min(32, os.cpu_count() or 8)}"),
+                    "parallel_trials": str(parallel_trials if parallel_trials is not None else "env default"),
+                    "torch_vec": str(torch_vec),
+                    "bench": str(bench),
                 },
             )
         args = make_args(
@@ -68,6 +88,9 @@ def register(app: typer.Typer) -> None:
             new=new,
             study_name=study_name,
             n_envs=n_envs,
+            parallel_trials=parallel_trials,
+            torch_vec=torch_vec,
+            bench=bench,
             use_historical=use_historical,
             historical_ratio=historical_ratio,
             interactive=interactive,
@@ -88,6 +111,13 @@ def register(app: typer.Typer) -> None:
         new: bool = typer.Option(False, "--new"),
         study_name: Optional[str] = typer.Option(None, "--study-name"),
         n_envs: Optional[int] = typer.Option(None, "--n-envs"),
+        parallel_trials: Optional[int] = typer.Option(
+            None,
+            "--parallel-trials",
+            help="Optuna worker processes sharing the same study (default: PPO_PARALLEL_TRIALS or 1).",
+        ),
+        torch_vec: bool = typer.Option(False, "--torch-vec"),
+        bench: bool = typer.Option(False, "--bench"),
         use_historical: bool = typer.Option(False, "--use-historical"),
         historical_ratio: Optional[float] = typer.Option(None, "--historical-ratio"),
         interactive: bool = typer.Option(False, "--interactive"),
@@ -112,6 +142,9 @@ def register(app: typer.Typer) -> None:
             new=new,
             study_name=study_name,
             n_envs=n_envs,
+            parallel_trials=parallel_trials,
+            torch_vec=torch_vec,
+            bench=bench,
             use_historical=use_historical,
             historical_ratio=historical_ratio,
             interactive=interactive,

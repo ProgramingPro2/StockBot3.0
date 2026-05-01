@@ -76,7 +76,10 @@ def _compute_step_reward(
     utility = float(np.log(max(1e-8, 1.0 + portfolio_return)))
     cost_frac = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
     reward = utility - drawdown_penalty * drawdown - turnover * cost_frac
-    return float(np.clip(np.nan_to_num(reward, nan=0.0, posinf=3.0, neginf=-3.0), -3.0, 3.0))
+    reward = float(np.nan_to_num(reward, nan=0.0, posinf=3.0, neginf=-3.0))
+    if not np.isfinite(reward):
+        reward = 0.0
+    return max(-3.0, min(3.0, reward))
 
 
 class TradingEnv(gym.Env):
@@ -270,11 +273,11 @@ class TradingEnv(gym.Env):
                     ret_5d = float(np.mean(valid[-5:])) if len(valid) >= 5 else 0.0
                     ret_21d = float(np.mean(valid)) if len(valid) > 0 else 0.0
                     vol_21d = float(self._rolling_vols[i])
-                    row[i, j] = np.clip(ret_5d * 50, -1, 1)
+                    row[i, j] = max(-1.0, min(1.0, ret_5d * 50.0))
                     j += 1
-                    row[i, j] = np.clip(ret_21d * 50, -1, 1)
+                    row[i, j] = max(-1.0, min(1.0, ret_21d * 50.0))
                     j += 1
-                    row[i, j] = np.clip((vol_21d - 0.01) * 50, -1, 1)
+                    row[i, j] = max(-1.0, min(1.0, (vol_21d - 0.01) * 50.0))
                     j += 1
                 else:
                     row[i, j : j + 3] = 0.0

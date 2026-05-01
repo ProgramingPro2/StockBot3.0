@@ -45,6 +45,7 @@ class TrainParams(BaseModel):
     tuned_study: Optional[str] = None
     retrain: bool = False
     n_envs: Optional[int] = None
+    torch_vec: bool = False
     ignore_early_stopping: bool = False
     debug: bool = False
 
@@ -70,6 +71,8 @@ class TuneParams(BaseModel):
     use_historical: bool = False
     historical_ratio: Optional[float] = None
     n_envs: Optional[int] = None
+    parallel_trials: Optional[int] = None
+    torch_vec: bool = False
     tickers: Optional[str] = None
     single_thread: bool = False
 
@@ -209,6 +212,18 @@ class SystemInfo(BaseModel):
     cuda_available: bool
     gpus: list[GpuInfo] = Field(default_factory=list)
     host: dict[str, Any] = Field(default_factory=dict)
+
+
+class PpoCalibrationResponse(BaseModel):
+    """Heuristic PPO parallelism hints for this host (fast; no training run)."""
+
+    cpu_count: int
+    cuda_available: bool
+    gpu_mem_total_mb: Optional[float] = None
+    recommended_n_envs: int
+    recommended_parallel_trials: int
+    suggest_torch_vec: bool
+    rationale: str
 
 
 class RunInfo(BaseModel):

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Play, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { Play, RefreshCw, SlidersHorizontal, Wand2 } from "lucide-react";
 import { ApiClient, type TuneStudySummary } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import JobControl from "../components/JobControl";
@@ -35,6 +35,11 @@ export default function Tune() {
   const [resumeOverride, setResumeOverride] = useState("");
   const [useHistorical, setUseHistorical] = useState(true);
   const [singleThread, setSingleThread] = useState(false);
+  const [nEnvs, setNEnvs] = useState<number | "">("");
+  const [parallelTrials, setParallelTrials] = useState<number | "">("");
+  const [torchVec, setTorchVec] = useState(false);
+  const [calibrationNote, setCalibrationNote] = useState<string | null>(null);
+  const [calibrationBusy, setCalibrationBusy] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
 
   const job = useJobByKind("tune");
@@ -78,7 +83,26 @@ export default function Tune() {
       const name = resumeOverride.trim() || resumeSelect.trim();
       if (name) params.study_name = name;
     }
+    if (nEnvs !== "") params.n_envs = nEnvs;
+    if (parallelTrials !== "") params.parallel_trials = parallelTrials;
+    if (torchVec) params.torch_vec = true;
     return ApiClient.startTune(params);
+  };
+
+  const applyCalibration = async () => {
+    setCalibrationBusy(true);
+    setCalibrationNote(null);
+    try {
+      const c = await ApiClient.getPpoCalibration();
+      setNEnvs(c.recommended_n_envs);
+      setParallelTrials(c.recommended_parallel_trials);
+      setTorchVec(c.suggest_torch_vec);
+      setCalibrationNote(c.rationale);
+    } catch (e) {
+      setCalibrationNote(e instanceof Error ? e.message : "Calibration request failed");
+    } finally {
+      setCalibrationBusy(false);
+    }
   };
 
   return (
@@ -124,6 +148,62 @@ export default function Tune() {
               onChange={(e) => setTimeout(parseInt(e.target.value || "0", 10))}
             />
           </Field>
+
+          <div className="border-t border-ink-muted/20 pt-3 space-y-3">
+            <h3 className="text-sm font-semibold text-ink">PPO performance</h3>
+            <div className="grid grid-cols-2 gap-3">
+              <Field
+                label="Parallel envs"
+                hint="Leave empty for server default (min(32, CPU count))."
+              >
+                <input
+                  type="number"
+                  className="input"
+                  min={1}
+                  value={nEnvs}
+                  onChange={(e) =>
+                    setNEnvs(e.target.value === "" ? "" : parseInt(e.target.value, 10))
+                  }
+                  placeholder="default"
+                />
+              </Field>
+              <Field
+                label="Parallel Optuna trials"
+                hint="Leave empty for PPO_PARALLEL_TRIALS from .env (usually 1)."
+              >
+                <input
+                  type="number"
+                  className="input"
+                  min={1}
+                  value={parallelTrials}
+                  onChange={(e) =>
+                    setParallelTrials(
+                      e.target.value === "" ? "" : parseInt(e.target.value, 10),
+                    )
+                  }
+                  placeholder="default"
+                />
+              </Field>
+            </div>
+            <button
+              type="button"
+              className="btn-secondary flex w-full items-center justify-center gap-2 text-sm"
+              onClick={() => void applyCalibration()}
+              disabled={calibrationBusy}
+            >
+              <Wand2 className="h-4 w-4" />
+              {calibrationBusy ? "Detecting…" : "Auto-fill for this machine"}
+            </button>
+            {calibrationNote ? (
+              <p className="text-xs text-ink-muted leading-relaxed">{calibrationNote}</p>
+            ) : null}
+            <Toggle
+              label="Batched vec env (historical-only, less Subproc IPC)"
+              checked={torchVec}
+              onChange={setTorchVec}
+            />
+          </div>
+
           {newStudy ? (
             <Field label="Study name (optional; empty → auto-generated)">
               <input

@@ -33,6 +33,11 @@ def register(app: typer.Typer) -> None:
             help="Optuna study name to load best params from (see: tune status). Omit to use models/meta_learner/ppo_tune_best.json.",
         ),
         n_envs: Optional[int] = typer.Option(None, "--n-envs", help="Parallel envs for SubprocVecEnv (default: PPO_N_ENVS)."),
+        torch_vec: bool = typer.Option(
+            False,
+            "--torch-vec",
+            help="Use batched single-process vec env for full historical training (no daily aux).",
+        ),
         ignore_early_stopping: bool = typer.Option(
             False,
             "--ignore-early-stopping",
@@ -67,6 +72,7 @@ def register(app: typer.Typer) -> None:
                     "Tuned study": tuned_study or "(default JSON)",
                     "Retrain specialists": str(retrain),
                     "Parallel envs": str(n_envs or PPO_N_ENVS),
+                    "Torch vec (historical)": str(torch_vec),
                     "Ignore early stopping": str(ignore_early_stopping),
                 },
             )
@@ -81,6 +87,7 @@ def register(app: typer.Typer) -> None:
             use_tuned=use_tuned,
             tuned_study=tuned_study,
             n_envs=n_envs,
+            torch_vec=torch_vec,
             ignore_early_stopping=ignore_early_stopping,
             debug=debug,
         )

@@ -9,7 +9,7 @@ from typing import Any
 
 import psutil
 
-from .schemas import GpuInfo, SystemInfo
+from .schemas import GpuInfo, PpoCalibrationResponse, SystemInfo
 
 # `nvidia-ml-py` ships the `pynvml` module name; older `pynvml` package is also accepted.
 try:
@@ -136,4 +136,63 @@ def snapshot() -> SystemInfo:
         cuda_available=_cuda_available(),
         gpus=gpus(),
         host=host(),
+    )
+
+
+def ppo_calibration_hints() -> PpoCalibrationResponse:
+    """
+    Recommend n_envs / parallel_trials for tune and n_envs (+ optional torch-vec) for train.
+    Heuristic only; safe defaults for SQLite Optuna concurrency and VRAM.
+    """
+    cpu_count = int(host().get("cpu_count") or os.cpu_count() or 8)
+    cpu_count = max(1, cpu_count)
+    recommended_n_envs = min(32, cpu_count)
+
+    cuda = _cuda_available()
+    gpu_list = gpus()
+    gpu_mem_total_mb: float | None = None
+    if gpu_list:
+        try:
+            gpu_mem_total_mb = float(gpu_list[0].mem_total_mb or 0) or None
+        except (TypeError, ValueError):
+            gpu_mem_total_mb = None
+
+    if not cuda:
+        rationale = (
+            "CUDA not available: use CPU Subproc envs; parallel Optuna workers add little "
+            "and increase contention. n_envs matches CPU count (capped at 32)."
+        )
+        return PpoCalibrationResponse(
+            cpu_count=cpu_count,
+            cuda_available=False,
+            gpu_mem_total_mb=gpu_mem_total_mb,
+            recommended_n_envs=recommended_n_envs,
+            recommended_parallel_trials=1,
+            suggest_torch_vec=False,
+            rationale=rationale,
+        )
+
+    parallel = min(8, max(1, cpu_count // 8))
+    if gpu_mem_total_mb is not None and gpu_mem_total_mb < 8192:
+        parallel = min(parallel, 2)
+
+    vram_note = (
+        f"~{gpu_mem_total_mb:.0f} MiB VRAM on first GPU"
+        if gpu_mem_total_mb is not None
+        else "VRAM unknown (enable nvidia-smi or NVML)"
+    )
+    rationale = (
+        f"CUDA available ({vram_note}): n_envs={recommended_n_envs} widens rollouts; "
+        f"parallel_trials={parallel} balances Optuna SQLite vs CPU. "
+        "Batched vec env (torch-vec) cuts Subproc IPC for historical-only runs."
+    )
+
+    return PpoCalibrationResponse(
+        cpu_count=cpu_count,
+        cuda_available=True,
+        gpu_mem_total_mb=gpu_mem_total_mb,
+        recommended_n_envs=recommended_n_envs,
+        recommended_parallel_trials=parallel,
+        suggest_torch_vec=True,
+        rationale=rationale,
     )

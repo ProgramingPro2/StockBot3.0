@@ -114,6 +114,10 @@ Options:
 - `--timeout`: Max seconds for tuning; 0 = no limit (default)
 - `--study-name`: Optuna study name to create or resume (non-interactive resume of a specific study)
 - `--pick-study`: When continuing an existing run (omit `--new`), print studies from storage and prompt for index or name; requires a TTY unless `--study-name` is already set. List studies without tuning: `python -m trading_system tune status`.
+- `--n-envs`: Parallel envs per trial (default: `min(32, cpu_count)`). Wider rollouts improve GPU utilisation when `PPO_DEVICE=cuda`.
+- `--parallel-trials`: Run multiple Optuna worker processes against the same SQLite study (default: `PPO_PARALLEL_TRIALS` in `.env`, or 1). Enable SQLite WAL automatically.
+- `--torch-vec`: Use the batched in-process vec env for historical-only trials (also set `PPO_USE_TORCH_VEC=1` to default it on without the flag).
+- `--bench`: Run a short PPO benchmark (Subproc vs torch-vec), print steps/sec and optional `nvidia-smi` util, then exit.
 
 Best parameters are saved to `trading_system/models/meta_learner/ppo_tune_best.json`, including `historical_ratio` (tuned). Then train with them:
 
@@ -274,6 +278,8 @@ When `BOARDROOM_RESULT_PATH` is set (the web UI does this automatically), `backt
 ## Web UI
 
 A FastAPI + React control plane sits in `webapp/`. It wraps every CLI mode with start/stop controls, live log streaming over WebSockets, live recharts panels for PPO metrics, an embedded TensorBoard, an `.env` editor, the scheduler YAML editor, a plot gallery, and a model manager.
+
+**Tune / Train performance (web UI):** The Tune page exposes optional **parallel envs**, **parallel Optuna trials**, and **batched vec env (torch-vec)** for historical-only runs. The Train page exposes **parallel envs** and the same **batched vec env** toggle for 100% historical training. Both pages include **Auto-fill for this machine**, which calls `GET /api/system/ppo-calibration` and applies heuristic `n_envs` / `parallel_trials` (Tune only) / `torch_vec` suggestions based on CPU count, CUDA availability, and GPU VRAM.
 
 ### Local development
 

@@ -136,6 +136,7 @@ def _argv_for(kind: JobKind, params: dict[str, Any]) -> list[str]:
         "single_thread": "--single-thread",
         "new": "--new",
         "debug": "--debug",
+        "torch_vec": "--torch-vec",
     }
     value_flags = {
         "timesteps": "--timesteps",
@@ -154,6 +155,7 @@ def _argv_for(kind: JobKind, params: dict[str, Any]) -> list[str]:
         "max_depth": "--max-depth",
         "learning_rate": "--learning-rate",
         "tuned_study": "--tuned-study",
+        "parallel_trials": "--parallel-trials",
     }
     for key, flag in value_flags.items():
         if key in params and params[key] is not None and params[key] != "":

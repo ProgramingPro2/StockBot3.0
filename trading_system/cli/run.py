@@ -555,6 +555,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             np.asarray(historical_returns, dtype=np.float32)
         )
 
+    train_use_torch_vec = True if getattr(args, "torch_vec", False) else None
     dated_path = trader.train(
         total_timesteps=args.timesteps,
         specialist_fn=specialist_fn_for_train,
@@ -568,6 +569,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         validation_trading_dates=validation_trading_dates,
         proxy_feature_cache=train_proxy_cache,
         ignore_early_stopping=getattr(args, "ignore_early_stopping", False),
+        use_torch_vec=train_use_torch_vec,
     )
     logger.info("Training complete. Models saved.")
 
@@ -1047,9 +1049,10 @@ def _tune_interactive_prompt() -> dict:
 
 def cmd_tune(args: argparse.Namespace) -> None:
     """Run Optuna hyperparameter tuning for PPO on historical data."""
+    import os
     import time
 
-    from ..config import PPO_N_ENVS
+    from ..config import PPO_PARALLEL_TRIALS
     from ..meta_learner.tuner import PPO_TUNE_PARAMS_PATH, run_tuning, tune_best_params_json_path
 
     tickers = _tickers_from_args(args)
@@ -1064,6 +1067,15 @@ def cmd_tune(args: argparse.Namespace) -> None:
     start_new = getattr(args, "new", False)
     study_name_arg = getattr(args, "study_name", None)
     n_envs = getattr(args, "n_envs", None)
+    if n_envs is None:
+        n_envs = min(32, os.cpu_count() or 8)
+    parallel_trials = getattr(args, "parallel_trials", None)
+    if parallel_trials is None:
+        parallel_trials = PPO_PARALLEL_TRIALS
+    parallel_trials = max(1, int(parallel_trials))
+    use_torch_vec = True if getattr(args, "torch_vec", False) else None
+    bench = bool(getattr(args, "bench", False))
+
     use_historical = getattr(args, "use_historical", False)
     historical_ratio_arg = getattr(args, "historical_ratio", None)
     interactive = getattr(args, "interactive", False)
@@ -1081,6 +1093,9 @@ def cmd_tune(args: argparse.Namespace) -> None:
         n_envs = prompted.get("n_envs") if prompted.get("n_envs") is not None else n_envs
         use_historical = prompted.get("use_historical", False)
         single_thread = prompted.get("single_thread", False)
+
+    if n_envs is None:
+        n_envs = min(32, os.cpu_count() or 8)
 
     if pick_study and not start_new and study_name_arg is None:
         if json_output or not sys.stdin.isatty():
@@ -1119,30 +1134,57 @@ def cmd_tune(args: argparse.Namespace) -> None:
             len(returns_array) - len(tuning_returns),
         )
 
+    if bench:
+        from ..meta_learner.parallel_tuner import run_tune_bench
+
+        logger.info(
+            "Bench mode: comparing SubprocVecEnv vs batched torch vec (%d timesteps, n_envs=%s)...",
+            min(8192, timesteps),
+            n_envs,
+        )
+        result = run_tune_bench(
+            returns_array=tuning_returns,
+            n_assets=n_assets,
+            n_envs=n_envs,
+            timesteps=min(8192, timesteps),
+            historical_trading_dates=aligned.index[: len(tuning_returns)],
+        )
+        for k, v in result.items():
+            logger.info("  bench %s: %s", k, v)
+        return
+
     logger.info(
-        "Running hyperparameter tuning for %d tickers (%d trials, %d timesteps/trial, study=%s, n_envs=%s)...",
+        "Running hyperparameter tuning for %d tickers (%d trials, %d timesteps/trial, study=%s, n_envs=%s, parallel_trials=%s)...",
         n_assets,
         n_trials,
         timesteps,
         study_name,
-        n_envs if n_envs is not None else PPO_N_ENVS,
+        n_envs,
+        parallel_trials,
     )
     tune_trading_dates = aligned.index[: len(tuning_returns)]
     per_study_params_path = tune_best_params_json_path(study_name)
-    best = run_tuning(
-        returns_array=tuning_returns,
-        n_assets=n_assets,
-        n_trials=n_trials,
-        n_timesteps=timesteps,
-        timeout=timeout if timeout > 0 else None,
-        n_envs=n_envs,
-        study_name=study_name,
-        load_if_exists=load_if_exists,
-        fixed_historical_ratio=fixed_historical_ratio,
-        single_thread=single_thread,
-        params_path=per_study_params_path,
-        historical_trading_dates=tune_trading_dates,
-    )
+    tune_kwargs: dict = {
+        "returns_array": tuning_returns,
+        "n_assets": n_assets,
+        "n_trials": n_trials,
+        "n_timesteps": timesteps,
+        "timeout": timeout if timeout > 0 else None,
+        "n_envs": n_envs,
+        "study_name": study_name,
+        "load_if_exists": load_if_exists,
+        "fixed_historical_ratio": fixed_historical_ratio,
+        "single_thread": single_thread,
+        "params_path": per_study_params_path,
+        "historical_trading_dates": tune_trading_dates,
+        "use_torch_vec": use_torch_vec,
+    }
+    if parallel_trials > 1:
+        from ..meta_learner.parallel_tuner import run_parallel_tuning
+
+        best = run_parallel_tuning(parallel_trials=parallel_trials, **tune_kwargs)
+    else:
+        best = run_tuning(**tune_kwargs)
     logger.info(
         "Tuning complete. Best params for study %r: %s (also mirrored to %s for train --use-tuned without --tuned-study).",
         study_name,

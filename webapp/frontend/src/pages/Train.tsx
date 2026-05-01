@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Flame, Play, ExternalLink } from "lucide-react";
+import { Flame, Play, ExternalLink, Wand2 } from "lucide-react";
 import { ApiClient, type TuneStudySummary } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import JobControl from "../components/JobControl";
@@ -35,6 +35,9 @@ export default function Train() {
   const [retrain, setRetrain] = useState(false);
   const [ignoreEarlyStopping, setIgnoreEarlyStopping] = useState(false);
   const [nEnvs, setNEnvs] = useState<number | "">("");
+  const [torchVec, setTorchVec] = useState(false);
+  const [calibrationNote, setCalibrationNote] = useState<string | null>(null);
+  const [calibrationBusy, setCalibrationBusy] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
 
   const job = useJobByKind("train");
@@ -77,7 +80,23 @@ export default function Train() {
     if (tickers) params.tickers = tickers;
     if (historicalRatio !== "") params.historical_ratio = historicalRatio;
     if (nEnvs !== "") params.n_envs = nEnvs;
+    if (torchVec) params.torch_vec = true;
     return ApiClient.startTrain(params);
+  };
+
+  const applyCalibration = async () => {
+    setCalibrationBusy(true);
+    setCalibrationNote(null);
+    try {
+      const c = await ApiClient.getPpoCalibration();
+      setNEnvs(c.recommended_n_envs);
+      setTorchVec(c.suggest_torch_vec);
+      setCalibrationNote(c.rationale);
+    } catch (e) {
+      setCalibrationNote(e instanceof Error ? e.message : "Calibration request failed");
+    } finally {
+      setCalibrationBusy(false);
+    }
   };
 
   return (
@@ -125,6 +144,25 @@ export default function Train() {
                 placeholder="default"
               />
             </Field>
+          </div>
+          <div className="space-y-2">
+            <button
+              type="button"
+              className="btn-secondary flex w-full items-center justify-center gap-2 text-sm"
+              onClick={() => void applyCalibration()}
+              disabled={calibrationBusy}
+            >
+              <Wand2 className="h-4 w-4" />
+              {calibrationBusy ? "Detecting…" : "Auto-fill for this machine"}
+            </button>
+            {calibrationNote ? (
+              <p className="text-xs text-ink-muted leading-relaxed">{calibrationNote}</p>
+            ) : null}
+            <Toggle
+              label="Batched vec env (100% historical only; ignores daily aux path)"
+              checked={torchVec}
+              onChange={setTorchVec}
+            />
           </div>
           <Field
             label="Historical ratio"

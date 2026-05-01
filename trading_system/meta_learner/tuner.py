@@ -6,6 +6,7 @@ Uses same env design as training: SubprocVecEnv, proxy-from-returns specialists.
 import json
 import logging
 import math
+import multiprocessing
 import os
 from functools import partial
 from pathlib import Path
@@ -25,6 +26,7 @@ from ..config import (
     META_LEARNER_MODEL_DIR,
     PPO_CPU_THREADS,
     PPO_N_ENVS,
+    PPO_USE_TORCH_VEC,
     TRAIN_HISTORICAL_RATIO,
     TRAIN_HISTORICAL_RATIO_OVERRIDE,
 )
@@ -39,6 +41,18 @@ from .proxy_specialists import precompute_proxy_feature_matrix
 from .runs_index import make_run_id, record_end, record_start, tb_log_dir_for
 
 _log = logging.getLogger("boardroom")
+
+# SubprocVecEnv cannot be created inside multiprocessing.Pool workers (they are daemon=True).
+_SUBPROC_WARNED = False
+
+
+def _subproc_vec_env_allowed() -> bool:
+    """False in daemon workers (e.g. multiprocessing.Pool); those cannot spawn child processes."""
+    try:
+        return not multiprocessing.current_process().daemon
+    except Exception:
+        return True
+
 
 # SubprocVecEnv / multiprocessing teardown after SIGTERM: workers may already be gone.
 _VEC_ENV_CLOSE_IPC_ERRORS: tuple[type[BaseException], ...] = (
@@ -118,9 +132,13 @@ def load_tuned_params_from_study(study_name: str) -> dict[str, Any] | None:
 
 
 def _get_ppo_device() -> str:
-    """PPO uses CPU (SB3 recommends CPU for MLP policy)."""
+    """Use CUDA when available unless PPO_DEVICE forces CPU."""
     from ..config import PPO_DEVICE
-    if PPO_DEVICE == "cuda" and torch.cuda.is_available():
+
+    lowered = (PPO_DEVICE or "cuda").strip().lower()
+    if lowered in ("cpu", "no", "false", "0"):
+        return "cpu"
+    if torch.cuda.is_available():
         return "cuda"
     return "cpu"
 
@@ -138,9 +156,9 @@ def sample_ppo_params(
         historical_ratio = trial.suggest_float("historical_ratio", 0.1, 0.9)
     return {
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True),
-        "n_steps": trial.suggest_categorical("n_steps", [1024, 2048, 4096]),
-        "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128]),
-        "n_epochs": trial.suggest_categorical("n_epochs", [5, 10, 20]),
+        "n_steps": trial.suggest_categorical("n_steps", [2048, 4096, 8192]),
+        "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024, 2048]),
+        "n_epochs": trial.suggest_categorical("n_epochs", [3, 5, 10]),
         "gamma": trial.suggest_float("gamma", 0.95, 0.999),
         "gae_lambda": trial.suggest_float("gae_lambda", 0.9, 0.99),
         "clip_range": trial.suggest_float("clip_range", 0.1, 0.3),
@@ -151,11 +169,13 @@ def sample_ppo_params(
 
 
 def _sample_net_arch(trial: optuna.Trial) -> dict:
-    arch = trial.suggest_categorical("net_arch", ["small", "medium"])
+    arch = trial.suggest_categorical("net_arch", ["small", "medium", "large"])
     if arch == "small":
         net_arch = {"pi": [64, 64], "vf": [64, 64]}
-    else:
+    elif arch == "medium":
         net_arch = {"pi": [128, 128], "vf": [128, 128]}
+    else:
+        net_arch = {"pi": [256, 256], "vf": [256, 256]}
     return {"net_arch": net_arch}
 
 
@@ -175,6 +195,7 @@ def run_tuning(
     params_path: Path | None = None,
     show_progress: bool = True,
     historical_trading_dates: Any = None,
+    use_torch_vec: bool | None = None,
 ) -> dict[str, Any]:
     """
     Run Optuna hyperparameter tuning.
@@ -182,10 +203,19 @@ def run_tuning(
     Returns best params dict.
     """
     n_envs = n_envs if n_envs is not None else PPO_N_ENVS
+    use_torch_vec_eff = PPO_USE_TORCH_VEC if use_torch_vec is None else bool(use_torch_vec)
     # SB3 callback n_calls advances per vec-env rollout; spread evals across the trial
     eval_freq = max(1, n_timesteps // (max(1, n_evaluations) * max(1, n_envs)))
     params_path = params_path or PPO_TUNE_PARAMS_PATH
     returns_array = np.asarray(returns_array, dtype=np.float32)
+
+    _dev0 = _get_ppo_device()
+    if _dev0 == "cuda":
+        try:
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     # Use a validation slice for eval so tuning does not overfit to the same data as training
     n = len(returns_array)
@@ -243,14 +273,29 @@ def run_tuning(
             import logging
 
             logging.getLogger("boardroom").info(
-                "BENCH_TRACE tune trial=%s n_envs=%s eval_freq=%s dummy_vec=%s",
+                "BENCH_TRACE tune trial=%s n_envs=%s eval_freq=%s dummy_vec=%s torch_vec=%s",
                 trial.number,
                 n_envs,
                 eval_freq,
                 use_dummy_vec,
+                use_torch_vec_eff and mode == "historical",
             )
 
-        if n_envs <= 1:
+        use_torch_vec_path = use_torch_vec_eff and mode == "historical"
+
+        if use_torch_vec_path and n_envs >= 1:
+            from .torch_vec_env import BatchedHistoricalTorchVecEnv
+
+            with trace_block("tune_make_torch_vec_env", trial=trial.number, n_envs=n_envs):
+                env = BatchedHistoricalTorchVecEnv(
+                    train_returns,
+                    train_proxy_cache,
+                    n_assets,
+                    n_envs,
+                    trading_dates=train_trading_dates,
+                    device=_get_ppo_device(),
+                )
+        elif n_envs <= 1:
             with trace_block("tune_make_env_single", trial=trial.number):
                 env = _make_env_fn(
                     mode=mode,
@@ -280,7 +325,16 @@ def run_tuning(
                 for i in range(n_envs)
             ]
             with trace_block("tune_make_vec_env", trial=trial.number, n_envs=n_envs):
-                if use_dummy_vec:
+                global _SUBPROC_WARNED
+                force_dummy = use_dummy_vec or not _subproc_vec_env_allowed()
+                if force_dummy:
+                    if not use_dummy_vec and not _SUBPROC_WARNED:
+                        _log.info(
+                            "Daemon worker: using DummyVecEnv instead of SubprocVecEnv "
+                            "(nested multiprocessing is unsupported). Use --parallel-trials 1 if "
+                            "this message appears during tuning."
+                        )
+                        _SUBPROC_WARNED = True
                     env = DummyVecEnv(env_fns)
                 else:
                     try:
@@ -335,6 +389,15 @@ def run_tuning(
             verbose=0,
             tensorboard_log=str(tb_dir.parent),
         )
+        if _get_ppo_device() == "cuda" and os.environ.get("PPO_TORCH_COMPILE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            try:
+                model.policy = torch.compile(model.policy, mode="reduce-overhead")
+            except Exception as compile_exc:
+                _log.warning("PPO_TORCH_COMPILE skipped in tune: %s", compile_exc)
 
         sharpe_eval_callback = SharpeEvalCallback(
             val_returns=val_returns,
@@ -446,23 +509,34 @@ def run_tuning(
         show_progress_bar=show_progress,
     )
 
-    if study.best_trial is None:
-        return load_tuned_params(params_path) or {}
+    return export_best_params_after_study(study_name, params_path)
 
+
+def export_best_params_after_study(
+    study_name: str,
+    params_path: Path | None = None,
+) -> dict[str, Any]:
+    """Load study from default storage and write best params JSON (same as end of run_tuning)."""
+    storage = f"sqlite:///{PPO_TUNE_STUDY_PATH}"
+    p = params_path or PPO_TUNE_PARAMS_PATH
+    try:
+        study = optuna.load_study(study_name=study_name, storage=storage)
+    except Exception:
+        return load_tuned_params(p) or {}
+    if study.best_trial is None:
+        return load_tuned_params(p) or {}
     raw = dict(study.best_trial.params)
     best_value = float(study.best_value)
     best = _pack_best_params_from_trial_raw(raw, best_value if not math.isnan(best_value) else None)
-
-    with open(params_path, "w") as f:
+    META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    with open(p, "w") as f:
         json.dump(best, f, indent=2)
-
-    if params_path.resolve() != PPO_TUNE_PARAMS_PATH.resolve():
+    if p.resolve() != PPO_TUNE_PARAMS_PATH.resolve():
         try:
             with open(PPO_TUNE_PARAMS_PATH, "w") as f:
                 json.dump(best, f, indent=2)
         except OSError:
             pass
-
     return best
 
 
@@ -471,6 +545,8 @@ def _net_arch_from_name(arch: str) -> dict:
         return {"net_arch": {"pi": [64], "vf": [64]}}
     if arch == "medium":
         return {"net_arch": {"pi": [128, 128], "vf": [128, 128]}}
+    if arch == "large":
+        return {"net_arch": {"pi": [256, 256], "vf": [256, 256]}}
     return {"net_arch": {"pi": [64, 64], "vf": [64, 64]}}
 
 
@@ -483,6 +559,8 @@ def _net_arch_to_name(policy_kwargs: dict) -> str:
         return "tiny"
     if pi == [128, 128] and vf == [128, 128]:
         return "medium"
+    if pi == [256, 256] and vf == [256, 256]:
+        return "large"
     return "small"
 
 

@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
 from ..config import (
     ENV_EPISODE_DAYS,
@@ -42,6 +42,7 @@ from ..config import (
     PPO_NET_ARCH,
     PPO_N_ENVS,
     PPO_N_STEPS,
+    PPO_USE_TORCH_VEC,
 )
 from ..utils.graceful_shutdown import should_stop
 from ..utils.output_cleanup import prune_checkpoints
@@ -281,9 +282,13 @@ def _make_env_fn(
 
 
 def _get_ppo_device() -> str:
-    """PPO uses CPU (SB3 recommends CPU for MLP policy)."""
+    """PPO device: cuda when available unless PPO_DEVICE forces cpu."""
     from ..config import PPO_DEVICE
-    if PPO_DEVICE == "cuda" and torch.cuda.is_available():
+
+    lowered = (PPO_DEVICE or "cuda").strip().lower()
+    if lowered in ("cpu", "no", "false", "0"):
+        return "cpu"
+    if torch.cuda.is_available():
         return "cuda"
     return "cpu"
 
@@ -339,6 +344,7 @@ class PPOTrader:
         validation_trading_dates: Any = None,
         proxy_feature_cache: np.ndarray | None = None,
         ignore_early_stopping: bool = False,
+        use_torch_vec: bool | None = None,
     ) -> Path | None:
         """
         Train PPO on simulated or historical episodes.
@@ -351,6 +357,8 @@ class PPOTrader:
         ppo_kwargs: optional overrides for PPO hyperparameters (e.g. from tuning).
         n_envs: parallel env count for SubprocVecEnv; None = use PPO_N_ENVS.
         ignore_early_stopping: if True, run full timesteps even when early stopping is configured.
+        use_torch_vec: if True, use BatchedHistoricalTorchVecEnv for historical-only (no daily_aux).
+            If None, follow PPO_USE_TORCH_VEC from config.
         """
         kwargs = dict(ppo_kwargs or {})
         best_value = kwargs.pop("best_value", None)
@@ -361,6 +369,7 @@ class PPOTrader:
 
         specialist_fn = specialist_fn  # None => use _random_specialist_outputs in factory
         n_envs = n_envs if n_envs is not None else PPO_N_ENVS
+        use_torch_vec_eff = PPO_USE_TORCH_VEC if use_torch_vec is None else bool(use_torch_vec)
 
         if historical_returns is not None and historical_ratio >= 1.0:
             mode = "historical"
@@ -384,13 +393,50 @@ class PPOTrader:
 
         if trace_enabled():
             logging.getLogger("boardroom").info(
-                "BENCH_TRACE train build_env n_envs=%s dummy_vec=%s cache=%s",
+                "BENCH_TRACE train build_env n_envs=%s dummy_vec=%s cache=%s torch_vec=%s",
                 n_envs,
                 use_dummy_vec,
                 proxy_feature_cache is not None,
+                use_torch_vec_eff and mode == "historical" and daily_aux_features is None,
             )
 
-        if n_envs <= 1:
+        use_torch_vec_path = (
+            use_torch_vec_eff
+            and mode == "historical"
+            and daily_aux_features is None
+            and n_envs >= 1
+        )
+        env = None
+        if use_torch_vec_path:
+            hr = historical_returns
+            assert hr is not None
+            pc = proxy_feature_cache
+            if pc is None and len(hr) > 21:
+                pc = precompute_proxy_feature_matrix(np.asarray(hr, dtype=np.float32))
+            if pc is None:
+                logging.getLogger("boardroom").warning(
+                    "Batched torch vec env skipped (need >21 days of returns and proxy cache); using Subproc/Dummy"
+                )
+            else:
+                from .torch_vec_env import BatchedHistoricalTorchVecEnv
+
+                with trace_block("ppo_train_make_torch_vec_env", n_envs=n_envs):
+                    env = BatchedHistoricalTorchVecEnv(
+                        np.asarray(hr, dtype=np.float32),
+                        np.asarray(pc, dtype=np.float32),
+                        self.n_assets,
+                        n_envs,
+                        trading_dates=historical_trading_dates,
+                        device=_get_ppo_device(),
+                    )
+                    env = VecMonitor(env)
+                    logging.getLogger("boardroom").info(
+                        "PPO training with %d envs (BatchedHistoricalTorchVecEnv)", n_envs
+                    )
+
+        if env is not None:
+            pass
+        elif n_envs <= 1:
             with trace_block("ppo_train_make_env_single"):
                 env = _make_env_fn(
                     mode=mode,
