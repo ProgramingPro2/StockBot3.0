@@ -35,8 +35,13 @@ from .proxy_specialists import (
 
 def _sanitize_obs(obs: np.ndarray) -> np.ndarray:
     """Replace NaN/Inf with 0 and clip to [-1, 1] so the policy never sees invalid values."""
-    out = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    return np.clip(out, -1.0, 1.0)
+    out = np.nan_to_num(np.asarray(obs, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    out = np.copy(out)
+    # Avoid np.clip here: in SubprocVecEnv fork children after the parent has imported
+    # torch/CUDA, np.clip can raise SystemError ("error return without exception set").
+    out[out > 1.0] = 1.0
+    out[out < -1.0] = -1.0
+    return out
 
 
 def _obs_features_per_asset() -> int:

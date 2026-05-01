@@ -126,6 +126,7 @@ def run_parallel_tuning(
     # inside Optuna trials. ProcessPoolExecutor workers are non-daemon (see PEP-like behavior
     # in CPython), so SB3 vector env subprocesses work.
     from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
 
     max_workers = len(payloads)
     stall_raw = os.environ.get("PPO_TUNE_STALL_TIMEOUT_SEC", "0").strip()
@@ -144,6 +145,15 @@ def run_parallel_tuning(
         else:
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
                 list(ex.map(_parallel_worker_entry, payloads, chunksize=1))
+    except BrokenProcessPool as exc:
+        _log.error(
+            "Parallel tune: a worker exited abruptly (%s). "
+            "Saving best-known params from the study (SIGTERM or Subproc env crash).",
+            exc,
+        )
+        study_name = str(kwargs.get("study_name", "ppo_tune"))
+        params_path = kwargs.get("params_path")
+        return export_best_params_after_study(study_name, params_path)
     finally:
         stop_watchdog.set()
         if watchdog_thread is not None:

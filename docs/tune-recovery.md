@@ -92,10 +92,28 @@ Set high enough that a normal trial can finish without DB writes, or leave
 disabled. Heartbeats on the Optuna storage still help recover dead RUNNING
 trials; the watchdog is a last resort for total parent-visible stalls.
 
-## 7. Code-side mitigations (already in tree)
+## 7. Subproc workers, CUDA, and NumPy
+
+If tuning uses **mixed** episodes (`historical_ratio` below 1), each trial may build
+`SubprocVecEnv` over `TradingEnv`. Forked env workers can hit rare NumPy failures
+(for example `SystemError` from `np.clip`) if the parent process has already
+imported PyTorch with CUDA. Mitigations:
+
+- Prefer **`PPO_DEVICE=cpu`** for long parallel MLP tuning (SB3 also warns that MLP
+  PPO on GPU is often slower than CPU for vec throughput).
+- Or force **historical-only** (`--use-historical` or `historical_ratio=1.0`) so
+  `--torch-vec` stays on the batched path without Subproc children.
+
+Rebuild/redeploy the image after pulling fixes so `/app` matches your checkout.
+
+## 8. Code-side mitigations (already in tree)
 
 - `get_tune_rdb_storage()` in `trading_system/meta_learner/tuner.py`: SQLite
   `connect_args.timeout=120`, plus Optuna `heartbeat_interval` / `grace_period`
   on `RDBStorage`.
 - `enable_sqlite_wal()` in `trading_system/meta_learner/parallel_tuner.py`
   before parallel workers start.
+- `_sanitize_obs` in `trading_system/meta_learner/env.py` avoids `np.clip` on the
+  observation vector (see §7).
+- `run_parallel_tuning` catches `BrokenProcessPool` (e.g. after SIGTERM) and still
+  writes best params from the SQLite study when possible.
