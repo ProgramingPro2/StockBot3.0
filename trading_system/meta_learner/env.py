@@ -25,7 +25,7 @@ from ..config import (
     STARTING_CAPITAL,
     TRANSACTION_COST_BPS,
 )
-from ..utils.pdt import pdt_tracker_from_config, rebalance_multi_asset, session_date_from_index
+from ..utils.imf import imf_guard_from_config, rebalance_multi_asset, session_date_from_index
 from .proxy_specialists import (
     merge_daily_aux_into_proxy_matrix,
     merge_daily_aux_into_proxy_row,
@@ -137,7 +137,7 @@ class TradingEnv(gym.Env):
         self._rolling_vols: np.ndarray | None = None
         self._bootstrap_returns: np.ndarray | None = None
         self._bootstrap_idx: int = 0
-        self._pdt_tracker = pdt_tracker_from_config()
+        self._imf_guard = imf_guard_from_config()
         self._last_buy_bar = np.full(self.n_assets, -999, dtype=np.int64)
         self._last_sell_bar = np.full(self.n_assets, -999, dtype=np.int64)
 
@@ -148,7 +148,7 @@ class TradingEnv(gym.Env):
         self._equity_peak = 1.0
         self._holdings = np.zeros(self.n_assets, dtype=np.float32)
         self._step_count = 0
-        self._pdt_tracker = pdt_tracker_from_config()
+        self._imf_guard = imf_guard_from_config()
         self._last_buy_bar = np.full(self.n_assets, -999, dtype=np.int64)
         self._last_sell_bar = np.full(self.n_assets, -999, dtype=np.int64)
         specialist = options.get("specialist_outputs", []) if options else []
@@ -192,7 +192,7 @@ class TradingEnv(gym.Env):
             self._last_sell_bar,
             min_hold_bars,
             min_reentry_bars,
-            self._pdt_tracker,
+            self._imf_guard,
             sess,
             portfolio_value,
         )
@@ -323,7 +323,7 @@ class HistoricalTradingEnv(gym.Env):
             returns_array: Shape (n_days, n_assets), daily returns per asset.
             n_assets: Number of assets.
             daily_aux_features: Optional (n_days, n_assets, 2) for atr_pct, volume_ratio.
-            trading_dates: Optional length n_days calendar index for PDT session keys.
+            trading_dates: Optional length n_days calendar index for IMF session keys.
             proxy_feature_cache: Optional (n_days, n_assets, 13) from precompute_proxy_feature_matrix;
                 when set, skips recomputing the proxy matrix (faster for tuning / SubprocVecEnv).
         """
@@ -404,7 +404,7 @@ class HistoricalTradingEnv(gym.Env):
         self._equity_history = [1.0]
         self._equity_peak = 1.0
         self._holdings = np.zeros(self.n_assets, dtype=np.float32)
-        self._pdt_tracker = pdt_tracker_from_config()
+        self._imf_guard = imf_guard_from_config()
         self._last_buy_bar = np.full(self.n_assets, -999, dtype=np.int64)
         self._last_sell_bar = np.full(self.n_assets, -999, dtype=np.int64)
 
@@ -438,7 +438,7 @@ class HistoricalTradingEnv(gym.Env):
             self._last_sell_bar,
             min_hold_bars,
             min_reentry_bars,
-            self._pdt_tracker,
+            self._imf_guard,
             sess,
             portfolio_value,
         )

@@ -12,7 +12,7 @@ The price/volume-first feature store (`trading_system/data/feature_store.py`) is
 
 ### Walk-Forward Evaluation
 
-- **Splits**: Chronological train/test. Config: `TEST_WINDOW_DAYS` (default 252) is held out; the rest is used for training and tuning. No shuffle.
+- **Splits**: Chronological train/test. Config: `TEST_WINDOW_DAYS` (default 252) and `TEST_WINDOW_PLACEMENT` (`recent` = hold out newest days, `oldest` = hold out oldest days so training sees recent regimes, `none` = no holdout). No shuffle.
 - **Tuning**: Optuna tuning uses only the train window. The test window is never seen during hyperparameter search.
 - **Training**: When a split is available, PPO is trained on the train window only. The "training complete" backtest and reported stats use the held-out test window (out-of-sample).
 - **Leakage**: Target construction and rolling features use only past data. Use `get_features_for_date(..., as_of_date)` so that inference at date `t` only sees rows with index <= t.
@@ -36,7 +36,7 @@ Specialists (sentiment, quantitative, fundamental, regime, momentum, etc.) are *
 | Rebalance threshold | `MIN_TRADE_NOTIONAL`, `REBALANCE_BAND_PCT` |
 | Live cooldowns | `MIN_HOLD_MINUTES_AFTER_BUY`, `MIN_REENTRY_MINUTES_AFTER_SELL` |
 | Transaction friction | `TRANSACTION_COST_BPS`, `SLIPPAGE_BPS` |
-| Walk-forward test window | `TEST_WINDOW_DAYS` (default 252) |
+| Walk-forward test window | `TEST_WINDOW_DAYS` (default 252), `TEST_WINDOW_PLACEMENT` (`recent` / `oldest` / `none`) |
 | History length for data load | `TRAIN_WINDOW_YEARS` (default 5) |
 | Historical vs synthetic training | `TRAIN_HISTORICAL_RATIO` (default 1.0) |
 | Reward window reachable in episode | `ENV_EPISODE_DAYS`, `ENV_ROLLING_SHARPE_DAYS` (derived) |

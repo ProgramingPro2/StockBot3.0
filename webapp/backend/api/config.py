@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from .. import env_manager
 from ..paths import ENV_FILE
@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/config", tags=["config"])
 
 @router.get("/env", response_model=EnvDocument)
 def get_env(reveal: bool = False) -> EnvDocument:
+    env_manager.ensure_defaults_in_env()
     items = env_manager.variables_for_ui()
     if not reveal:
         items = env_manager.mask_secrets(items)
@@ -26,7 +27,10 @@ def get_env(reveal: bool = False) -> EnvDocument:
 
 @router.put("/env", response_model=EnvDocument)
 def update_env(payload: EnvUpdateRequest) -> EnvDocument:
-    env_manager.update(payload.updates)
+    try:
+        env_manager.update(payload.updates)
+    except env_manager.EnvValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     items = env_manager.mask_secrets(env_manager.variables_for_ui())
     raw = ENV_FILE.read_text()
     return EnvDocument(
@@ -46,6 +50,7 @@ def get_static() -> StaticConfig:
         "TRADE_LIST_SIZE",
         "STARTING_CAPITAL",
         "FRACTIONAL",
+        "LIVE_BUYING_POWER_MODE",
         "MIN_TRADE_NOTIONAL",
         "REBALANCE_BAND_PCT",
         "TRANSACTION_COST_BPS",
@@ -54,6 +59,7 @@ def get_static() -> StaticConfig:
         "MIN_REENTRY_MINUTES_AFTER_SELL",
         "TRAIN_HISTORICAL_RATIO",
         "TEST_WINDOW_DAYS",
+        "TEST_WINDOW_PLACEMENT",
         "TRAIN_WINDOW_YEARS",
         "PPO_DEVICE",
         "PPO_N_ENVS",
@@ -70,10 +76,9 @@ def get_static() -> StaticConfig:
         "ENV_REWARD_DRAWDOWN_PENALTY",
         "ENV_OBS_ROLLING_FEATURES",
         "ENV_ALLOW_CASH_EXPOSURE",
-        "ENV_PDT_RESTRICTIONS",
-        "PDT_MIN_ACCOUNT_EQUITY",
-        "PDT_MAX_DAY_TRADES",
-        "PDT_ROLLING_BUSINESS_DAYS",
+        "ENV_IMF_RESTRICTIONS",
+        "IMF_MIN_INTRADAY_EQUITY",
+        "IMF_INTRADAY_MULTIPLIER",
         "OLLAMA_URL",
         "OLLAMA_MODEL",
         "OLLAMA_FALLBACK_MODELS",

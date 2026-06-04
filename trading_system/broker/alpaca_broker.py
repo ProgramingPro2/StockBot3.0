@@ -43,6 +43,7 @@ class AlpacaBroker:
                 "cash": float(account.cash),
                 "portfolio_value": float(account.portfolio_value),
                 "buying_power": float(account.buying_power),
+                "non_marginable_buying_power": float(account.non_marginable_buying_power),
             }
         except Exception as e:
             logger.error("Failed to get account: %s", e)

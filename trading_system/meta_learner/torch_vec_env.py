@@ -2,7 +2,7 @@
 Batched HistoricalTradingEnv-compatible VecEnv on a single process.
 
 Proxy features and returns live on CUDA for fast batched observation assembly;
-per-env stepping mirrors HistoricalTradingEnv (rebalance_multi_asset, PDT).
+per-env stepping mirrors HistoricalTradingEnv (rebalance_multi_asset, IMF).
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from ..config import (
     STARTING_CAPITAL,
     TRANSACTION_COST_BPS,
 )
-from ..utils.pdt import pdt_tracker_from_config, rebalance_multi_asset, session_date_from_index
+from ..utils.imf import imf_guard_from_config, rebalance_multi_asset, session_date_from_index
 from .env import _compute_step_reward, _sanitize_obs
 from .proxy_specialists import normalize_action_max_unit_exposure
 
@@ -103,7 +103,7 @@ class BatchedHistoricalTorchVecEnv(VecEnv):
         self._equity_peak = np.ones(self.num_envs, dtype=np.float64)
         self._last_buy_bar = np.full((self.num_envs, self.n_assets), -999, dtype=np.int64)
         self._last_sell_bar = np.full((self.num_envs, self.n_assets), -999, dtype=np.int64)
-        self._pdt_trackers = [pdt_tracker_from_config() for _ in range(self.num_envs)]
+        self._imf_guards = [imf_guard_from_config() for _ in range(self.num_envs)]
         self._rng = np.random.default_rng()
         self._actions: np.ndarray | None = None
 
@@ -123,7 +123,7 @@ class BatchedHistoricalTorchVecEnv(VecEnv):
         self._equity_peak[env_idx] = 1.0
         self._last_buy_bar[env_idx].fill(-999)
         self._last_sell_bar[env_idx].fill(-999)
-        self._pdt_trackers[env_idx] = pdt_tracker_from_config()
+        self._imf_guards[env_idx] = imf_guard_from_config()
 
     def reset(self) -> VecEnvObs:
         for i in range(self.num_envs):
@@ -174,7 +174,7 @@ class BatchedHistoricalTorchVecEnv(VecEnv):
                 self._last_sell_bar[e],
                 min_hold_bars,
                 min_reentry_bars,
-                self._pdt_trackers[e],
+                self._imf_guards[e],
                 sess,
                 portfolio_value,
             )

@@ -70,6 +70,34 @@ class TestChronologicalSplit(unittest.TestCase):
         self.assertIsNone(train_ret)
         self.assertIsNone(test_ret)
 
+    def test_split_oldest_holds_out_start(self) -> None:
+        n = 600
+        aligned = pd.DataFrame(index=pd.date_range("2022-01-01", periods=n, freq="B"))
+        returns_array = np.random.randn(n, 3).astype(np.float32) * 0.01
+        with patch("trading_system.config.TEST_WINDOW_PLACEMENT", "oldest"):
+            train_ret, test_ret, aligned_train, aligned_test = _chronological_train_test_split(
+                aligned, returns_array, test_days=252
+            )
+        self.assertIsNotNone(train_ret)
+        self.assertIsNotNone(test_ret)
+        self.assertEqual(len(test_ret), 252)
+        self.assertEqual(len(train_ret), n - 252)
+        self.assertTrue(aligned_test.index[0] < aligned_train.index[0])
+
+    def test_split_none_uses_full_series(self) -> None:
+        n = 400
+        aligned = pd.DataFrame(index=pd.date_range("2022-01-01", periods=n, freq="B"))
+        returns_array = np.random.randn(n, 2).astype(np.float32) * 0.01
+        with patch("trading_system.config.TEST_WINDOW_PLACEMENT", "none"):
+            train_ret, test_ret, aligned_train, aligned_test = _chronological_train_test_split(
+                aligned, returns_array, test_days=252
+            )
+        self.assertIsNotNone(train_ret)
+        self.assertIsNone(test_ret)
+        self.assertIsNone(aligned_test)
+        self.assertEqual(len(train_ret), n)
+        pd.testing.assert_frame_equal(aligned_train, aligned)
+
 
 class TestHistoryWindow(unittest.TestCase):
     """Default load must not truncate to 504 days when TRAIN_WINDOW_YEARS is used."""

@@ -37,9 +37,9 @@ from ..config import (
     ENV_ALLOW_CASH_EXPOSURE,
     sentiment_refresh_every_n_bars,
     ENV_OBS_ROLLING_FEATURES,
-    ENV_PDT_RESTRICTIONS,
+    ENV_IMF_RESTRICTIONS,
     FRACTIONAL,
-    PDT_MIN_ACCOUNT_EQUITY,
+    LIVE_BUYING_POWER_MODE,
     LIVE_PPO_MODEL_PATH,
     META_LEARNER_MODEL_DIR,
     MIN_HOLD_MINUTES_AFTER_BUY,
@@ -58,8 +58,8 @@ from ..config import (
 )
 from ..utils.graceful_shutdown import should_stop, stop_event
 from ..utils.logger import get_logger, is_debug, set_debug, setup_logger
-from ..utils.pdt import (
-    pdt_tracker_from_config,
+from ..utils.imf import (
+    imf_guard_from_config,
     rebalance_multi_asset,
     session_date_from_index,
 )
@@ -315,19 +315,35 @@ def _chronological_train_test_split(
 ):
     """
     Split aligned returns into train and test by time (no shuffle).
+    Placement from TEST_WINDOW_PLACEMENT: recent (hold out end), oldest (hold out start),
+    none (no holdout; train uses full series).
     Returns (train_returns, test_returns, aligned_train, aligned_test) or (None, None, None, None) if too short.
     """
-    from ..config import TEST_WINDOW_DAYS
+    from ..config import TEST_WINDOW_DAYS, TEST_WINDOW_PLACEMENT
 
     n = len(returns_array)
     test_len = test_days if test_days is not None else TEST_WINDOW_DAYS
+    placement = TEST_WINDOW_PLACEMENT
+
+    if placement == "none":
+        if n < 252:
+            return None, None, None, None
+        return returns_array, None, aligned, None
+
     if n < test_len + 252:
         return None, None, None, None
-    train_len = n - test_len
-    train_returns = returns_array[:train_len]
-    test_returns = returns_array[train_len:]
-    aligned_train = aligned.iloc[:train_len]
-    aligned_test = aligned.iloc[train_len:]
+
+    if placement == "oldest":
+        test_returns = returns_array[:test_len]
+        train_returns = returns_array[test_len:]
+        aligned_test = aligned.iloc[:test_len]
+        aligned_train = aligned.iloc[test_len:]
+    else:
+        train_len = n - test_len
+        train_returns = returns_array[:train_len]
+        test_returns = returns_array[train_len:]
+        aligned_train = aligned.iloc[:train_len]
+        aligned_test = aligned.iloc[train_len:]
     return train_returns, test_returns, aligned_train, aligned_test
 
 
@@ -436,28 +452,43 @@ def cmd_train(args: argparse.Namespace) -> None:
     if historical_ratio > 0:
         aligned_full, returns_array = _load_aligned_returns(tickers)
         if returns_array is not None and aligned_full is not None:
-            train_returns, _test_returns, _aligned_train, aligned_test = _chronological_train_test_split(
+            train_returns, test_returns, _aligned_train, aligned_test = _chronological_train_test_split(
                 aligned_full, returns_array
             )
             if train_returns is not None:
+                from ..config import TEST_WINDOW_PLACEMENT
+
                 n_train = len(train_returns)
                 val_days = max(21, min(252, n_train // 5))  # validation slice: 20% or up to 252 days, min 21
                 if n_train > val_days + 252:  # enough for train + validation
                     historical_returns = train_returns[: n_train - val_days]
                     validation_returns = train_returns[n_train - val_days :]
                     logger.info(
-                        "Using chronological split: training on %d days; validation %d days (early stopping); test window held out",
+                        "Using chronological split: training on %d days; validation %d days (early stopping); test holdout=%s",
                         len(historical_returns),
                         len(validation_returns),
+                        TEST_WINDOW_PLACEMENT,
                     )
                 else:
                     historical_returns = train_returns
+                    if test_returns is not None:
+                        logger.info(
+                            "Using chronological split: training on %d days; test window (%d days, placement=%s) held out",
+                            len(train_returns),
+                            len(test_returns),
+                            TEST_WINDOW_PLACEMENT,
+                        )
+                    else:
+                        logger.info(
+                            "Using full history for training (%d days); no test holdout (placement=none)",
+                            len(train_returns),
+                        )
+                if test_returns is not None:
                     logger.info(
-                        "Using chronological split: training on %d days; test window (%d days) held out for evaluation",
-                        len(train_returns),
-                        len(returns_array) - len(train_returns),
+                        "Test window: %d days held out for final backtest (placement=%s)",
+                        len(test_returns),
+                        TEST_WINDOW_PLACEMENT,
                     )
-                logger.info("Test window: %d days held out for final backtest", len(returns_array) - len(train_returns))
             else:
                 historical_returns = returns_array
                 logger.info("Using historical returns for PPO training (%d days)", len(returns_array))
@@ -579,10 +610,17 @@ def cmd_train(args: argparse.Namespace) -> None:
         from ..broker.discord_notifier import send_training_complete_embed
         from ..utils.plotting import save_performance_plot, save_performance_series
 
-        # Report out-of-sample when test window was held out; otherwise full backtest
-        backtest_aligned = aligned_test if aligned_test is not None else None
-        if backtest_aligned is not None:
-            logger.info("Running training-complete backtest on held-out test window (out-of-sample)")
+        from ..config import TEST_WINDOW_PLACEMENT
+
+        backtest_aligned = aligned_test
+        if backtest_aligned is None and TEST_WINDOW_PLACEMENT == "none" and aligned_full is not None:
+            backtest_aligned = aligned_full
+            logger.info("Running training-complete backtest on full dataset (no holdout)")
+        elif backtest_aligned is not None:
+            logger.info(
+                "Running training-complete backtest on held-out test window (placement=%s, out-of-sample)",
+                TEST_WINDOW_PLACEMENT,
+            )
         result = _run_backtest(tickers, trader, aligned_df=backtest_aligned)
         if result is not None:
             (
@@ -852,7 +890,7 @@ def _run_backtest(
     last_sell_bar: np.ndarray = np.full(n_assets, -999, dtype=np.int64)
     cost_bps = (TRANSACTION_COST_BPS + SLIPPAGE_BPS) / 10000.0
     turnover_pct = 0.0
-    pdt_tracker = pdt_tracker_from_config()
+    imf_guard = imf_guard_from_config()
 
     returns_mat = aligned[return_cols].fillna(0).values.astype(np.float32)
     from ..meta_learner.proxy_specialists import (
@@ -899,7 +937,8 @@ def _run_backtest(
 
         sessd = session_date_from_index(aligned.index, t)
         if effective_weights is None:
-            if ENV_PDT_RESTRICTIONS and pdt_tracker.should_block_new_opens(portfolio_value, sessd):
+            total_buy = float(np.sum(target_holdings)) * portfolio_value
+            if imf_guard.should_block_buy(portfolio_value, total_buy):
                 effective_weights = np.zeros(n_assets, dtype=np.float64)
                 prev_position_sum = 0.0
                 traded = False
@@ -925,7 +964,7 @@ def _run_backtest(
                 last_sell_bar,
                 min_hold_bars,
                 min_reentry_bars,
-                pdt_tracker,
+                imf_guard,
                 sessd,
                 portfolio_value,
             )
@@ -1123,16 +1162,25 @@ def cmd_tune(args: argparse.Namespace) -> None:
         return
 
     # Walk-forward: tune on train window only; test window held out for final evaluation
-    train_returns, _test_returns, _aligned_train, _aligned_test = _chronological_train_test_split(
+    train_returns, test_returns, _aligned_train, _aligned_test = _chronological_train_test_split(
         aligned, returns_array
     )
     tuning_returns = train_returns if train_returns is not None else returns_array
     if train_returns is not None:
-        logger.info(
-            "Using chronological split: tuning on %d days, test window held out (%d days)",
-            len(tuning_returns),
-            len(returns_array) - len(tuning_returns),
-        )
+        from ..config import TEST_WINDOW_PLACEMENT
+
+        if test_returns is not None:
+            logger.info(
+                "Using chronological split: tuning on %d days, test window held out (%d days, placement=%s)",
+                len(tuning_returns),
+                len(test_returns),
+                TEST_WINDOW_PLACEMENT,
+            )
+        else:
+            logger.info(
+                "No test holdout: tuning on full history (%d days, placement=none)",
+                len(tuning_returns),
+            )
 
     if bench:
         from ..meta_learner.parallel_tuner import run_tune_bench
@@ -1563,7 +1611,7 @@ def cmd_live(args: argparse.Namespace) -> None:
     last_trading_date: date | None = None
     last_ollama_time = 0.0
     cached_boardroom_summary: str | None = None
-    pdt_tracker = pdt_tracker_from_config()
+    imf_guard = imf_guard_from_config()
 
     while True:
         if should_stop():
@@ -1582,6 +1630,17 @@ def cmd_live(args: argparse.Namespace) -> None:
             account = broker.get_account()
             cash = float(account.get("cash", 0))
             logger.info("Account cash: $%.2f", cash)
+            if LIVE_BUYING_POWER_MODE == "buying_power":
+                available_capital = float(account.get("buying_power", 0))
+            else:
+                available_capital = float(
+                    account.get("non_marginable_buying_power", cash)
+                )
+            logger.info(
+                "Available capital (%s): $%.2f",
+                LIVE_BUYING_POWER_MODE,
+                available_capital,
+            )
 
             # Log Alpaca's actual positions (source of truth)
             alpaca_positions = broker.get_all_positions()
@@ -1627,8 +1686,13 @@ def cmd_live(args: argparse.Namespace) -> None:
                 action = np.array([_position_used(float(a)) for a in action])
             exposure, weights = _exposure_and_weights(action, ENV_ALLOW_CASH_EXPOSURE)
             target_holdings = exposure * weights  # match PPO env: actual fractional holdings (sum = exposure)
-            if cash <= 0:
-                logger.warning("Account on margin (cash=%.2f); not placing buy orders", cash)
+            if available_capital < MIN_TRADE_NOTIONAL:
+                logger.warning(
+                    "Insufficient buying power (%s=$%.2f, min=$%.2f); not placing buy orders",
+                    LIVE_BUYING_POWER_MODE,
+                    available_capital,
+                    MIN_TRADE_NOTIONAL,
+                )
             # Target values are fractions of total portfolio (consistent with backtest)
             rebalance_band = max(MIN_TRADE_NOTIONAL, portfolio_value * REBALANCE_BAND_PCT)
 
@@ -1712,12 +1776,19 @@ def cmd_live(args: argparse.Namespace) -> None:
                 if target_value > current_value + rebalance_band:
                     if t in sold_since:
                         logger.info("HOLD %s: skip buy (re-entry cooldown)", t)
-                    elif ENV_PDT_RESTRICTIONS and pdt_tracker.should_block_new_opens(
-                        portfolio_value, ny_today
+                    elif imf_guard.should_block_buy(
+                        portfolio_value, target_value - current_value
                     ):
-                        logger.info("HOLD %s: skip buy (PDT new-open freeze)", t)
-                    elif cash <= 0:
-                        logger.debug("HOLD %s: skip buy (no margin)", t)
+                        logger.info(
+                            "HOLD %s: skip buy (intraday buying power; IMF sim)",
+                            t,
+                        )
+                    elif available_capital < MIN_TRADE_NOTIONAL:
+                        logger.debug(
+                            "HOLD %s: skip buy (insufficient %s buying power)",
+                            t,
+                            LIVE_BUYING_POWER_MODE,
+                        )
                     else:
                         notional = target_value - current_value
                         if FRACTIONAL:
@@ -1741,20 +1812,11 @@ def cmd_live(args: argparse.Namespace) -> None:
                     if t in bought_since:
                         logger.info("HOLD %s: skip sell (within hold period)", t)
                         continue
-                    if t in bought_today:
-                        if not ENV_PDT_RESTRICTIONS:
-                            logger.info("HOLD %s: skip sell (bought today)", t)
-                            continue
-                        if portfolio_value < PDT_MIN_ACCOUNT_EQUITY and not pdt_tracker.can_open_new_day_trade(
-                            ny_today
-                        ):
-                            logger.info("HOLD %s: skip sell (PDT rolling day-trade limit)", t)
-                            continue
-                    record_pdt_on_sell = (
-                        ENV_PDT_RESTRICTIONS
-                        and portfolio_value < PDT_MIN_ACCOUNT_EQUITY
-                        and t in bought_today
-                    )
+                    if t in bought_today and not imf_guard.allow_same_day_sell(
+                        portfolio_value, True
+                    ):
+                        logger.info("HOLD %s: skip sell (same-session round trip; IMF)", t)
+                        continue
                     if current_value <= 0:
                         logger.debug("HOLD %s: no long position to reduce (current_value=%.2f)", t, current_value)
                     else:
@@ -1767,8 +1829,6 @@ def cmd_live(args: argparse.Namespace) -> None:
                             if sell_all:
                                 if broker.close_position(t):
                                     logger.info("SELL ALL %s (was $%.2f)", t, current_value)
-                                    if record_pdt_on_sell:
-                                        pdt_tracker.record_day_trade(ny_today)
                                     send_discord_notification(
                                         t, "SELL", position_pct, outputs,
                                         {"close_position": True, "notional": current_value, "status": "closed"},
@@ -1779,8 +1839,6 @@ def cmd_live(args: argparse.Namespace) -> None:
                                 order = broker.place_order(t, notional=notional, side="sell")
                                 if order:
                                     logger.info("SELL %s: $%.2f", t, notional)
-                                    if record_pdt_on_sell:
-                                        pdt_tracker.record_day_trade(ny_today)
                                     send_discord_notification(t, "SELL", position_pct, outputs, order)
                             else:
                                 current_qty = float(current_pos.get("qty", 0))
@@ -1790,8 +1848,6 @@ def cmd_live(args: argparse.Namespace) -> None:
                                     if would_sell_qty >= current_qty * 0.95:
                                         if broker.close_position(t):
                                             logger.info("SELL ALL %s (was %d shares)", t, int(current_qty))
-                                            if record_pdt_on_sell:
-                                                pdt_tracker.record_day_trade(ny_today)
                                             send_discord_notification(
                                                 t, "SELL", position_pct, outputs,
                                                 {"close_position": True, "notional": current_value, "status": "closed"},
@@ -1800,8 +1856,6 @@ def cmd_live(args: argparse.Namespace) -> None:
                                         order = broker.place_order(t, qty=would_sell_qty, side="sell")
                                         if order:
                                             logger.info("SELL %s: %d shares @ ~$%.2f", t, would_sell_qty, price)
-                                            if record_pdt_on_sell:
-                                                pdt_tracker.record_day_trade(ny_today)
                                             send_discord_notification(t, "SELL", position_pct, outputs, order)
                                 else:
                                     logger.warning("No position or price for %s; skipping sell", t)

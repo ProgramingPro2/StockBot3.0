@@ -4,5 +4,11 @@
   "UNIVERSE_SOURCE": "How the tradable universe is built (e.g. file reads UNIVERSE_FILE; other modes if configured).",
   "UNIVERSE_FILE": "Path to the universe list file when UNIVERSE_SOURCE=file (relative to project root unless absolute).",
   "STARTING_CAPITAL": "Starting portfolio value in dollars for backtests, training envs, and sizing context in paper/live.",
-  "LIVE_PPO_MODEL_PATH": "Filesystem path to the PPO meta-learner checkpoint used when running live Alpaca trading."
+  "LIVE_BUYING_POWER_MODE": "Buying power used for live buy safety checks. 'non_marginable' = cash only (default, no margin). 'buying_power' = Alpaca intraday buying power including margin (up to 4x for eligible accounts).",
+  "LIVE_PPO_MODEL_PATH": "Filesystem path to the PPO meta-learner checkpoint used when running live Alpaca trading.",
+  "TEST_WINDOW_PLACEMENT": "Where to hold out TEST_WINDOW_DAYS for evaluation. 'recent' = newest days (classic walk-forward). 'oldest' = oldest days first; training uses newer market regimes. 'none' = no holdout; train and backtest on full history.",
+  "TEST_WINDOW_DAYS": "Number of trading days held out when placement is recent or oldest (default 252). Ignored when placement is none.",
+  "ENV_IMF_RESTRICTIONS": "Enable intraday margin (IMF) simulation in backtest, training, and live. When off, same-day sells after a buy are blocked (conservative). When on, uses IMF_MIN_INTRADAY_EQUITY and IMF_INTRADAY_MULTIPLIER.",
+  "IMF_MIN_INTRADAY_EQUITY": "Minimum portfolio equity for full intraday multiplier (Alpaca 4x threshold is $2,000). Below this, simulated intraday buying power is 1x equity and same-day round trips are blocked.",
+  "IMF_INTRADAY_MULTIPLIER": "Simulated intraday buying power multiplier when equity is at or above IMF_MIN_INTRADAY_EQUITY. Valid: 1, 2, or 4 (matches Alpaca margin tiers)."
 }

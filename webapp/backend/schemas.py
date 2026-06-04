@@ -127,6 +127,7 @@ class EnvVar(BaseModel):
     description: Optional[str] = None
     secret: bool = False
     group: Optional[str] = None
+    allowed_values: Optional[list[str]] = None
 
 
 class EnvDocument(BaseModel):

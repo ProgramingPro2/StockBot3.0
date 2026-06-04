@@ -120,15 +120,32 @@ export default function ConfigPage() {
                       </button>
                     )}
                   </div>
-                  <input
-                    type={v.secret && !reveal && !revealed[v.key] ? "password" : "text"}
-                    className="input mt-1"
-                    title={v.description ?? undefined}
-                    value={drafts[v.key] ?? ""}
-                    onChange={(e) =>
-                      setDrafts((d) => ({ ...d, [v.key]: e.target.value }))
-                    }
-                  />
+                  {v.allowed_values && v.allowed_values.length > 0 && !v.secret ? (
+                    <select
+                      className="input mt-1"
+                      title={v.description ?? undefined}
+                      value={drafts[v.key] ?? ""}
+                      onChange={(e) =>
+                        setDrafts((d) => ({ ...d, [v.key]: e.target.value }))
+                      }
+                    >
+                      {v.allowed_values.map((opt) => (
+                        <option key={opt || "__empty__"} value={opt}>
+                          {opt === "" ? "(empty / off)" : opt}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type={v.secret && !reveal && !revealed[v.key] ? "password" : "text"}
+                      className="input mt-1"
+                      title={v.description ?? undefined}
+                      value={drafts[v.key] ?? ""}
+                      onChange={(e) =>
+                        setDrafts((d) => ({ ...d, [v.key]: e.target.value }))
+                      }
+                    />
+                  )}
                   {v.description ? (
                     <p className="text-xs text-ink-muted mt-1">{v.description}</p>
                   ) : null}

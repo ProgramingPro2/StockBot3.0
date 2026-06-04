@@ -149,22 +149,24 @@ try:
 except (ValueError, TypeError):
     SLIPPAGE_BPS = 5.0
 
-# Pattern day trader (PDT) simulation: backtest, training envs, and live Alpaca loop
-ENV_PDT_RESTRICTIONS = os.getenv("ENV_PDT_RESTRICTIONS", "").strip().lower() in ("1", "true", "yes")
+# Live Alpaca: which buying power field gates buy orders (non_marginable = cash only; buying_power = intraday margin)
+_live_bp_mode = os.getenv("LIVE_BUYING_POWER_MODE", "non_marginable").strip().lower()
+LIVE_BUYING_POWER_MODE = (
+    _live_bp_mode if _live_bp_mode in ("non_marginable", "buying_power") else "non_marginable"
+)
+
+# Intraday margin framework (IMF): backtest, training envs, and live Alpaca loop.
+# Alpaca replaced PDT with intraday margin (Jun 2026); these flags simulate buying power and round trips.
+ENV_IMF_RESTRICTIONS = os.getenv("ENV_IMF_RESTRICTIONS", "").strip().lower() in ("1", "true", "yes")
 try:
-    PDT_MIN_ACCOUNT_EQUITY = float(os.getenv("PDT_MIN_ACCOUNT_EQUITY", "25000").strip() or "25000")
+    IMF_MIN_INTRADAY_EQUITY = float(os.getenv("IMF_MIN_INTRADAY_EQUITY", "2000").strip() or "2000")
 except (ValueError, TypeError):
-    PDT_MIN_ACCOUNT_EQUITY = 25000.0
+    IMF_MIN_INTRADAY_EQUITY = 2000.0
 try:
-    PDT_MAX_DAY_TRADES = int(os.getenv("PDT_MAX_DAY_TRADES", "3").strip() or "3")
+    _imf_mult = float(os.getenv("IMF_INTRADAY_MULTIPLIER", "4").strip() or "4")
 except (ValueError, TypeError):
-    PDT_MAX_DAY_TRADES = 3
-try:
-    PDT_ROLLING_BUSINESS_DAYS = int(os.getenv("PDT_ROLLING_BUSINESS_DAYS", "5").strip() or "5")
-except (ValueError, TypeError):
-    PDT_ROLLING_BUSINESS_DAYS = 5
-PDT_MAX_DAY_TRADES = max(1, PDT_MAX_DAY_TRADES)
-PDT_ROLLING_BUSINESS_DAYS = max(1, PDT_ROLLING_BUSINESS_DAYS)
+    _imf_mult = 4.0
+IMF_INTRADAY_MULTIPLIER = _imf_mult if _imf_mult in (1.0, 2.0, 4.0) else 4.0
 
 # Trade tickers (5 assets; override via TRADE_TICKERS=SPY,IWM,... in .env)
 # Default: ETFs chosen for active-trading fit (volatility, dispersion) vs strong-trend names.
@@ -254,9 +256,14 @@ TRAIN_HISTORICAL_RATIO = float(os.getenv("TRAIN_HISTORICAL_RATIO", "1.0"))
 # When set in .env, use this ratio for both training and tuning; tuner will not search for historical_ratio
 TRAIN_HISTORICAL_RATIO_OVERRIDE = "TRAIN_HISTORICAL_RATIO" in os.environ
 
-# Walk-forward: hold out last TEST_WINDOW_DAYS for out-of-sample evaluation; tune/train on the rest
+# Walk-forward evaluation
 TEST_WINDOW_DAYS = int(os.getenv("TEST_WINDOW_DAYS", "252"))  # 1 year default
 TRAIN_WINDOW_YEARS = int(os.getenv("TRAIN_WINDOW_YEARS", "5"))  # years of history to load
+# Where to hold out TEST_WINDOW_DAYS: recent (end), oldest (start), none (no holdout; train on all data)
+_test_placement = os.getenv("TEST_WINDOW_PLACEMENT", "recent").strip().lower()
+TEST_WINDOW_PLACEMENT = (
+    _test_placement if _test_placement in ("recent", "oldest", "none") else "recent"
+)
 
 # Environment
 # Reward: use rolling Sharpe only when we have enough steps; keep window <= episode length so reward is reachable

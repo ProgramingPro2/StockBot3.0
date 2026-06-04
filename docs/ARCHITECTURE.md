@@ -146,7 +146,7 @@ trading_system/
     eval_helpers.py / proxy_specialists.py
   universe/             - Universe provider, features, ScorerModel, selector
   broker/               - Alpaca integration, Discord notifications
-  utils/                - Logger, plotting (headless), pdt
+  utils/                - Logger, plotting (headless), imf
   models/               - Saved checkpoints
     meta_learner/
       ppo_trader*.zip
@@ -171,15 +171,14 @@ requirements-web.txt    - FastAPI/uvicorn/websockets/psutil/nvidia-ml-py
 Makefile                - web/web-dev/web-prod, frontend-build, docker-up*, test, cli
 ```
 
-## Day-trading prevention
+## Intraday margin (IMF)
 
 By default the system avoids same-period buy-then-sell on the same asset using `last_buy_bar` / `last_sell_bar` and min-hold / min-reentry rules aligned with live cooldowns.
 
-- **Live**: A set `bought_today` records tickers bought on the current America/New_York session date. When `ENV_PDT_RESTRICTIONS` is off, sells are skipped if the symbol is in `bought_today` (same as before). When PDT mode is on and portfolio value is below `PDT_MIN_ACCOUNT_EQUITY`, same-day sells are allowed only up to `PDT_MAX_DAY_TRADES` within a rolling `PDT_ROLLING_BUSINESS_DAYS` window (each qualifying sell is recorded); at the limit, new buys are skipped until the window rolls forward. Above the equity threshold, PDT limits do not apply.
-- **Backtest**: Shared `rebalance_multi_asset` logic applies the same band, cooldown bars, and optional PDT rules (`trading_system/utils/pdt.py`) per bar.
-- **Training (`TradingEnv`, `HistoricalTradingEnv`)**: Each step uses the same rebalance helper as the backtest so policy training matches execution semantics. `HistoricalTradingEnv` accepts optional `trading_dates` (aligned index) for calendar-based PDT windows; otherwise an integer cursor is used.
+- **Live**: `bought_today` tracks session buys. `LIVE_BUYING_POWER_MODE` gates buys against Alpaca `non_marginable_buying_power` or `buying_power`. When `ENV_IMF_RESTRICTIONS` is off, sells are skipped if the symbol was bought today. When IMF mode is on and equity is at/above `IMF_MIN_INTRADAY_EQUITY`, same-day sells are allowed; below the minimum, same-day round trips are blocked. Buys can be blocked when they exceed simulated intraday buying power (`equity * IMF_INTRADAY_MULTIPLIER`).
+- **Backtest / training**: `rebalance_multi_asset` in `trading_system/utils/imf.py` applies band, cooldowns, and optional IMF rules per bar.
 
-Alpaca may enforce PDT independently; local flags mirror policy for simulation and logging.
+Alpaca enforces intraday margin at the broker; local IMF flags mirror buying power and round-trip policy for simulation.
 
 ## Trading Modes
 

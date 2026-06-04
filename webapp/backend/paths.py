@@ -30,6 +30,7 @@ JOBS_REGISTRY: Path = JOBS_DIR / "registry.json"
 ENV_FILE: Path = Path(os.environ.get("BOARDROOM_ENV_FILE", str(PROJECT_ROOT / ".env")))
 ENV_EXAMPLE_FILE: Path = PROJECT_ROOT / ".env.example"
 ENV_HINTS_FILE: Path = PROJECT_ROOT / "webapp" / "backend" / "data" / "env_var_hints.json"
+ENV_REGISTRY_FILE: Path = PROJECT_ROOT / "webapp" / "backend" / "data" / "env_registry.json"
 SCHEDULE_FILE: Path = Path(
     os.environ.get("BOARDROOM_SCHEDULE_FILE", str(PROJECT_ROOT / "config" / "schedule.yaml"))
 )
