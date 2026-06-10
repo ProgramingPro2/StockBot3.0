@@ -68,15 +68,24 @@ def load_ohlcv(
     end: datetime | str | None = None,
     use_cache: bool = True,
     lookback_years: int | None = None,
+    require_fresh: bool = False,
+    max_bar_age_days: int = 3,
 ) -> pd.DataFrame:
     """
     Load OHLCV data from yfinance with retry and caching.
     Returns DataFrame with columns: open, high, low, close, volume.
     If lookback_years is set, fetches that many years (ignores cache).
+    require_fresh: when True (live/paper paths only), forces a refetch if the last cached bar is
+        older than max_bar_age_days calendar days. Has no effect on training/backtest callers
+        that leave require_fresh at its default False.
     """
     ticker = ticker.upper()
     if lookback_years is not None:
         end = end or datetime.now()
+        if isinstance(end, str):
+            end = datetime.fromisoformat(end)
+        if isinstance(start, str):
+            start = datetime.fromisoformat(start)
         start = start or (end - timedelta(days=lookback_years * 365))
         use_cache = False
     cache_path = _cache_path(ticker)
@@ -85,8 +94,21 @@ def load_ohlcv(
         if _cache_valid(cache_path):
             try:
                 df = pd.read_parquet(cache_path)
-                logger.debug("Loaded %s from cache (%d rows)", ticker, len(df))
-                return df
+                if require_fresh and not df.empty:
+                    last_bar = pd.Timestamp(df.index[-1]).normalize()
+                    today = pd.Timestamp.now().normalize()
+                    if (today - last_bar).days > max_bar_age_days:
+                        logger.info(
+                            "Cache for %s last bar %s is stale (>%dd); refetching",
+                            ticker, last_bar.date(), max_bar_age_days,
+                        )
+                        # Fall through to live refetch below
+                    else:
+                        logger.debug("Loaded %s from cache (%d rows)", ticker, len(df))
+                        return df
+                else:
+                    logger.debug("Loaded %s from cache (%d rows)", ticker, len(df))
+                    return df
             except Exception as e:
                 logger.warning("Cache read failed for %s: %s", ticker, e)
 

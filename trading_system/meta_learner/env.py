@@ -206,6 +206,15 @@ class TradingEnv(gym.Env):
                 self._bootstrap_returns[self._bootstrap_idx], dtype=np.float32
             ).reshape(self.n_assets)
             self._bootstrap_idx += 1
+            # Keep rolling features in sync with the bootstrap return path.
+            for i in range(self.n_assets):
+                ret = float(returns_per_asset[i])
+                if self._rolling_returns is not None:
+                    self._rolling_returns[i] = np.roll(self._rolling_returns[i], 1)
+                    self._rolling_returns[i, 0] = ret
+                    valid = self._rolling_returns[i][~np.isnan(self._rolling_returns[i])]
+                    if len(valid) >= 5:
+                        self._rolling_vols[i] = max(0.01, float(np.std(valid)))
         else:
             outputs = self._specialist_outputs or [{}] * self.n_assets
             returns_per_asset = np.zeros(self.n_assets, dtype=np.float32)
@@ -302,6 +311,23 @@ class HistoricalTradingEnv(gym.Env):
     Trading environment using real historical returns.
     Steps through aligned return data; derives specialist proxies from lookback.
     Optional daily_aux_features (n_days, n_assets, 2): atr_pct, volume_ratio mapped into obs slots.
+
+    Observation layout per asset (proxy_specialists_vectorized slot ordering):
+      Slot  0: sentiment          [-1, 1]  short-term (5d) momentum proxy
+      Slot  1: quant_prob         [ 0, 1]  fraction of positive returns in window (hit rate)
+      Slot  2: fund_score         [-1, 1]  mean-reversion z-score of last return vs window
+      Slot  3: regime_flag        [ 0, 1]  volatility level (high vol = 1)
+      Slot  4: momentum           [-1, 1]  full-window mean return scaled
+      Slot  5: mean_reversion     [-1, 1]  price deviation from SMA (z-scored)
+      Slot  6: volatility         [ 0, 1]  short/long realized vol ratio proxy
+      Slot  7: event_risk         [ 0, 1]  max absolute return in window / (3 * std)
+      Slot  8: relative_strength  [-1, 1]  return vs equal-weight basket; or aux atr_pct
+      Slot  9: liquidity          [ 0, 1]  0.5 neutral (no vol data); or aux volume_ratio
+      Slot 10: holdings           [ 0, 1]  current position fraction
+    Optional (ENV_OBS_ROLLING_FEATURES):
+      Slot 11: rolling_return_5d  [-1, 1]  5d mean return * 50
+      Slot 12: rolling_return_21d [-1, 1]  21d mean return * 50
+      Slot 13: rolling_vol_21d    [-1, 1]  (vol_21d - 0.01) * 50
     """
 
     metadata = {"render_modes": []}
@@ -483,9 +509,11 @@ class HistoricalTradingEnv(gym.Env):
             features[:, 9] = 0.5
             features[:, 12] = 0.01
         else:
-            features = self._proxy_cache[self._cursor]
+            # Clamp to valid range; cursor may equal n_days at episode end before termination.
+            safe_cursor = min(self._cursor, self.n_days - 1)
+            features = self._proxy_cache[safe_cursor]
             if self.daily_aux_features is not None:
-                aux_row = self.daily_aux_features[self._cursor - 1]
+                aux_row = self.daily_aux_features[safe_cursor - 1]
                 features = merge_daily_aux_into_proxy_matrix(features, aux_row)
 
         holdings = self._holdings if self._holdings is not None else np.zeros(self.n_assets, dtype=np.float32)

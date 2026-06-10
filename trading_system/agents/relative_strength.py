@@ -49,4 +49,6 @@ def get_relative_strength_score(ticker: str, benchmark: str | None = None) -> fl
     # Scale: e.g. ±0.2 relative return -> ±1; use linear cap
     scale = 5.0  # 0.2 -> 1.0
     score = float(np.clip(avg_rel * scale, -1.0, 1.0))
+    if not np.isfinite(score):
+        return 0.0
     return score

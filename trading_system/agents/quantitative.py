@@ -11,6 +11,7 @@ import torch
 from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer
 from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.loggers import TensorBoardLogger
 
 from ..config import (
@@ -44,12 +45,31 @@ def _get_device() -> str:
     return "cpu"
 
 
+def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add log-volume and ensure return-based features are present.
+    Raw price and volume columns are not added as encoder inputs because
+    cross-ticker magnitude differences make them non-comparable.
+    """
+    df = df.copy()
+    if "volume" in df.columns:
+        df["log_volume"] = np.log1p(df["volume"].clip(lower=0))
+    return df
+
+
 def _build_dataset(df: pd.DataFrame) -> TimeSeriesDataSet:
-    """Build TimeSeriesDataSet from prepared OHLCV DataFrame."""
-    time_varying_unknown_reals = ["open", "high", "low", "close", "volume", "return_1d", "vol_20d"]
-    available = [c for c in time_varying_unknown_reals if c in df.columns]
+    """
+    Build TimeSeriesDataSet from prepared OHLCV DataFrame.
+
+    Only return-based and log-volume features are used as encoder inputs so that
+    cross-ticker magnitude differences (e.g. $3 stock vs $1000 stock) do not
+    inflate or suppress gradients. Raw open/high/low/close/volume are excluded.
+    """
+    # Use only scale-free features; exclude raw OHLCV prices/volume
+    candidate_features = ["return_1d", "vol_20d", "log_volume"]
+    available = [c for c in candidate_features if c in df.columns]
     if not available:
-        available = ["close", "return_1d", "vol_20d"]
+        available = ["return_1d"]
 
     dataset = TimeSeriesDataSet(
         df,
@@ -73,6 +93,20 @@ def _build_dataset(df: pd.DataFrame) -> TimeSeriesDataSet:
 def _forecast_to_probability(forecast: float, scale: float = 20.0) -> float:
     """Map TFT forecast (30d return) to trend probability in [0, 1]."""
     return 1.0 / (1.0 + math.exp(-scale * forecast))
+
+
+def _fix_time_idx(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reassign time_idx per group as a contiguous 0-based integer sequence.
+
+    prepare_tft_data assigns time_idx before dropna, which can leave gaps when
+    rows with NaN targets are removed.  This ensures a monotonically increasing
+    index with no gaps within each group, as required by TimeSeriesDataSet.
+    """
+    df = df.copy()
+    df = df.sort_values(["ticker", "time_idx"]).reset_index(drop=True)
+    df["time_idx"] = df.groupby("ticker").cumcount()
+    return df
 
 
 def _ensure_model(
@@ -109,6 +143,7 @@ def _ensure_model(
             continue
         prepared = prepare_tft_data(df, ticker=t)
         if not prepared.empty:
+            prepared = _add_derived_features(prepared)
             parts.append(prepared)
 
     if not parts:
@@ -116,16 +151,62 @@ def _ensure_model(
         return False
 
     combined = pd.concat(parts, ignore_index=True)
-    _training_dataset = _build_dataset(combined)
+    # Ensure monotonically increasing time_idx per group with no gaps after dropna
+    combined = _fix_time_idx(combined)
+
+    # Chronological 80/20 train/val split per group
+    # Each group's time_idx runs 0..N-1; split at 80th percentile per group.
+    min_val_rows = TFT_MAX_ENCODER_LENGTH + TFT_MAX_PREDICTION_LENGTH
+
+    def _split_group(g: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        n = len(g)
+        split_idx = int(n * 0.8)
+        # Val needs encoder context: include trailing encoder-length rows from train
+        val_start = max(0, split_idx - TFT_MAX_ENCODER_LENGTH)
+        return g.iloc[:split_idx], g.iloc[val_start:]
+
+    train_parts, val_parts = [], []
+    for _, grp in combined.groupby("ticker"):
+        tr, va = _split_group(grp)
+        if len(tr) >= TFT_MAX_ENCODER_LENGTH + TFT_MAX_PREDICTION_LENGTH:
+            train_parts.append(tr)
+        if len(va) >= min_val_rows:
+            val_parts.append(va)
+
+    if not train_parts:
+        logger.warning("No valid train split for TFT")
+        return False
+
+    train_df = pd.concat(train_parts, ignore_index=True)
+    train_df = _fix_time_idx(train_df)
+
     _bs = int(os.getenv("TFT_BATCH_SIZE", "32").strip() or "32")
     _nw = int(os.getenv("TFT_DATALOADER_NUM_WORKERS", "0").strip() or "0")
     _persist = os.getenv("TFT_DATALOADER_PERSISTENT", "").strip().lower() in ("1", "true", "yes")
+
+    _training_dataset = _build_dataset(train_df)
     train_dl = _training_dataset.to_dataloader(
         train=True,
         batch_size=_bs,
         num_workers=_nw,
         persistent_workers=bool(_nw and _persist),
     )
+
+    val_dl = None
+    if val_parts:
+        try:
+            val_df = pd.concat(val_parts, ignore_index=True)
+            val_df = _fix_time_idx(val_df)
+            val_dataset = TimeSeriesDataSet.from_dataset(_training_dataset, val_df, stop_randomization=True)
+            val_dl = val_dataset.to_dataloader(
+                train=False,
+                batch_size=_bs,
+                num_workers=_nw,
+                persistent_workers=bool(_nw and _persist),
+            )
+        except Exception as e:
+            logger.warning("Could not build TFT validation dataloader: %s", e)
+            val_dl = None
 
     model = TemporalFusionTransformer.from_dataset(
         _training_dataset,
@@ -150,12 +231,23 @@ def _ensure_model(
         pass
 
     _epochs = int(os.getenv("TFT_MAX_EPOCHS", "10").strip() or "10")
+    callbacks = [EpochProgressCallback(phase="specialist_quant")]
+    if val_dl is not None:
+        callbacks.append(
+            EarlyStopping(
+                monitor="val_loss",
+                patience=3,
+                mode="min",
+                verbose=False,
+            )
+        )
+
     trainer_kw: dict = {
         "max_epochs": _epochs,
         "accelerator": _get_device(),
         "devices": 1,
         "logger": tb_logger,
-        "callbacks": [EpochProgressCallback(phase="specialist_quant")],
+        "callbacks": callbacks,
         "enable_progress_bar": False,
         "enable_model_summary": False,
     }
@@ -169,7 +261,10 @@ def _ensure_model(
             message=".*is an instance of `nn.Module` and is already saved during checkpointing.*",
             module="lightning.pytorch.utilities.parsing",
         )
-        trainer.fit(model, train_dl)
+        fit_kwargs: dict = {"model": model, "train_dataloaders": train_dl}
+        if val_dl is not None:
+            fit_kwargs["val_dataloaders"] = val_dl
+        trainer.fit(**fit_kwargs)
     QUANTITATIVE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     trainer.save_checkpoint(str(ckpt))
     _model = model
@@ -195,6 +290,8 @@ def get_trend_probability(ticker: str, retrain: bool = False) -> float:
     if prepared.empty:
         return 0.5
 
+    prepared = _add_derived_features(prepared)
+
     if _training_dataset is not None:
         try:
             dataset = TimeSeriesDataSet.from_dataset(_training_dataset, prepared)
@@ -216,4 +313,7 @@ def get_trend_probability(ticker: str, retrain: bool = False) -> float:
         forecast = float(preds[-1])
     else:
         forecast = float(preds.flatten()[-1])
-    return _forecast_to_probability(forecast)
+
+    if not np.isfinite(forecast):
+        return 0.5
+    return float(np.clip(_forecast_to_probability(forecast), 0.0, 1.0))

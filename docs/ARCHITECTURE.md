@@ -101,11 +101,68 @@ Meta-Learner (PPO) --> position_size % per asset (n_assets outputs)
 ## Meta-Learner
 
 - **Model**: PPO (stable-baselines3)
-- **Observation**: Per-asset specialist features + holdings + optional rolling features. Length = 14 \* n_assets when `ENV_OBS_ROLLING_FEATURES` is true: for each asset (sentiment, quant_prob, fund_score, regime_flag, momentum_score, mean_reversion_score, volatility_score, event_risk_score, relative_strength_score, liquidity_score, holdings, rolling_return_5d, rolling_return_21d, rolling_vol_21d). Without rolling: 11 \* n_assets. Example: 70-dim for 5 assets with rolling.
-- **Action**: Position size % per asset [0, 1]; n_assets outputs (e.g. 5). When `ENV_ALLOW_CASH_EXPOSURE` is true, the **sum** of actions is interpreted as total market exposure (capped at 1); the rest stays in cash (0 return).
+- **Observation**: Per-asset specialist features + holdings + rolling return/vol slots. Shape = 13 slots × n_assets. Slot layout (matches proxy and specialist paths exactly):
+  - Slot 0: sentiment [-1, 1]
+  - Slot 1: quant_prob [0, 1]
+  - Slot 2: fund_score [-1, 1]
+  - Slot 3: regime_flag [0, 1]
+  - Slot 4: momentum_score [-1, 1]
+  - Slot 5: mean_reversion [-1, 1]
+  - Slot 6: volatility [0, 1]
+  - Slot 7: event_risk [0, 1]
+  - Slot 8: relative_strength [-1, 1]
+  - Slot 9: liquidity [0, 1]
+  - Slot 10: ret_5d_norm [-1, 1]
+  - Slot 11: ret_21d_norm [-1, 1]
+  - Slot 12: vol_21d_norm [-1, 1]
+
+  Holdings (current position weight per asset) are appended after the 13×n_assets block, giving obs dimension = 14 × n_assets.
+- **Action**: Position size % per asset [0, 1]; n_assets outputs. When `ENV_ALLOW_CASH_EXPOSURE` is true, the **sum** of actions is interpreted as total market exposure (capped at 1); the rest stays in cash (0 return).
 - **Reward**: Full-portfolio return (weights \* returns, cash earns 0) with rolling Sharpe when enough history; drawdown penalty (`ENV_REWARD_DRAWDOWN_PENALTY`) and turnover cost (`TRANSACTION_COST_BPS`, `SLIPPAGE_BPS`).
 - **Training**: Default is historical-first (`TRAIN_HISTORICAL_RATIO=1.0`). Three modes: synthetic `TradingEnv`, `HistoricalTradingEnv` (real OHLCV returns), or mixed. Use `--use-historical` for 100% historical or `TRAIN_HISTORICAL_RATIO` in config. When set in `.env`, it is used as the fixed ratio for both training and tuning. See [Training Data and Evaluation](training_data_and_evaluation.md) for walk-forward splits and data contract.
 - **Tuning**: Run `tune` for Optuna-based hyperparameter optimization; use `--use-tuned` when training.
+
+## Dual Feature Modes (FEATURE_SOURCE)
+
+The system supports two mutually exclusive feature modes selected by the `FEATURE_SOURCE` environment variable (`proxy` or `specialist`). The mode is stamped into the model artifact's metadata sidecar at training time; live/paper execution rejects a model loaded in the wrong mode.
+
+### Mode A: proxy (default)
+
+All 13 observation slots are computed from OHLCV price/return data only, using a precomputed proxy feature matrix. The proxy pipeline avoids live specialist model calls:
+
+- Slots 10-12 (ret_5d_norm, ret_21d_norm, vol_21d_norm): directly computed from aligned returns.
+- Slot 3 (regime_flag), 5 (mean_reversion), 6 (volatility), 8 (relative_strength), 9 (liquidity): rule-based computations from price/volume.
+- Slots 0 (sentiment), 2 (fund_score), 7 (event_risk): proxy-filled from OHLCV momentum heuristics; real specialist outputs not available without the LLM/yfinance-current-snapshot dependencies.
+- Slot 1 (quant_prob), 4 (momentum_score): derived from return windows (not the trained TFT or LightGBM model).
+
+All slots pass through an **expanding z-score** normalizer (`proxy_expanding_zscore.py`). Normalization running statistics are computed over the training window and persisted in the model's `.meta.json` sidecar. During live/paper inference, the saved running stats are **warm-started** (test/val slice stats initialized from the end of the train slice) so no distribution shift occurs at slice boundaries.
+
+### Mode B: specialist
+
+Slots are populated with real specialist model outputs generated via a walk-forward historical generator (`meta_learner/specialist_features.py`). Trained models (TFT, LightGBM, VAE) are refitted on expanding windows; rule-based specialists apply `.shift(1)` to rolling stats for strict no-lookahead. The specialist feature matrix is precomputed and cached before PPO training begins.
+
+Proxy fallback slots in Mode B (see `specialist_features.py` for reasons):
+- Slot 0 (sentiment): LLM unavailable for historical dates.
+- Slot 2 (fund_score): yfinance provides only current-snapshot fundamentals.
+- Slot 7 (event_risk): earnings calendar is forward-looking.
+- Slot 1 (quant_prob): known deferred TFT date-mapping limitation — walk-forward TFT predictions do not map back to output bars, so the proxy hit-rate is substituted.
+
+Real (non-fallback) Mode B slots: 3 (regime VAE), 4 (momentum LightGBM), 5, 6, 8, 9 (rule-based with `.shift(1)`), and 10-12 (returns-based).
+
+### Model metadata sidecar
+
+Every trained model `ppo_trader_<timestamp>.zip` is accompanied by `ppo_trader_<timestamp>.zip.meta.json` containing:
+
+```json
+{
+  "feature_source": "proxy",
+  "tickers": [...],
+  "norm_running_stats": { "mean": [...], "var": [...], "count": N },
+  "n_assets": 30
+}
+```
+
+Legacy models without a sidecar are assumed to be proxy-mode; a WARNING is logged. The sidecar enables the live/paper path to verify that the loaded model's mode matches the configured `FEATURE_SOURCE` and to restore the warm-started z-score stats for inference.
 
 ### Variable Exposure and Cash
 
@@ -182,15 +239,15 @@ Alpaca enforces intraday margin at the broker; local IMF flags mirror buying pow
 
 ## Trading Modes
 
-**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` for pure historical returns, `--historical-ratio 0.7` for mixed (70% historical, 30% synthetic), or `TRAIN_HISTORICAL_RATIO` in config. When `TRAIN_HISTORICAL_RATIO` is set in `.env`, it is used as the fixed ratio for both training and tuning. Use `--use-tuned` to apply tuned hyperparameters. Random historical episodes from `ProxySpecialistFn` apply the same **proxy sentiment staleness** expectation as backtest (probabilistic refresh vs carry-over, no Ollama); other proxy features still vary each sampled day.
+**Train**: Train specialists (TFT on all TRADE_TICKERS, fundamental/regime as before) and meta-learner (PPO) on TRADE_TICKERS. Use `--tickers` to override. Use `--use-historical` for pure historical returns, `--historical-ratio 0.7` for mixed (70% historical, 30% synthetic), or `TRAIN_HISTORICAL_RATIO` in config. When `TRAIN_HISTORICAL_RATIO` is set in `.env`, it is used as the fixed ratio for both training and tuning. Use `--use-tuned` to apply tuned hyperparameters. The `FEATURE_SOURCE` environment variable selects proxy (default) or specialist mode. Use `--retrain` to force specialist retraining. Random historical episodes from `ProxySpecialistFn` apply the same **proxy sentiment staleness** expectation as backtest (probabilistic refresh vs carry-over, no Ollama); other proxy features still vary each sampled day.
 
 **Tune**: Run Optuna hyperparameter tuning on historical data. Best params saved to `models/meta_learner/ppo_tune_best.json`. Trials report validation Sharpe at `n_evaluations` checkpoints per trial (aligned with `n_timesteps` and `n_envs`); default pruner is Hyperband (`OPTUNA_PRUNER=median` for MedianPruner). Train and val proxy feature matrices are precomputed once per study to avoid per-worker recomputation. See `docs/perf-sprint.md` for env flags.
 
-**Backtest**: Portfolio backtest over all tickers; aligned OHLCV, proxy specialists per ticker, one portfolio equity curve and plot (`backtest_portfolio.png`). Sentiment uses the same **OHLCV momentum proxy** as live when the LLM is not used (`sentiment_proxy_from_close_prices`), with **staleness** between refreshes: recomputed every `N` trading days where `N` = `BACKTEST_OLLAMA_EVERY_N_BARS` if set, else `max(1, OLLAMA_INTERVAL_MIN // CYCLE_INTERVAL_MIN)` so the bar cadence matches the paper/live Ollama-to-cycle ratio without any Ollama requests. Other proxy specialist fields still update every bar from the precomputed return window.
+**Backtest**: Portfolio backtest over all tickers; aligned OHLCV, proxy specialists per ticker, one portfolio equity curve and plot (`backtest_portfolio.png`). By default the backtest is **out-of-sample**: the chronological test window (oldest 252 days by default, configurable via `TEST_WINDOW_PLACEMENT` and `TEST_WINDOW_DAYS`) is held out. Pass `--in-sample` to evaluate on all available data instead. Sentiment uses the same **OHLCV momentum proxy** as live when the LLM is not used (`sentiment_proxy_from_close_prices`), with **staleness** between refreshes: recomputed every `N` trading days where `N` = `BACKTEST_OLLAMA_EVERY_N_BARS` if set, else `max(1, OLLAMA_INTERVAL_MIN // CYCLE_INTERVAL_MIN)` so the bar cadence matches the paper/live Ollama-to-cycle ratio without any Ollama requests. Other proxy specialist fields still update every bar from the precomputed return window.
 
 **Paper**: Run specialists for all tickers each interval; one PPO prediction (5 position sizes); log exposure and weights; Discord per ticker. Use `--autodiscover` to resolve the trade list via universe autodiscovery (top N by scorer) at start.
 
-**Live**: Same as paper; target value per ticker = portfolio_value \* weight (sized from total portfolio value, not cash); place buy/sell per ticker via Alpaca. Rebalance band and cooldowns (min hold after buy, min re-entry after sell) apply. Use `--autodiscover` to resolve the trade list via universe autodiscovery at start.
+**Live**: Same as paper; target value per ticker = portfolio_value \* weight (sized from total portfolio value, not cash); place buy/sell per ticker via Alpaca. Rebalance uses a **two-pass sell-first** strategy: all sells execute first to free capital, then buys are placed against the updated `remaining_capital` to prevent silent over-allocation to early tickers. Rebalance band and cooldowns (min hold after buy, min re-entry after sell) apply. Use `--autodiscover` to resolve the trade list via universe autodiscovery at start.
 
 Switching the number of assets (e.g. changing TRADE_TICKERS length) requires retraining the PPO; the saved policy has fixed input/output dimensions.
 

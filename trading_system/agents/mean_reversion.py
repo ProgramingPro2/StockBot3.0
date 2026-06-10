@@ -33,13 +33,28 @@ def get_mean_reversion_score(ticker: str) -> float:
     rsi = float(row["rsi"])
     close = float(row["close"])
 
-    sma = df["close"].rolling(SMA_WINDOW).mean().iloc[-1]
-    std_ret = df["close"].pct_change().dropna().tail(SMA_WINDOW).std()
-    if pd.isna(std_ret) or std_ret < 1e-10:
-        std_ret = 1e-10
-    z_score = (close - sma) / (std_ret * (SMA_WINDOW ** 0.5) + 1e-10)
-    z_term = np.clip(-z_score * 0.15, -0.3, 0.3)
+    # Guard against NaN values from insufficient price history
+    if not np.isfinite(rsi) or not np.isfinite(close):
+        return 0.0
 
-    rsi_term = (50 - rsi) / 50
-    score = np.clip(rsi_term + z_term, -1.0, 1.0)
-    return float(score)
+    sma = float(df["close"].rolling(SMA_WINDOW).mean().iloc[-1])
+    if not np.isfinite(sma):
+        return 0.0
+
+    # Price-unit z-score: both numerator and denominator in the same (price) units.
+    # The previous version divided by std_ret * sqrt(N) where std_ret is in return
+    # units (~0.01), making the denominator ~0.045 while the numerator is in dollars
+    # ($5+), causing the z-term to always saturate at the clip boundary.
+    std_price = float(df["close"].rolling(SMA_WINDOW).std().iloc[-1])
+    if not np.isfinite(std_price) or std_price < 1e-10:
+        std_price = 1e-10
+
+    z_score = (close - sma) / std_price
+    z_term = float(np.clip(-z_score * 0.3, -0.3, 0.3))
+
+    rsi_term = float((50 - rsi) / 50)
+    score = float(np.clip(rsi_term + z_term, -1.0, 1.0))
+
+    if not np.isfinite(score):
+        return 0.0
+    return score

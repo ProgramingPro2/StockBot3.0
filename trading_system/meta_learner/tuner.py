@@ -8,6 +8,7 @@ import logging
 import math
 import multiprocessing
 import os
+import tempfile
 import warnings
 from functools import partial
 from pathlib import Path
@@ -30,6 +31,7 @@ from ..config import (
     META_LEARNER_MODEL_DIR,
     PPO_CPU_THREADS,
     PPO_N_ENVS,
+    PPO_SEED,
     PPO_USE_TORCH_VEC,
     TRAIN_HISTORICAL_RATIO,
     TRAIN_HISTORICAL_RATIO_OVERRIDE,
@@ -38,7 +40,7 @@ from ..utils.graceful_shutdown import should_stop
 from .bench_trace import trace_block, trace_enabled
 from .env import HistoricalTradingEnv, MixedDataEnv
 from .env_helpers import create_proxy_specialist_fn
-from .eval_helpers import SharpeEvalCallback, deterministic_validation_walk
+from .eval_helpers import SharpeEvalCallback, _seed_everything, deterministic_validation_walk
 from .metrics_callback import JsonlMetricsCallback, metrics_path
 from .ppo_trader import GracefulShutdownCallback, _make_env_fn
 from .proxy_specialists import precompute_proxy_feature_matrix
@@ -138,13 +140,20 @@ def get_tune_storage(*, use_journal_storage: bool = False) -> Any:
 
 
 def split_tune_train_val(returns_array: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Split returns into train/validation slices used by tuning."""
+    """Split returns into train/validation slices used by tuning.
+
+    Raises ValueError when data is too short to produce distinct train and val arrays.
+    """
     returns_array = np.asarray(returns_array, dtype=np.float32)
     n = len(returns_array)
     val_size = max(21, min(252, n // 5))
-    if n > val_size + 252:
-        return returns_array[: n - val_size], returns_array[n - val_size :]
-    return returns_array, returns_array
+    min_required = val_size + 252
+    if n <= min_required:
+        raise ValueError(
+            f"returns_array too short for tuning split: {n} rows, need at least {min_required + 1} "
+            f"({252} train days + {val_size} validation days). Provide more history."
+        )
+    return returns_array[: n - val_size], returns_array[n - val_size :]
 
 
 def get_tune_rdb_storage() -> RDBStorage:
@@ -356,6 +365,7 @@ def run_tuning(
     precomputed_train_proxy: np.ndarray | None = None,
     precomputed_val_proxy: np.ndarray | None = None,
     use_journal_storage: bool = False,
+    sampler_seed: int | None = None,
 ) -> dict[str, Any]:
     """
     Run Optuna hyperparameter tuning.
@@ -372,7 +382,9 @@ def run_tuning(
     _dev0 = _get_ppo_device()
     if _dev0 == "cuda":
         try:
-            torch.backends.cudnn.benchmark = True
+            # Keep cudnn.benchmark OFF during tuning: it re-selects kernels per input shape
+            # which introduces non-determinism that makes trial comparisons noisy.
+            torch.backends.cudnn.benchmark = False
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
@@ -396,12 +408,17 @@ def run_tuning(
 
     if precomputed_train_proxy is not None:
         train_proxy_cache = precomputed_train_proxy
+        _train_stats_tune: "dict | None" = None
     else:
-        train_proxy_cache = precompute_proxy_feature_matrix(train_returns)
+        train_proxy_cache, _train_stats_tune = precompute_proxy_feature_matrix(
+            train_returns, return_stats=True
+        )
     if precomputed_val_proxy is not None:
         val_proxy_cache = precomputed_val_proxy
     elif len(val_returns) > 21:
-        val_proxy_cache = precompute_proxy_feature_matrix(val_returns)
+        # Warm-start val z-score from end of train slice to avoid boundary distribution shift.
+        _ws = _train_stats_tune if precomputed_train_proxy is None else None
+        val_proxy_cache = precompute_proxy_feature_matrix(val_returns, warmstart_stats=_ws)
     else:
         val_proxy_cache = None
 
@@ -419,6 +436,9 @@ def run_tuning(
     def objective(trial: optuna.Trial) -> float:
         if n_envs > 1:
             os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+        # Per-trial seed: trials differ but are individually reproducible.
+        _seed_everything(PPO_SEED + trial.number)
 
         params = sample_ppo_params(trial, fixed_historical_ratio=fixed_historical_ratio)
         if params["n_steps"] * n_envs > n_timesteps:
@@ -645,8 +665,11 @@ def run_tuning(
                     pass
             return float("nan")
 
-        last = sharpe_eval_callback.last_mean_reward
-        if last is None or not math.isfinite(float(last)):
+        # Use the best validation Sharpe seen at any checkpoint, not the final value.
+        # This prevents the overfit_threshold hard-stop from systematically underranking
+        # good hyperparameters that later degrade.
+        best = sharpe_eval_callback.best_mean_reward
+        if best is None or not math.isfinite(float(best)):
             sharpe, _ = deterministic_validation_walk(
                 model,
                 val_returns,
@@ -655,13 +678,21 @@ def run_tuning(
                 proxy_feature_cache=val_proxy_cache,
             )
         else:
-            sharpe = float(last)
+            sharpe = float(best)
         return sharpe
 
     device = _get_ppo_device()
     if device == "cpu":
         torch.set_num_threads(1 if single_thread else PPO_CPU_THREADS)
-    sampler = TPESampler(n_startup_trials=10, seed=42)
+    # Distinct seed per parallel worker (sampler_seed) prevents concurrent workers
+    # from proposing identical parameter sets in lockstep; single-worker runs stay
+    # reproducible via PPO_SEED.
+    from ..config import PPO_SEED
+
+    sampler = TPESampler(
+        n_startup_trials=10,
+        seed=int(sampler_seed) if sampler_seed is not None else PPO_SEED,
+    )
     # HyperbandPruner creates bracket sub-studies lazily; parallel workers race to look them
     # up before they exist in JournalStorage, causing KeyError on the first trial.  Use
     # MedianPruner for any parallel-journal run; HyperbandPruner is fine for single-worker runs.
@@ -740,13 +771,10 @@ def export_best_params_after_study(
     raw = dict(study.best_trial.params)
     best_value = float(study.best_value)
     best = _pack_best_params_from_trial_raw(raw, best_value if not math.isnan(best_value) else None)
-    META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    with open(p, "w") as f:
-        json.dump(best, f, indent=2)
+    _atomic_json_write(p, best)
     if p.resolve() != PPO_TUNE_PARAMS_PATH.resolve():
         try:
-            with open(PPO_TUNE_PARAMS_PATH, "w") as f:
-                json.dump(best, f, indent=2)
+            _atomic_json_write(PPO_TUNE_PARAMS_PATH, best)
         except OSError:
             pass
     return best
@@ -815,6 +843,22 @@ def _previous_best_to_enqueue(path: Path | None = None) -> dict[str, Any] | None
     return result
 
 
+def _atomic_json_write(path: Path, data: Any) -> None:
+    """Write JSON atomically via a temp file in the same directory and os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp.json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _save_best_params(
     study: optuna.Study,
     trial: optuna.Trial,
@@ -826,14 +870,11 @@ def _save_best_params(
     raw = dict(trial.params)
     best_value = float(study.best_value)
     best = _pack_best_params_from_trial_raw(raw, best_value if not math.isnan(best_value) else None)
-    META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     p = params_path or PPO_TUNE_PARAMS_PATH
-    with open(p, "w") as f:
-        json.dump(best, f, indent=2)
+    _atomic_json_write(p, best)
     if p.resolve() != PPO_TUNE_PARAMS_PATH.resolve():
         try:
-            with open(PPO_TUNE_PARAMS_PATH, "w") as f:
-                json.dump(best, f, indent=2)
+            _atomic_json_write(PPO_TUNE_PARAMS_PATH, best)
         except OSError:
             pass
 

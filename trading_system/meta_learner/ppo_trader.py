@@ -42,12 +42,13 @@ from ..config import (
     PPO_NET_ARCH,
     PPO_N_ENVS,
     PPO_N_STEPS,
+    PPO_SEED,
     PPO_USE_TORCH_VEC,
 )
 from ..utils.graceful_shutdown import should_stop
 from ..utils.output_cleanup import prune_checkpoints
 from .env import HistoricalTradingEnv, MixedDataEnv, TradingEnv
-from .eval_helpers import SharpeEvalCallback
+from .eval_helpers import SharpeEvalCallback, _seed_everything
 from .bench_trace import trace_block, trace_enabled
 from .metrics_callback import JsonlMetricsCallback, metrics_path
 from .proxy_specialists import normalize_action_max_unit_exposure, precompute_proxy_feature_matrix
@@ -170,6 +171,82 @@ def _random_specialist_outputs(n_assets: int, rng: np.random.Generator | None = 
         }
         for _ in range(n_assets)
     ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model metadata sidecar helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_METADATA_SCHEMA_VERSION = "v1"
+
+
+def _metadata_sidecar_path(model_path: Path | str) -> Path:
+    """Return the .meta.json path alongside a given model zip."""
+    p = Path(model_path)
+    return p.parent / (p.name + ".meta.json")
+
+
+def _load_metadata_sidecar(model_path: Path | str) -> dict | None:
+    """Read <model_path>.meta.json if it exists; return None on any error."""
+    import json
+
+    p = _metadata_sidecar_path(model_path)
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        return data
+    except Exception as exc:
+        logging.getLogger("boardroom").warning("Failed to read metadata sidecar %s: %s", p, exc)
+        return None
+
+
+def write_metadata_sidecar(model_path: Path | str, metadata: dict) -> None:
+    """Write metadata dict to <model_path>.meta.json (atomic temp-file write)."""
+    import json
+    import tempfile
+
+    p = _metadata_sidecar_path(model_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), suffix=".meta.json.tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(metadata, f, indent=2, default=str)
+        os.replace(tmp_name, str(p))
+    except Exception as exc:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        logging.getLogger("boardroom").warning("Failed to write metadata sidecar %s: %s", p, exc)
+
+
+def build_model_metadata(
+    feature_source: str,
+    n_assets: int,
+    tickers: list[str],
+    proxy_expanding_zscore: bool,
+    norm_running_stats: dict | None,
+    slot_schema_version: str = "v1.1",
+    extra: dict | None = None,
+) -> dict:
+    """Build the standardised metadata dict for stamping alongside a saved model."""
+    from datetime import datetime
+
+    meta: dict = {
+        "schema_version": _METADATA_SCHEMA_VERSION,
+        "feature_source": feature_source,
+        "slot_schema_version": slot_schema_version,
+        "n_assets": n_assets,
+        "tickers": list(tickers),
+        "proxy_expanding_zscore": proxy_expanding_zscore,
+        "norm_running_stats": norm_running_stats,
+        "saved_at": datetime.utcnow().isoformat() + "Z",
+    }
+    if extra:
+        meta.update(extra)
+    return meta
 
 
 class BootstrapReturnSampler:
@@ -318,11 +395,19 @@ class PPOTrader:
         self.n_assets = n_assets
         self.env = TradingEnv(n_assets=n_assets)
         self.model: PPO | None = None
+        self.metadata: dict | None = None  # populated from .meta.json sidecar when present
 
         resolved = _resolve_model_path(model_path) if model_path else None
         if resolved is not None:
             try:
                 self.model = PPO.load(str(resolved), env=self.env, device=_get_ppo_device())
+                self.metadata = _load_metadata_sidecar(resolved)
+                if self.metadata is None:
+                    logging.getLogger("boardroom").warning(
+                        "Model loaded without metadata sidecar (%s.meta.json not found); "
+                        "assuming legacy proxy mode — feature_source mismatch will not be detected",
+                        resolved.name,
+                    )
             except Exception:
                 self.model = None
         elif load:
@@ -330,6 +415,12 @@ class PPOTrader:
             if path.exists():
                 try:
                     self.model = PPO.load(str(path), env=self.env, device=_get_ppo_device())
+                    self.metadata = _load_metadata_sidecar(path)
+                    if self.metadata is None:
+                        logging.getLogger("boardroom").warning(
+                            "Model loaded without metadata sidecar (ppo_trader.zip.meta.json not found); "
+                            "assuming legacy proxy mode — feature_source mismatch will not be detected"
+                        )
                 except Exception:
                     self.model = None
 
@@ -348,9 +439,19 @@ class PPOTrader:
         proxy_feature_cache: np.ndarray | None = None,
         ignore_early_stopping: bool = False,
         use_torch_vec: bool | None = None,
+        model_metadata: dict | None = None,
+        val_feature_cache: np.ndarray | None = None,
     ) -> Path | None:
         """
         Train PPO on simulated or historical episodes.
+        model_metadata: optional dict to persist as a .meta.json sidecar alongside
+            the saved model.  Should be built with ``build_model_metadata()`` and
+            include feature_source, tickers, norm_running_stats, etc.
+        val_feature_cache: optional (n_val_days, n_assets, 13) pre-computed feature
+            matrix for the validation/early-stopping slice.  When provided, used
+            instead of recomputing from validation_returns.  Should be warm-started
+            from the training slice stats to avoid boundary distribution shift.
+
         specialist_fn: callable() -> list[dict] of length n_assets; each dict has
             sentiment, quant_prob, fund_score, regime_flag.
         historical_returns: if provided, shape (n_days, n_assets), used for HistoricalTradingEnv.
@@ -371,6 +472,10 @@ class PPOTrader:
             )
         # Extract env-level params early so they don't reach the PPO constructor.
         train_obs_noise_std = float(kwargs.pop("obs_noise_std", 0.0))
+
+        # Global seeding for reproducibility (numpy, torch, random, SB3).
+        _seed_everything(PPO_SEED)
+        logging.getLogger("boardroom").info("Global seed set to %d (PPO_SEED)", PPO_SEED)
 
         specialist_fn = specialist_fn  # None => use _random_specialist_outputs in factory
         n_envs = n_envs if n_envs is not None else PPO_N_ENVS
@@ -591,11 +696,12 @@ class PPOTrader:
         best_snapshot_path = META_LEARNER_MODEL_DIR / "ppo_best.zip"
         if (
             not ignore_early_stopping
-            and (historical_returns is not None or validation_returns is not None)
+            and validation_returns is not None
+            and len(validation_returns) > 0
             and PPO_EARLY_STOPPING_EVAL_FREQ > 0
             and PPO_EARLY_STOPPING_PATIENCE > 0
         ):
-            eval_returns = validation_returns if validation_returns is not None and len(validation_returns) > 0 else historical_returns
+            eval_returns = validation_returns
             eval_aux = None
             if (
                 daily_aux_features is not None
@@ -613,7 +719,10 @@ class PPOTrader:
             else:
                 eval_trading_dates = None
             eval_proxy_cache = None
-            if len(eval_returns) > 21:
+            if val_feature_cache is not None and len(val_feature_cache) == len(eval_returns):
+                # Use caller-supplied warm-started val cache.
+                eval_proxy_cache = np.asarray(val_feature_cache, dtype=np.float32)
+            elif len(eval_returns) > 21:
                 eval_proxy_cache = precompute_proxy_feature_matrix(
                     np.asarray(eval_returns, dtype=np.float32)
                 )
@@ -656,6 +765,16 @@ class PPOTrader:
         ):
             logging.getLogger("boardroom").info(
                 "Early stopping skipped for this run (ignore_early_stopping=True); training for full timesteps."
+            )
+        elif (
+            not ignore_early_stopping
+            and (historical_returns is not None or validation_returns is None or len(validation_returns) == 0)
+            and PPO_EARLY_STOPPING_EVAL_FREQ > 0
+            and PPO_EARLY_STOPPING_PATIENCE > 0
+        ):
+            logging.getLogger("boardroom").warning(
+                "Early stopping disabled: validation_returns not provided. "
+                "Pass explicit validation data to avoid silently evaluating on training data."
             )
         if (
             device == "cuda"
@@ -715,12 +834,21 @@ class PPOTrader:
         prune_checkpoints(ck_dir, keep=PPO_CHECKPOINT_KEEP_LAST)
 
         META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        self.model.save(str(META_LEARNER_MODEL_DIR / "ppo_trader.zip"))
+        main_path = META_LEARNER_MODEL_DIR / "ppo_trader.zip"
+        self.model.save(str(main_path))
+        if model_metadata is not None:
+            write_metadata_sidecar(main_path, model_metadata)
+            self.metadata = model_metadata
+            # Also stamp the ppo_best.zip checkpoint so it can be loaded with mode checks.
+            if best_snapshot_path is not None and best_snapshot_path.exists():
+                write_metadata_sidecar(best_snapshot_path, model_metadata)
         dated_path: Path | None = None
         if total_timesteps >= LONG_RUN_TIMESTEPS:
             dated_name = f"ppo_trader_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.zip"
             dated_path = META_LEARNER_MODEL_DIR / dated_name
             self.model.save(str(dated_path))
+            if model_metadata is not None:
+                write_metadata_sidecar(dated_path, model_metadata)
             logging.getLogger("boardroom").info(
                 "Long run (%d timesteps): saved dated model to %s",
                 total_timesteps,
@@ -806,6 +934,73 @@ class PPOTrader:
                 float(obs.max()),
                 "\n".join(parts),
                 [round(float(a), 4) for a in action],
+                [round(float(a), 4) for a in action_clipped],
+            )
+
+        return action_clipped
+
+    def predict_from_features(
+        self,
+        feature_slice_2d: np.ndarray,
+        holdings: np.ndarray | None = None,
+        debug: bool = False,
+    ) -> np.ndarray:
+        """
+        Get position sizes from a pre-normalised feature matrix slice.
+
+        This is the unified obs path used by live/paper when the full training
+        pipeline (proxy or specialist) has already been applied and z-scored.
+        Unlike ``predict()``, this method bypasses raw specialist dict parsing
+        and builds the obs vector directly from the matrix row.
+
+        Args:
+            feature_slice_2d: (n_assets, 13) float32 — already z-scored features
+                               in the same slot order as training.
+            holdings:         (n_assets,) current fractional holdings; None = zeros.
+            debug:            Log obs stats when True.
+
+        Returns:
+            Array of size n_assets with position % in [0, 1].
+        """
+        from ..utils.logger import get_logger
+
+        log = get_logger()
+
+        if self.model is None:
+            return np.ones(self.n_assets, dtype=np.float32) * 0.5
+
+        feat = np.asarray(feature_slice_2d, dtype=np.float32)
+        if feat.shape != (self.n_assets, 13):
+            raise ValueError(
+                f"feature_slice_2d must have shape ({self.n_assets}, 13), got {feat.shape}"
+            )
+        if holdings is None:
+            holdings = np.zeros(self.n_assets, dtype=np.float32)
+
+        parts: list[float] = []
+        for i in range(self.n_assets):
+            # Slots 0-9: the 10 specialist feature columns
+            for j in range(10):
+                parts.append(float(feat[i, j]))
+            # Holdings slot (between the 10 features and the 3 rolling slots)
+            parts.append(float(holdings[i]))
+            # Slots 10-12: rolling features (appended only when enabled, to match training obs)
+            if ENV_OBS_ROLLING_FEATURES:
+                parts.append(float(feat[i, 10]))
+                parts.append(float(feat[i, 11]))
+                parts.append(float(feat[i, 12]))
+
+        obs = np.array(parts, dtype=np.float32)
+        obs = np.clip(obs, -1, 1)
+        action, _ = self.model.predict(obs, deterministic=True)
+        action_clipped = normalize_action_max_unit_exposure(np.asarray(action, dtype=np.float32))
+
+        if debug:
+            log.info(
+                "DEBUG predict_from_features | obs shape=%s min=%.3f max=%.3f | clipped=%s",
+                obs.shape,
+                float(obs.min()),
+                float(obs.max()),
                 [round(float(a), 4) for a in action_clipped],
             )
 

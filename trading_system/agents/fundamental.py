@@ -1,21 +1,31 @@
 """
-Fundamental Specialist: XGBoost classifier for intrinsic value.
+Fundamental Specialist: cross-sectional composite z-score for intrinsic value.
+
+Design choice: deterministic composite z-score instead of XGBoost classifier.
+
+The previous XGBoost classifier used P/E tercile as the label while including
+trailingPE as a feature - circular by construction. With yfinance providing only
+current-snapshot fundamentals (no historical per-date values), a forward-return
+label is not feasible either. A cross-sectional relative-value approach is the
+honest alternative: z-score each value/quality metric for a ticker vs a reference
+universe, combine them, and return the composite. This is:
+- Non-circular (no metric is both the label and a feature)
+- Deterministic and interpretable
+- Properly calibrated: 0 = average, positive = relatively attractive
+
+Universe statistics (mean and std per metric) are persisted as JSON so the score
+is stable across calls and does not retrain on each request.
 """
 import json
 import os
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import xgboost as xgb
 import yfinance as yf
-import joblib
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
 
-from ..config import CACHE_MAX_AGE_DAYS, FUNDAMENTAL_CACHE_DIR, FUNDAMENTAL_MODEL_DIR, XGB_LEARNING_RATE, XGB_MAX_DEPTH, XGB_N_ESTIMATORS
+from ..config import CACHE_MAX_AGE_DAYS, FUNDAMENTAL_CACHE_DIR, FUNDAMENTAL_MODEL_DIR
 from ..utils.logger import get_logger
 
 logger = get_logger()
@@ -37,7 +47,19 @@ FEATURE_KEYS = [
     "dividendYield",
 ]
 
-VALUE_LABELS = ["Overvalued", "Fair", "Undervalued"]  # 0, 1, 2
+# Sign convention: +1 means higher value = more undervalued/attractive
+METRIC_DIRECTIONS: dict[str, int] = {
+    "trailingPE": -1,
+    "forwardPE": -1,
+    "priceToBook": -1,
+    "debtToEquity": -1,
+    "returnOnEquity": +1,
+    "returnOnAssets": +1,
+    "profitMargins": +1,
+    "revenueGrowth": +1,
+    "earningsGrowth": +1,
+    "currentRatio": +1,
+}
 
 
 def _cache_path(ticker: str) -> Path:
@@ -101,103 +123,68 @@ def _extract_features(ticker: str) -> dict[str, float]:
     return {}
 
 
-def _build_training_data(tickers: list[str]) -> tuple[pd.DataFrame, np.ndarray]:
-    """
-    Build labeled dataset for training. Labels are point-in-time only: cross-sectional
-    P/E percentile (Overvalued=high P/E, Fair=mid, Undervalued=low P/E). No future
-    return or other lookahead is used.
-    """
-    rows = []
-    for ticker in tickers:
-        feat = _extract_features(ticker)
-        if len(feat) < 5:
-            continue
-        rows.append({"ticker": ticker, **feat})
-
-    if not rows:
-        return pd.DataFrame(), np.array([])
-
-    df = pd.DataFrame(rows).set_index("ticker")
-    df = df.select_dtypes(include=[np.number])
-
-    # Point-in-time label: P/E tercile (Overvalued=high P/E, Fair=mid, Undervalued=low P/E)
-    if "trailingPE" in df.columns:
-        pe = df["trailingPE"].dropna()
-        q33 = pe.quantile(0.33)
-        q67 = pe.quantile(0.67)
-        labels = np.ones(len(df), dtype=int)
-        for i, v in enumerate(df["trailingPE"]):
-            if pd.isna(v):
-                labels[i] = 1
-            elif v <= q33:
-                labels[i] = 2  # Undervalued
-            elif v >= q67:
-                labels[i] = 0  # Overvalued
-            else:
-                labels[i] = 1  # Fair
-    else:
-        labels = np.ones(len(df), dtype=int)
-
-    return df, labels
-
-
-_model: xgb.XGBClassifier | None = None
-_imputer: SimpleImputer | None = None
-_scaler: StandardScaler | None = None
+_universe_stats: dict[str, dict[str, float]] | None = None  # {metric: {"mean": float, "std": float}}
+_STATS_PATH = FUNDAMENTAL_MODEL_DIR / "universe_stats.json"
 
 
 def _ensure_model(tickers: list[str] | None = None) -> bool:
-    """Load or train model."""
-    global _model, _imputer, _scaler
+    """
+    Compute and cache cross-sectional universe statistics (mean/std per metric).
+    If stats already exist on disk, load them. Otherwise fetch and compute.
+    """
+    global _universe_stats
 
-    path = FUNDAMENTAL_MODEL_DIR / "xgb_fundamental.json"
-    imp_path = FUNDAMENTAL_MODEL_DIR / "imputer.joblib"
-    scal_path = FUNDAMENTAL_MODEL_DIR / "scaler.joblib"
-    if path.exists() and imp_path.exists() and scal_path.exists():
+    if _universe_stats is not None:
+        return True
+
+    if _STATS_PATH.exists():
         try:
-            _model = xgb.XGBClassifier()
-            _model.load_model(str(path))
-            _imputer = joblib.load(imp_path)
-            _scaler = joblib.load(scal_path)
+            with open(_STATS_PATH) as f:
+                _universe_stats = json.load(f)
             return True
         except Exception as e:
-            logger.warning("Failed to load fundamental model: %s", e)
+            logger.warning("Failed to load universe stats: %s", e)
 
     if tickers is None:
-        tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "JPM", "V", "WMT", "PG"]
+        tickers = [
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "JPM", "V", "WMT", "PG",
+            "XOM", "UNH", "JNJ", "PFE", "HD", "BAC", "MA", "TSLA", "NFLX", "DIS",
+        ]
 
-    df, labels = _build_training_data(tickers)
-    if df.empty or len(df) < 10:
-        logger.warning("Insufficient data for fundamental model training")
+    rows: list[dict[str, float]] = []
+    for ticker in tickers:
+        feat = _extract_features(ticker)
+        if len(feat) >= 3:
+            rows.append(feat)
+
+    if len(rows) < 5:
+        logger.warning("Insufficient universe data for fundamental scoring (%d tickers)", len(rows))
         return False
 
-    X = df[FEATURE_KEYS] if all(c in df.columns for c in FEATURE_KEYS) else df
-    X = X.reindex(columns=FEATURE_KEYS, fill_value=np.nan)
-    _imputer = SimpleImputer(strategy="median")
-    X_imp = _imputer.fit_transform(X)
-    _scaler = StandardScaler()
-    X_scaled = _scaler.fit_transform(X_imp)
-    _tree = os.getenv("XGB_TREE_METHOD", "hist").strip() or "hist"
-    _device = os.getenv("XGB_DEVICE", "cpu").strip().lower() or "cpu"
-    _njobs_raw = os.getenv("XGB_N_JOBS", "0").strip()
-    _njobs = int(_njobs_raw) if _njobs_raw else 0
-    clf_kw: dict = {
-        "n_estimators": XGB_N_ESTIMATORS,
-        "max_depth": XGB_MAX_DEPTH,
-        "learning_rate": XGB_LEARNING_RATE,
-        "eval_metric": "mlogloss",
-        "tree_method": _tree,
-    }
-    if _njobs != 0:
-        clf_kw["n_jobs"] = _njobs
-    if _device == "cuda":
-        clf_kw["device"] = "cuda"
-    _model = xgb.XGBClassifier(**clf_kw)
-    _model.fit(X_scaled, labels)
+    df = pd.DataFrame(rows)
+    stats: dict[str, dict[str, float]] = {}
+    for metric in METRIC_DIRECTIONS:
+        if metric not in df.columns:
+            continue
+        vals = pd.to_numeric(df[metric], errors="coerce").dropna()
+        if len(vals) < 3:
+            continue
+        m, s = float(vals.mean()), float(vals.std())
+        if s < 1e-10:
+            continue
+        stats[metric] = {"mean": m, "std": s}
+
+    if not stats:
+        logger.warning("No valid metrics found in universe fundamentals")
+        return False
+
+    _universe_stats = stats
     FUNDAMENTAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    _model.save_model(str(path))
-    joblib.dump(_imputer, imp_path)
-    joblib.dump(_scaler, scal_path)
+    try:
+        with open(_STATS_PATH, "w") as f:
+            json.dump(_universe_stats, f)
+    except Exception as e:
+        logger.warning("Failed to save universe stats: %s", e)
     return True
 
 
@@ -206,6 +193,11 @@ def get_intrinsic_value_score(ticker: str, retrain_tickers: list[str] | None = N
     Get intrinsic value score for a ticker.
     Returns (score, confidence) in [-1, 1] and [0, 1].
     Undervalued=1, Fair=0, Overvalued=-1.
+
+    Score is a cross-sectional composite z-score: compares this ticker's value and
+    quality metrics to a reference universe. Positive = relatively cheap/high quality.
+    Uses tanh scaling so that a mean z-score of ~1.5 std devs maps to ±0.9.
+    Confidence reflects the fraction of metrics available for this ticker.
     """
     if not _ensure_model(retrain_tickers):
         return 0.0, 0.5
@@ -214,13 +206,23 @@ def get_intrinsic_value_score(ticker: str, retrain_tickers: list[str] | None = N
     if len(feat) < 3:
         return 0.0, 0.5
 
-    row = pd.DataFrame([feat]).reindex(columns=FEATURE_KEYS, fill_value=np.nan)
-    X_imp = _imputer.transform(row)
-    X_scaled = _scaler.transform(X_imp)
-    pred = _model.predict(X_scaled)[0]
-    proba = _model.predict_proba(X_scaled)[0]
-    conf = float(np.max(proba))
+    z_scores: list[float] = []
+    for metric, direction in METRIC_DIRECTIONS.items():
+        if metric not in feat or metric not in _universe_stats:
+            continue
+        v = feat[metric]
+        if v is None or not np.isfinite(v):
+            continue
+        m = _universe_stats[metric]["mean"]
+        s = _universe_stats[metric]["std"]
+        z = float((v - m) / s) * direction
+        z_scores.append(float(np.clip(z, -3.0, 3.0)))
 
-    # Map 0->-1, 1->0, 2->1
-    score = float(pred) - 1
-    return score, conf
+    if not z_scores:
+        return 0.0, 0.5
+
+    mean_z = float(np.mean(z_scores))
+    # tanh maps ±1.5 avg z-score to ±0.9; naturally bounded in (-1, 1)
+    score = float(np.clip(np.tanh(mean_z / 1.5), -1.0, 1.0))
+    confidence = float(np.clip(len(z_scores) / len(METRIC_DIRECTIONS), 0.0, 1.0))
+    return score, confidence

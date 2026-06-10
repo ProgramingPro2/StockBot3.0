@@ -38,6 +38,7 @@ from ..config import (
     sentiment_refresh_every_n_bars,
     ENV_OBS_ROLLING_FEATURES,
     ENV_IMF_RESTRICTIONS,
+    FEATURE_SOURCE,
     FRACTIONAL,
     LIVE_BUYING_POWER_MODE,
     LIVE_PPO_MODEL_PATH,
@@ -47,6 +48,7 @@ from ..config import (
     MIN_TRADE_NOTIONAL,
     OLLAMA_INTERVAL_MIN,
     OUTPUT_DIR,
+    PROXY_EXPANDING_ZSCORE,
     REBALANCE_BAND_PCT,
     SLIPPAGE_BPS,
     STARTING_CAPITAL,
@@ -172,6 +174,108 @@ def _rolling_features_from_ohlcv(close_series) -> dict:
         "rolling_return_21d": max(-1, min(1, ret_21d * 50)),
         "rolling_vol_21d": max(-1, min(1, (vol_21d - 0.01) * 50)),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live/paper unified observation builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _LiveZscoreState:
+    """
+    Incrementally-maintained running stats for expanding-window z-score during live/paper.
+
+    Seeded from the model's persisted training-time stats so the live obs normalisation
+    continues the expanding window that training ended on (no cold-start).
+    """
+
+    def __init__(self, n_assets: int, n_slots: int = 13, warmstart_stats: dict | None = None) -> None:
+        self.n_assets = n_assets
+        self.n_slots  = n_slots
+        self.min_periods = 63
+        if warmstart_stats is not None:
+            self.count       = int(warmstart_stats["count"])
+            self.running_sum = np.asarray(warmstart_stats["running_sum"], dtype=np.float64)
+            self.running_sq  = np.asarray(warmstart_stats["running_sq"],  dtype=np.float64)
+        else:
+            self.count       = 0
+            self.running_sum = np.zeros((n_assets, n_slots), dtype=np.float64)
+            self.running_sq  = np.zeros((n_assets, n_slots), dtype=np.float64)
+
+    def update_and_normalise(self, raw_features: np.ndarray) -> np.ndarray:
+        """
+        Accept raw features (n_assets, 13), update running stats, return z-scored features.
+        Updates the stats in-place so subsequent calls see a longer expanding window.
+        """
+        x = np.asarray(raw_features, dtype=np.float64)
+        self.running_sum += x
+        self.running_sq  += x ** 2
+        self.count       += 1
+        if self.count < self.min_periods:
+            return x.astype(np.float32)
+        mu    = self.running_sum / self.count
+        var   = self.running_sq  / self.count - mu ** 2
+        sigma = np.sqrt(np.maximum(var, 1e-8))
+        out   = np.clip((x - mu) / sigma, -3.0, 3.0) / 3.0
+        return out.astype(np.float32)
+
+
+def _build_live_proxy_features(
+    tickers: list[str],
+    window: int = 21,
+) -> np.ndarray:
+    """
+    Build raw (n_assets, 13) proxy feature row for live inference using the exact same
+    proxy_specialists_vectorized function used in training.  Returns zeros on failure.
+    """
+    from ..data.loader import load_ohlcv
+    from ..meta_learner.proxy_specialists import proxy_specialists_vectorized
+
+    n_assets = len(tickers)
+    returns_cols: list[np.ndarray] = []
+    for t in tickers:
+        df = load_ohlcv(t, lookback_years=1)
+        if df.empty or "close" not in df.columns or len(df) < window + 1:
+            col = np.zeros(window + 1, dtype=np.float32)
+        else:
+            prices = df["close"].values[-window - 2:]
+            col = np.diff(prices) / (np.abs(prices[:-1]) + 1e-10)
+            col = col[-(window):]
+            if len(col) < window:
+                col = np.pad(col, (window - len(col), 0))
+        returns_cols.append(col.astype(np.float32))
+
+    n_cols = max(len(c) for c in returns_cols) if returns_cols else window
+    padded = [np.pad(c, (n_cols - len(c), 0)) for c in returns_cols]
+    returns_2d = np.stack(padded, axis=1)  # (window, n_assets)
+    return proxy_specialists_vectorized(returns_2d)  # (n_assets, 13)
+
+
+def _check_model_mode_compatibility(trader, label: str = "live") -> None:
+    """
+    Verify that the loaded model's feature_source tag matches FEATURE_SOURCE config.
+    Raises SystemExit with a clear message on mismatch; warns for legacy (no metadata) models.
+    """
+    import sys
+
+    meta = getattr(trader, "metadata", None)
+    if meta is None:
+        logger.warning(
+            "[%s] Model has no metadata sidecar — cannot verify feature_source compatibility. "
+            "Proceeding with legacy behaviour (raw specialist dicts -> PPOTrader.predict). "
+            "Retrain with the current codebase to stamp metadata.",
+            label,
+        )
+        return
+    model_fs = meta.get("feature_source", "proxy")
+    if model_fs != FEATURE_SOURCE:
+        logger.error(
+            "[%s] Feature source mismatch: model was trained with feature_source='%s' "
+            "but FEATURE_SOURCE='%s' is configured. "
+            "Either retrain with FEATURE_SOURCE=%s or set FEATURE_SOURCE=%s to match the model.",
+            label, model_fs, FEATURE_SOURCE, FEATURE_SOURCE, model_fs,
+        )
+        sys.exit(1)
 
 
 def _run_specialists(ticker: str = "SPY", force_refresh_sentiment: bool = False) -> dict:
@@ -300,6 +404,10 @@ def _load_aligned_returns(
     for df in dfs[1:]:
         aligned = aligned.join(df, how="inner")
     aligned = aligned.dropna(how="all")
+    # pct_change() produces NaN on the first row; fillna(0) would create a phantom 0% return.
+    # Drop rows where every return column is NaN (the first row after the inner join).
+    _ret_cols_tmp = ["return_" + t for t in tickers]
+    aligned = aligned.dropna(subset=_ret_cols_tmp, how="all")
     if max_days is not None:
         aligned = aligned.tail(max_days)
     if len(aligned) < 252:
@@ -560,42 +668,28 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     ppo_kwargs = None
     if getattr(args, "use_tuned", False):
-        from ..config import PPO_N_STEPS
-
         ppo_kwargs = _tuned_params_payload_for_train(args)
         if ppo_kwargs:
             ppo_kwargs = dict(ppo_kwargs)
             ppo_kwargs.pop("historical_ratio", None)
             ppo_kwargs.pop("best_value", None)
-            tuned_n = ppo_kwargs.get("n_steps")
-            use_full_tuned_n = os.environ.get(
-                "PPO_TRAIN_USE_FULL_TUNED_N_STEPS", ""
-            ).strip().lower() in ("1", "true", "yes")
-            if (
-                not use_full_tuned_n
-                and tuned_n is not None
-                and tuned_n > PPO_N_STEPS
-            ):
-                ppo_kwargs["n_steps"] = PPO_N_STEPS
-            tuned_lr = ppo_kwargs.get("learning_rate")
-            if (
-                tuned_lr is not None
-                and args.timesteps >= 200_000
-                and float(tuned_lr) < 1e-4
-            ):
-                new_lr = 1e-4
-                logger.warning(
-                    "Tuned LR %.2e is small for %d steps; clamping to %.2e",
-                    float(tuned_lr),
-                    args.timesteps,
-                    new_lr,
-                )
-                ppo_kwargs["learning_rate"] = new_lr
             ts = getattr(args, "tuned_study", None)
             if ts and str(ts).strip():
                 logger.info("Using tuned hyperparameters from Optuna study %r", str(ts).strip())
             else:
                 logger.info("Using tuned hyperparameters from ppo_tune_best.json")
+            logger.info(
+                "Effective tuned HPs: lr=%.2e n_steps=%s batch=%s n_epochs=%s gamma=%.4f "
+                "gae_lambda=%.4f clip_range=%.3f ent_coef=%.4f",
+                float(ppo_kwargs.get("learning_rate", 0)),
+                ppo_kwargs.get("n_steps"),
+                ppo_kwargs.get("batch_size"),
+                ppo_kwargs.get("n_epochs"),
+                float(ppo_kwargs.get("gamma", 0)),
+                float(ppo_kwargs.get("gae_lambda", 0)),
+                float(ppo_kwargs.get("clip_range", 0)),
+                float(ppo_kwargs.get("ent_coef", 0)),
+            )
         else:
             ts = getattr(args, "tuned_study", None)
             if ts and str(ts).strip():
@@ -616,19 +710,94 @@ def cmd_train(args: argparse.Namespace) -> None:
     validation_trading_dates = None
     if historical_returns is not None and aligned_full is not None:
         nh = len(historical_returns)
-        historical_trading_dates = aligned_full.index[:nh]
+        # Dates must come from the TRAIN slice, not aligned_full: with
+        # TEST_WINDOW_PLACEMENT=oldest the test window occupies the start of
+        # aligned_full, and indexing from position 0 would map training rows
+        # onto test-window dates (feature misalignment + test-window leakage
+        # in the specialist feature matrix).
+        _dates_src = _aligned_train if _aligned_train is not None else aligned_full
+        historical_trading_dates = _dates_src.index[:nh]
         if validation_returns is not None:
-            validation_trading_dates = aligned_full.index[nh : nh + len(validation_returns)]
+            validation_trading_dates = _dates_src.index[nh : nh + len(validation_returns)]
     train_proxy_cache = None
+    val_proxy_cache = None
+    train_norm_stats: dict | None = None
     if historical_returns is not None and len(historical_returns) > 21:
         from ..meta_learner.proxy_specialists import precompute_proxy_feature_matrix
 
-        train_proxy_cache = precompute_proxy_feature_matrix(
-            np.asarray(historical_returns, dtype=np.float32)
-        )
+        if FEATURE_SOURCE == "specialist":
+            # Build walk-forward specialist matrix for the training window.
+            try:
+                from ..meta_learner.specialist_features import get_or_build_specialist_matrix
+                from ..meta_learner.proxy_specialists import _expanding_zscore_3d
+
+                if historical_trading_dates is not None:
+                    sp_start = str(historical_trading_dates[0].date())
+                    sp_end   = str(historical_trading_dates[-1].date())
+                else:
+                    sp_start = "2015-01-01"
+                    sp_end   = str(np.datetime64("today", "D"))
+                logger.info(
+                    "FEATURE_SOURCE=specialist: building specialist feature matrix for training (%s to %s)...",
+                    sp_start, sp_end,
+                )
+                sp_matrix, _sp_dates, sp_meta = get_or_build_specialist_matrix(
+                    tickers=tickers, start=sp_start, end=sp_end
+                )
+                # Apply expanding z-score with stats returned for warm-starting val slice.
+                train_proxy_cache, train_norm_stats = _expanding_zscore_3d(
+                    sp_matrix, return_stats=True
+                )
+                train_proxy_cache = np.asarray(train_proxy_cache, dtype=np.float32)
+                logger.info(
+                    "Specialist matrix shape=%s (slot_sources=%s)",
+                    sp_matrix.shape,
+                    sp_meta.get("slot_sources", {}),
+                )
+                # Build val specialist matrix warm-started from training stats.
+                if validation_returns is not None and validation_trading_dates is not None:
+                    val_start = str(validation_trading_dates[0].date())
+                    val_end   = str(validation_trading_dates[-1].date())
+                    val_sp_matrix, _, _ = get_or_build_specialist_matrix(
+                        tickers=tickers, start=val_start, end=val_end
+                    )
+                    val_proxy_cache = np.asarray(
+                        _expanding_zscore_3d(val_sp_matrix, warmstart_stats=train_norm_stats),
+                        dtype=np.float32,
+                    )
+            except Exception as ex:
+                logger.warning(
+                    "FEATURE_SOURCE=specialist: specialist matrix build failed (%s); "
+                    "falling back to proxy features for training",
+                    ex,
+                )
+                FEATURE_SOURCE_EFF = "proxy"
+                train_proxy_cache, train_norm_stats = precompute_proxy_feature_matrix(
+                    np.asarray(historical_returns, dtype=np.float32), return_stats=True
+                )
+                if validation_returns is not None and len(validation_returns) > 21:
+                    val_proxy_cache = precompute_proxy_feature_matrix(
+                        np.asarray(validation_returns, dtype=np.float32),
+                        warmstart_stats=train_norm_stats,
+                    )
+            else:
+                FEATURE_SOURCE_EFF = "specialist"
+        else:
+            FEATURE_SOURCE_EFF = "proxy"
+            train_proxy_cache, train_norm_stats = precompute_proxy_feature_matrix(
+                np.asarray(historical_returns, dtype=np.float32), return_stats=True
+            )
+            if validation_returns is not None and len(validation_returns) > 21:
+                val_proxy_cache = precompute_proxy_feature_matrix(
+                    np.asarray(validation_returns, dtype=np.float32),
+                    warmstart_stats=train_norm_stats,
+                )
+    else:
+        FEATURE_SOURCE_EFF = FEATURE_SOURCE
 
     train_use_torch_vec = True if getattr(args, "torch_vec", False) else None
 
+    # Walk-forward fold proxy caches with warm-start z-score.
     if getattr(args, "walk_forward", False) and returns_array is not None and aligned_full is not None:
         _wf_folds = int(os.environ.get("PPO_WALK_FORWARD_FOLDS", "3"))
         wf_splits = _walk_forward_splits(returns_array, aligned_full, n_folds=_wf_folds)
@@ -647,9 +816,18 @@ def cmd_train(args: argparse.Namespace) -> None:
                         create_proxy_specialist_fn(fold_train, n_assets) if len(fold_train) > 21 else None
                     )
                     fold_proxy_cache = None
+                    fold_train_stats: dict | None = None
+                    fold_val_cache = None
                     if len(fold_train) > 21:
                         from ..meta_learner.proxy_specialists import precompute_proxy_feature_matrix as _wf_pcpm
-                        fold_proxy_cache = _wf_pcpm(np.asarray(fold_train, dtype=np.float32))
+                        fold_proxy_cache, fold_train_stats = _wf_pcpm(
+                            np.asarray(fold_train, dtype=np.float32), return_stats=True
+                        )
+                        if len(fold_val) > 21 and fold_train_stats is not None:
+                            fold_val_cache = _wf_pcpm(
+                                np.asarray(fold_val, dtype=np.float32),
+                                warmstart_stats=fold_train_stats,
+                            )
                     fold_trader.train(
                         total_timesteps=args.timesteps,
                         specialist_fn=fold_specialist_fn,
@@ -682,6 +860,18 @@ def cmd_train(args: argparse.Namespace) -> None:
             else:
                 logger.warning("Walk-forward: no folds completed successfully")
 
+    # Build model metadata to persist alongside the saved artifact.
+    _model_meta = None
+    if historical_returns is not None:
+        from ..meta_learner.ppo_trader import build_model_metadata
+        _model_meta = build_model_metadata(
+            feature_source=FEATURE_SOURCE_EFF,
+            n_assets=n_assets,
+            tickers=tickers,
+            proxy_expanding_zscore=PROXY_EXPANDING_ZSCORE,
+            norm_running_stats=train_norm_stats,
+        )
+
     dated_path = trader.train(
         total_timesteps=args.timesteps,
         specialist_fn=specialist_fn_for_train,
@@ -696,6 +886,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         proxy_feature_cache=train_proxy_cache,
         ignore_early_stopping=getattr(args, "ignore_early_stopping", False),
         use_torch_vec=train_use_torch_vec,
+        model_metadata=_model_meta,
+        val_feature_cache=val_proxy_cache,
     )
     logger.info("Training complete. Models saved.")
 
@@ -963,6 +1155,9 @@ def _run_backtest(
         for df in dfs[1:]:
             aligned = aligned.join(df, how="inner")
         aligned = aligned.dropna(how="all")
+        # Drop phantom first row where all return columns are NaN (pct_change has no prior bar).
+        _ret_cols_bt = ["return_" + t for t in tickers]
+        aligned = aligned.dropna(subset=_ret_cols_bt, how="all")
         if len(aligned) < 252:
             return None
 
@@ -995,6 +1190,41 @@ def _run_backtest(
     )
 
     precomp = precompute_proxy_feature_matrix(returns_mat, window)
+    use_specialist_features = False
+    _model_meta = getattr(trader, "metadata", None) or {}
+    if _model_meta.get("feature_source") == "specialist":
+        # Specialist-mode model: evaluate on the same walk-forward specialist
+        # features it was trained on, not the proxy pipeline.
+        try:
+            from ..meta_learner.proxy_specialists import _expanding_zscore_3d
+            from ..meta_learner.specialist_features import get_or_build_specialist_matrix
+
+            _bt_index = pd.DatetimeIndex(pd.to_datetime(aligned.index)).normalize()
+            sp_matrix, sp_dates, _sp_meta = get_or_build_specialist_matrix(
+                tickers=tickers,
+                start=str(_bt_index[0].date()),
+                end=str(_bt_index[-1].date()),
+            )
+            sp_dates = pd.DatetimeIndex(pd.to_datetime(sp_dates)).normalize()
+            # Map each backtest bar to the latest specialist row at or before it
+            # (backward fill; never uses a future row).
+            row_idx = np.searchsorted(sp_dates.values, _bt_index.values, side="right") - 1
+            if (row_idx < 0).any():
+                raise RuntimeError(
+                    "specialist matrix does not cover the start of the backtest window"
+                )
+            sp_aligned = sp_matrix[row_idx]
+            precomp = np.asarray(_expanding_zscore_3d(sp_aligned), dtype=np.float32)
+            use_specialist_features = True
+            logger.info(
+                "Backtest: model feature_source=specialist — using walk-forward "
+                "specialist feature matrix (%d bars)", len(_bt_index),
+            )
+        except Exception as ex:  # noqa: BLE001
+            logger.warning(
+                "Backtest: specialist feature matrix unavailable (%s); "
+                "falling back to proxy features — results may understate the model", ex,
+            )
     ollama_every_n_bars = sentiment_refresh_every_n_bars()
     cached_sentiment = np.zeros(n_assets, dtype=np.float64)
 
@@ -1004,12 +1234,15 @@ def _run_backtest(
             for i in range(n_assets)
         ]
         bar_off = t - window
-        if bar_off % ollama_every_n_bars == 0:
-            for i, sym in enumerate(tickers):
-                close_slice = aligned[sym].iloc[: t + 1]
-                cached_sentiment[i] = sentiment_proxy_from_close_prices(close_slice)
-        for i in range(n_assets):
-            specialist_list[i]["sentiment"] = float(cached_sentiment[i])
+        if not use_specialist_features:
+            # Proxy path only: refresh staleness-aware sentiment proxy. The
+            # specialist matrix already carries its own (z-scored) sentiment slot.
+            if bar_off % ollama_every_n_bars == 0:
+                for i, sym in enumerate(tickers):
+                    close_slice = aligned[sym].iloc[: t + 1]
+                    cached_sentiment[i] = sentiment_proxy_from_close_prices(close_slice)
+            for i in range(n_assets):
+                specialist_list[i]["sentiment"] = float(cached_sentiment[i])
         # Pass current portfolio weights so PPO sees same observation structure as in training
         current_holdings = (
             effective_weights.copy()
@@ -1505,8 +1738,34 @@ def cmd_backtest(args: argparse.Namespace) -> None:
 
     trader = PPOTrader(n_assets=n_assets, model_path=model_path) if model_path else PPOTrader(n_assets=n_assets)
 
+    # By default evaluate on the held-out test window (out-of-sample).
+    # Pass --in-sample to bypass the split and evaluate on all available data.
+    in_sample = getattr(args, "in_sample", False)
+    aligned_for_bt: pd.DataFrame | None = None
+    if not in_sample:
+        aligned_full_bt, returns_array_bt = _load_aligned_returns(tickers)
+        if aligned_full_bt is not None and returns_array_bt is not None:
+            _, _, _, aligned_test_bt = _chronological_train_test_split(aligned_full_bt, returns_array_bt)
+            if aligned_test_bt is not None and len(aligned_test_bt) >= 252:
+                aligned_for_bt = aligned_test_bt
+                logger.info(
+                    "Backtest: out-of-sample test window (%d days, %s to %s)",
+                    len(aligned_for_bt),
+                    aligned_for_bt.index[0].date() if hasattr(aligned_for_bt.index[0], "date") else aligned_for_bt.index[0],
+                    aligned_for_bt.index[-1].date() if hasattr(aligned_for_bt.index[-1], "date") else aligned_for_bt.index[-1],
+                )
+            else:
+                logger.warning(
+                    "Backtest: chronological split produced insufficient test data (<252 days); "
+                    "falling back to full in-sample evaluation. Use TEST_WINDOW_DAYS / TEST_WINDOW_PLACEMENT to adjust."
+                )
+        else:
+            logger.warning("Backtest: could not load aligned data for split; using full in-sample evaluation.")
+    else:
+        logger.info("Backtest: in-sample mode (--in-sample set; no chronological split applied).")
+
     logger.info("Running portfolio backtest for %s...", tickers)
-    result = _run_backtest(tickers, trader)
+    result = _run_backtest(tickers, trader, aligned_df=aligned_for_bt)
     if result is None:
         logger.error("Insufficient data for backtest")
         return
@@ -1588,6 +1847,20 @@ def cmd_paper(args: argparse.Namespace) -> None:
     logger.info("Starting paper trading for %s (interval=%dm, ollama_every=%dm) [simulated capital $%.2f]",
                 tickers, interval_min, OLLAMA_INTERVAL_MIN, STARTING_CAPITAL)
 
+    # Mode compatibility check and z-score state initialisation.
+    _check_model_mode_compatibility(trader, label="paper")
+    _paper_meta = getattr(trader, "metadata", None)
+    _paper_use_unified_obs = _paper_meta is not None  # unified path for stamped models
+    _paper_zscore_state: "_LiveZscoreState | None" = None
+    if _paper_use_unified_obs:
+        _warmstart = _paper_meta.get("norm_running_stats")
+        _paper_zscore_state = _LiveZscoreState(n_assets, warmstart_stats=_warmstart)
+        logger.info(
+            "Paper: unified obs path (feature_source=%s, zscore warm-start count=%d)",
+            _paper_meta.get("feature_source", "?"),
+            _paper_zscore_state.count,
+        )
+
     last_ollama_time = 0.0
     cached_boardroom_summary: str | None = None
     from ..data.loader import load_ohlcv as _load_ohlcv_paper
@@ -1595,11 +1868,29 @@ def cmd_paper(args: argparse.Namespace) -> None:
     paper_cash = float(STARTING_CAPITAL)
     paper_shares: dict[str, float] = {t: 0.0 for t in tickers}
 
+    # Cooldown state (mirrors live loop guards so paper validates live behavior)
+    paper_bought_today: set[str] = set()
+    paper_last_buy_time: dict[str, "datetime"] = {}
+    paper_last_sell_time: dict[str, "datetime"] = {}
+    paper_last_date: "date | None" = None
+    paper_imf_guard = imf_guard_from_config()
+
     while True:
         if should_stop():
             logger.info("Paper trading stop requested; exiting cleanly")
             break
         try:
+            from datetime import datetime as _dt_cls
+            from datetime import timedelta
+            from zoneinfo import ZoneInfo
+
+            _tz = ZoneInfo("America/New_York")
+            _now = _dt_cls.now(_tz)
+            _today = _now.date()
+            if paper_last_date is not None and _today != paper_last_date:
+                paper_bought_today.clear()
+            paper_last_date = _today
+
             do_ollama = (time.time() - last_ollama_time) >= (OLLAMA_INTERVAL_MIN * 60)
             logger.info("Cycle ollama_refresh=%s (%s)", do_ollama, "sentiment+boardroom from LLM" if do_ollama else "cached sentiment/boardroom")
             specialist_list: list[dict] = []
@@ -1631,11 +1922,23 @@ def cmd_paper(args: argparse.Namespace) -> None:
                 dtype=np.float64,
             )
             current_holdings = position_values / (paper_equity + 1e-12)
-            action = trader.predict(
-                specialist_outputs_by_asset=specialist_list,
-                holdings=current_holdings,
-                debug=is_debug(),
-            )
+            if _paper_use_unified_obs and _paper_zscore_state is not None:
+                # Unified path: build proxy features then z-score with persisted running stats.
+                _raw_features = _build_live_proxy_features(tickers)
+                _norm_features = _paper_zscore_state.update_and_normalise(_raw_features)
+                action = trader.predict_from_features(
+                    feature_slice_2d=_norm_features,
+                    holdings=current_holdings,
+                    debug=is_debug(),
+                )
+                # Real specialists still run for Discord/logging (already collected above).
+            else:
+                # Legacy path: no metadata sidecar — use raw specialist dicts.
+                action = trader.predict(
+                    specialist_outputs_by_asset=specialist_list,
+                    holdings=current_holdings,
+                    debug=is_debug(),
+                )
             action = np.array(action, dtype=np.float64)
             if not ENV_ALLOW_CASH_EXPOSURE:
                 action = np.array([_position_used(float(a)) for a in action])
@@ -1660,38 +1963,84 @@ def cmd_paper(args: argparse.Namespace) -> None:
                 elif cached_boardroom_summary:
                     logger.info("Boardroom (cached): %s", cached_boardroom_summary)
 
+            # Cooldown sets derived from local tracked times (mirrors live-loop guards)
+            _hold_sec = MIN_HOLD_MINUTES_AFTER_BUY * 60
+            _reentry_sec = MIN_REENTRY_MINUTES_AFTER_SELL * 60
+            _paper_bought_since: set[str] = {
+                t for t, ts in paper_last_buy_time.items()
+                if (_now - ts).total_seconds() < _hold_sec
+            }
+            _paper_sold_since: set[str] = {
+                t for t, ts in paper_last_sell_time.items()
+                if (_now - ts).total_seconds() < _reentry_sec
+            }
+
+            # Pass 1: SELLS — execute first to free cash for buys this cycle.
             for i, t in enumerate(tickers):
                 position_pct = float(target_holdings[i])
                 out = specialist_list[i]
                 px = _px(t)
                 target_value = paper_equity * target_holdings[i]
                 current_value = paper_shares.get(t, 0.0) * px
-                if target_value > current_value + rebalance_band:
-                    notional = target_value - current_value
-                    if paper_cash >= notional and px > 1e-12:
-                        paper_cash -= notional
-                        paper_shares[t] = paper_shares.get(t, 0.0) + notional / px
-                        logger.info(
-                            "Paper BUY %s | $%.2f | Sentiment=%.2f Quant=%.2f | equity=$%.2f",
-                            t, notional, out["sentiment"], out["quant_prob"], paper_equity,
-                        )
-                        send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
-                    else:
-                        logger.info(
-                            "Paper | %s HOLD (insufficient cash for BUY $%.2f) | Weight=%.1f%%",
-                            t, notional, position_pct * 100,
-                        )
-                elif current_value > target_value + rebalance_band:
-                    notional = min(current_value - target_value, current_value)
-                    if px > 1e-12:
-                        paper_cash += notional
-                        paper_shares[t] = max(0.0, paper_shares.get(t, 0.0) - notional / px)
+                if current_value <= target_value + rebalance_band:
+                    continue
+                if t in _paper_bought_since:
+                    logger.info("Paper HOLD %s: skip sell (within hold period)", t)
+                    continue
+                if t in paper_bought_today and not paper_imf_guard.allow_same_day_sell(paper_equity, True):
+                    logger.info("Paper HOLD %s: skip sell (same-session round trip; IMF)", t)
+                    continue
+                notional = min(current_value - target_value, current_value)
+                if px > 1e-12 and notional >= 1.0:
+                    paper_cash += notional
+                    paper_shares[t] = max(0.0, paper_shares.get(t, 0.0) - notional / px)
+                    paper_last_sell_time[t] = _now
                     logger.info(
                         "Paper SELL %s | $%.2f | Sentiment=%.2f Quant=%.2f | equity=$%.2f",
                         t, notional, out["sentiment"], out["quant_prob"], paper_equity,
                     )
                     send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
+
+            # Pass 2: BUYS
+            for i, t in enumerate(tickers):
+                position_pct = float(target_holdings[i])
+                out = specialist_list[i]
+                px = _px(t)
+                target_value = paper_equity * target_holdings[i]
+                current_value = paper_shares.get(t, 0.0) * px
+                if target_value <= current_value + rebalance_band:
+                    continue
+                if t in _paper_sold_since:
+                    logger.info("Paper HOLD %s: skip buy (re-entry cooldown)", t)
+                    continue
+                notional = target_value - current_value
+                if paper_imf_guard.should_block_buy(paper_equity, notional):
+                    logger.info("Paper HOLD %s: skip buy (intraday buying power; IMF sim)", t)
+                    continue
+                if paper_cash >= notional and px > 1e-12:
+                    paper_cash -= notional
+                    paper_shares[t] = paper_shares.get(t, 0.0) + notional / px
+                    paper_last_buy_time[t] = _now
+                    paper_bought_today.add(t)
+                    logger.info(
+                        "Paper BUY %s | $%.2f | Sentiment=%.2f Quant=%.2f | equity=$%.2f",
+                        t, notional, out["sentiment"], out["quant_prob"], paper_equity,
+                    )
+                    send_discord_notification(t, "PAPER", position_pct, specialist_outputs=out)
                 else:
+                    logger.info(
+                        "Paper HOLD %s: insufficient cash for BUY $%.2f | Weight=%.1f%%",
+                        t, notional, position_pct * 100,
+                    )
+
+            # Log HOLDs for tickers that needed no rebalancing
+            for i, t in enumerate(tickers):
+                position_pct = float(target_holdings[i])
+                out = specialist_list[i]
+                px = _px(t)
+                target_value = paper_equity * target_holdings[i]
+                current_value = paper_shares.get(t, 0.0) * px
+                if abs(target_value - current_value) <= rebalance_band:
                     logger.info(
                         "Paper HOLD %s | Sentiment=%.2f Quant=%.2f Fund=%.2f Regime=%s | Exposure=%.1f%% Weight=%.1f%% (equity=$%.2f)",
                         t,
@@ -1724,6 +2073,159 @@ def cmd_paper(args: argparse.Namespace) -> None:
                 break
 
 
+def _execute_rebalance_passes(
+    sell_candidates: list,
+    buy_candidates: list,
+    broker,
+    available_capital: float,
+    portfolio_value: float,
+    target_holdings: np.ndarray,
+    specialist_list: list,
+    fractional: bool,
+    latest_prices: dict,
+    pending_sells: set,
+    pending_buys: set,
+    bought_since: set,
+    sold_since: set,
+    bought_today: set,
+    imf_guard,
+    notify_fn=None,
+) -> tuple[float, set]:
+    """Execute sell then buy passes for a single rebalance cycle.
+
+    Pass 1: SELLS — execute all eligible sells first so proceeds can fund buys.
+    Pass 2: BUYS  — execute buys in order; skip if remaining capital is insufficient.
+
+    Args:
+        sell_candidates: list of (i, ticker, current_value, target_value, current_qty).
+        buy_candidates:  list of (i, ticker, notional, current_value).
+        broker:          broker object with place_order / close_position methods.
+        available_capital: cash available at cycle start.
+        portfolio_value:   total portfolio value for IMF / notional calculations.
+        target_holdings:   per-asset target fraction array.
+        specialist_list:   per-asset specialist output dicts (for Discord overlay).
+        fractional:        True = fractional-share mode; False = whole-share mode.
+        latest_prices:     ticker -> latest price dict (whole-share path only).
+        pending_sells/buys: tickers with already-open orders (skip to avoid duplicates).
+        bought_since/sold_since: cooldown sets from IMF guard.
+        bought_today:      set of tickers bought this session (mutated in place).
+        imf_guard:         IMF pattern-day-trade guard instance.
+        notify_fn:         optional callback(ticker, side, pct, outputs, order).
+
+    Returns:
+        (remaining_capital, bought_today) where remaining_capital is the cash left
+        after all executed orders and bought_today contains newly added tickers.
+    """
+    remaining_capital = available_capital
+
+    # Pass 1: SELLS — execute first so proceeds can fund buys this cycle.
+    for i, t, current_value, target_value, current_qty in sell_candidates:
+        outputs = specialist_list[i]
+        position_pct = float(target_holdings[i])
+        if t in pending_sells:
+            logger.info("HOLD %s: skip sell (pending open order)", t)
+            continue
+        if t in bought_since:
+            logger.info("HOLD %s: skip sell (within hold period)", t)
+            continue
+        if t in bought_today and not imf_guard.allow_same_day_sell(portfolio_value, True):
+            logger.info("HOLD %s: skip sell (same-session round trip; IMF)", t)
+            continue
+        if current_value <= 0:
+            logger.debug("HOLD %s: no long position to reduce (current_value=%.2f)", t, current_value)
+            continue
+        notional = min(current_value - target_value, current_value)
+        if notional < 1.0:
+            logger.debug("HOLD %s: sell amount below $1", t)
+            continue
+        sell_all = notional >= current_value * 0.95
+        if sell_all:
+            if broker.close_position(t):
+                remaining_capital += current_value
+                logger.info("SELL ALL %s (was $%.2f)", t, current_value)
+                if notify_fn:
+                    notify_fn(t, "SELL", position_pct, outputs,
+                              {"close_position": True, "notional": current_value, "status": "closed"})
+            else:
+                logger.warning("Failed to close position %s", t)
+        elif fractional:
+            order = broker.place_order(t, notional=notional, side="sell")
+            if order:
+                remaining_capital += notional
+                logger.info("SELL %s: $%.2f", t, notional)
+                if notify_fn:
+                    notify_fn(t, "SELL", position_pct, outputs, order)
+        else:
+            price = latest_prices.get(t) or 0.0
+            if price > 0 and current_qty > 0:
+                qty = int(round(notional / price))
+                if qty <= 0:
+                    logger.debug("HOLD %s: sell qty rounds to 0 (notional=%.2f price=%.2f)", t, notional, price)
+                    continue
+                if qty >= int(current_qty) * 0.95:
+                    if broker.close_position(t):
+                        remaining_capital += current_value
+                        logger.info("SELL ALL %s (was %d shares)", t, int(current_qty))
+                        if notify_fn:
+                            notify_fn(t, "SELL", position_pct, outputs,
+                                      {"close_position": True, "notional": current_value, "status": "closed"})
+                else:
+                    order = broker.place_order(t, qty=qty, side="sell")
+                    if order:
+                        remaining_capital += qty * price
+                        logger.info("SELL %s: %d shares @ ~$%.2f", t, qty, price)
+                        if notify_fn:
+                            notify_fn(t, "SELL", position_pct, outputs, order)
+            else:
+                logger.warning("No position or price for %s; skipping sell", t)
+
+    # Pass 2: BUYS — check remaining_capital and decrement after each successful order.
+    for i, t, notional, current_value in buy_candidates:
+        outputs = specialist_list[i]
+        position_pct = float(target_holdings[i])
+        if t in pending_buys:
+            logger.info("HOLD %s: skip buy (pending open order)", t)
+            continue
+        if t in sold_since:
+            logger.info("HOLD %s: skip buy (re-entry cooldown)", t)
+            continue
+        if imf_guard.should_block_buy(portfolio_value, notional):
+            logger.info("HOLD %s: skip buy (intraday buying power; IMF sim)", t)
+            continue
+        if notional > remaining_capital:
+            logger.info(
+                "HOLD %s: skip buy ($%.2f notional > $%.2f remaining capital)",
+                t, notional, remaining_capital,
+            )
+            continue
+        if fractional:
+            order = broker.place_order(t, notional=notional, side="buy")
+            if order:
+                remaining_capital -= notional
+                bought_today.add(t)
+                logger.info("BUY %s: $%.2f", t, notional)
+                if notify_fn:
+                    notify_fn(t, "BUY", position_pct, outputs, order)
+        else:
+            price = latest_prices.get(t) or 0.0
+            if price > 0:
+                qty = int(round(notional / price))
+                if qty <= 0:
+                    logger.debug("HOLD %s: buy qty rounds to 0 (notional=%.2f price=%.2f)", t, notional, price)
+                    continue
+                order = broker.place_order(t, qty=qty, side="buy")
+                if order:
+                    remaining_capital -= qty * price
+                    bought_today.add(t)
+                    logger.info("BUY %s: %d shares @ ~$%.2f", t, qty, price)
+                    if notify_fn:
+                        notify_fn(t, "BUY", position_pct, outputs, order)
+            else:
+                logger.warning("No price for %s; skipping buy", t)
+
+    return remaining_capital, bought_today
+
+
 def cmd_live(args: argparse.Namespace) -> None:
     """Live trading with Alpaca: poll data, run specialists for all tickers, place orders."""
     import time
@@ -1754,6 +2256,20 @@ def cmd_live(args: argparse.Namespace) -> None:
     trader = PPOTrader(n_assets=n_assets, model_path=model_path)
     logger.info("Starting LIVE trading for %s (interval=%dm, ollama_every=%dm) [fractional=%s] model=%s",
                 tickers, interval_min, OLLAMA_INTERVAL_MIN, FRACTIONAL, model_path or "ppo_trader.zip")
+
+    # Mode compatibility check and z-score state initialisation.
+    _check_model_mode_compatibility(trader, label="live")
+    _live_meta = getattr(trader, "metadata", None)
+    _live_use_unified_obs = _live_meta is not None
+    _live_zscore_state: "_LiveZscoreState | None" = None
+    if _live_use_unified_obs:
+        _warmstart = _live_meta.get("norm_running_stats")
+        _live_zscore_state = _LiveZscoreState(n_assets, warmstart_stats=_warmstart)
+        logger.info(
+            "Live: unified obs path (feature_source=%s, zscore warm-start count=%d)",
+            _live_meta.get("feature_source", "?"),
+            _live_zscore_state.count,
+        )
 
     try:
         from ..broker.discord_notifier import send_live_start_embed
@@ -1814,8 +2330,9 @@ def cmd_live(args: argparse.Namespace) -> None:
 
             position_symbols = [p["symbol"] for p in alpaca_positions]
 
+            # Query across all configured tickers so symbols bought and since exited still respect same-day rules.
             bought_today = broker.get_symbols_bought_on_date(
-                ny_today, position_symbols, tz
+                ny_today, tickers, tz
             )
 
             do_ollama = (time.time() - last_ollama_time) >= (OLLAMA_INTERVAL_MIN * 60)
@@ -1828,16 +2345,29 @@ def cmd_live(args: argparse.Namespace) -> None:
 
             # Size targets from total portfolio value, not cash; pass current holdings into PPO
             portfolio_value = float(account.get("portfolio_value", 0))
-            pos_by_symbol = {p["symbol"]: float(p.get("market_value", 0)) for p in alpaca_positions}
+            # Store full position dicts so we can read market_value and qty without extra API calls.
+            pos_by_symbol = {p["symbol"]: p for p in alpaca_positions}
             current_holdings = np.array(
-                [pos_by_symbol.get(t, 0.0) / (portfolio_value + 1e-12) for t in tickers],
+                [float(pos_by_symbol.get(t, {}).get("market_value", 0)) / (portfolio_value + 1e-12) for t in tickers],
                 dtype=np.float64,
             )
-            action = trader.predict(
-                specialist_outputs_by_asset=specialist_list,
-                holdings=current_holdings,
-                debug=is_debug(),
-            )
+            if _live_use_unified_obs and _live_zscore_state is not None:
+                # Unified path: build proxy features then z-score with persisted running stats.
+                _raw_features = _build_live_proxy_features(tickers)
+                _norm_features = _live_zscore_state.update_and_normalise(_raw_features)
+                action = trader.predict_from_features(
+                    feature_slice_2d=_norm_features,
+                    holdings=current_holdings,
+                    debug=is_debug(),
+                )
+                # Real specialists still run for Discord/logging (already collected above).
+            else:
+                # Legacy path: no metadata sidecar — use raw specialist dicts.
+                action = trader.predict(
+                    specialist_outputs_by_asset=specialist_list,
+                    holdings=current_holdings,
+                    debug=is_debug(),
+                )
             action = np.array(action, dtype=np.float64)
             if not ENV_ALLOW_CASH_EXPOSURE:
                 action = np.array([_position_used(float(a)) for a in action])
@@ -1912,112 +2442,65 @@ def cmd_live(args: argparse.Namespace) -> None:
                     break
                 continue
 
-            # For whole-share orders we need latest price per ticker
+            # Pending-order guard: fetch open orders once and skip symbols with a pending order on the same side.
+            open_orders = broker.get_open_orders()
+            pending_buys: set[str] = {o["symbol"] for o in open_orders if o.get("side") == "buy"}
+            pending_sells: set[str] = {o["symbol"] for o in open_orders if o.get("side") == "sell"}
+
+            # Real-time prices for whole-share path; fall back to cached OHLCV close on failure.
             latest_prices: dict[str, float] = {}
             if not FRACTIONAL:
                 from ..data.loader import load_ohlcv
                 for t in tickers:
-                    df = load_ohlcv(t, lookback_years=1)
-                    if df is not None and not df.empty and "close" in df.columns:
-                        latest_prices[t] = float(df["close"].iloc[-1])
+                    rt = broker.get_latest_price(t)
+                    if rt is not None and rt > 0:
+                        latest_prices[t] = rt
                     else:
-                        latest_prices[t] = 0.0
+                        df = load_ohlcv(t, lookback_years=1)
+                        if df is not None and not df.empty and "close" in df.columns:
+                            latest_prices[t] = float(df["close"].iloc[-1])
+                        else:
+                            latest_prices[t] = 0.0
 
+            # Pre-compute deltas (pos_by_symbol already fetched; no extra API calls).
+            # sell_candidates / buy_candidates carry everything needed for each pass.
+            sell_candidates = []
+            buy_candidates = []
+            hold_indices = []
             for i, t in enumerate(tickers):
                 target_value = portfolio_value * float(target_holdings[i])
-                current_pos = broker.get_position(t)
-                current_value = float(current_pos.get("market_value", 0))
-                outputs = specialist_list[i]
-                position_pct = float(target_holdings[i])
-
+                pos = pos_by_symbol.get(t, {})
+                current_value = float(pos.get("market_value", 0))
+                current_qty = float(pos.get("qty", 0))
                 if target_value > current_value + rebalance_band:
-                    if t in sold_since:
-                        logger.info("HOLD %s: skip buy (re-entry cooldown)", t)
-                    elif imf_guard.should_block_buy(
-                        portfolio_value, target_value - current_value
-                    ):
-                        logger.info(
-                            "HOLD %s: skip buy (intraday buying power; IMF sim)",
-                            t,
-                        )
-                    elif available_capital < MIN_TRADE_NOTIONAL:
-                        logger.debug(
-                            "HOLD %s: skip buy (insufficient %s buying power)",
-                            t,
-                            LIVE_BUYING_POWER_MODE,
-                        )
-                    else:
-                        notional = target_value - current_value
-                        if FRACTIONAL:
-                            order = broker.place_order(t, notional=notional, side="buy")
-                            if order:
-                                bought_today.add(t)
-                                logger.info("BUY %s: $%.2f", t, notional)
-                                send_discord_notification(t, "BUY", position_pct, outputs, order)
-                        else:
-                            price = latest_prices.get(t) or 0.0
-                            if price > 0:
-                                qty = max(1, int(round(notional / price)))
-                                order = broker.place_order(t, qty=qty, side="buy")
-                                if order:
-                                    bought_today.add(t)
-                                    logger.info("BUY %s: %d shares @ ~$%.2f", t, qty, price)
-                                    send_discord_notification(t, "BUY", position_pct, outputs, order)
-                            else:
-                                logger.warning("No price for %s; skipping buy", t)
+                    buy_candidates.append((i, t, target_value - current_value, current_value))
                 elif current_value > target_value + rebalance_band:
-                    if t in bought_since:
-                        logger.info("HOLD %s: skip sell (within hold period)", t)
-                        continue
-                    if t in bought_today and not imf_guard.allow_same_day_sell(
-                        portfolio_value, True
-                    ):
-                        logger.info("HOLD %s: skip sell (same-session round trip; IMF)", t)
-                        continue
-                    if current_value <= 0:
-                        logger.debug("HOLD %s: no long position to reduce (current_value=%.2f)", t, current_value)
-                    else:
-                        notional = min(current_value - target_value, current_value)
-                        if notional < 1.0:
-                            logger.debug("HOLD %s: sell amount below $1", t)
-                        else:
-                            # If selling most of position (>= 95%), close full position to avoid rounding issues
-                            sell_all = notional >= current_value * 0.95
-                            if sell_all:
-                                if broker.close_position(t):
-                                    logger.info("SELL ALL %s (was $%.2f)", t, current_value)
-                                    send_discord_notification(
-                                        t, "SELL", position_pct, outputs,
-                                        {"close_position": True, "notional": current_value, "status": "closed"},
-                                    )
-                                else:
-                                    logger.warning("Failed to close position %s", t)
-                            elif FRACTIONAL:
-                                order = broker.place_order(t, notional=notional, side="sell")
-                                if order:
-                                    logger.info("SELL %s: $%.2f", t, notional)
-                                    send_discord_notification(t, "SELL", position_pct, outputs, order)
-                            else:
-                                current_qty = float(current_pos.get("qty", 0))
-                                price = latest_prices.get(t) or 0.0
-                                if price > 0 and current_qty > 0:
-                                    would_sell_qty = min(int(current_qty), max(1, int(round(notional / price))))
-                                    if would_sell_qty >= current_qty * 0.95:
-                                        if broker.close_position(t):
-                                            logger.info("SELL ALL %s (was %d shares)", t, int(current_qty))
-                                            send_discord_notification(
-                                                t, "SELL", position_pct, outputs,
-                                                {"close_position": True, "notional": current_value, "status": "closed"},
-                                            )
-                                    else:
-                                        order = broker.place_order(t, qty=would_sell_qty, side="sell")
-                                        if order:
-                                            logger.info("SELL %s: %d shares @ ~$%.2f", t, would_sell_qty, price)
-                                            send_discord_notification(t, "SELL", position_pct, outputs, order)
-                                else:
-                                    logger.warning("No position or price for %s; skipping sell", t)
+                    sell_candidates.append((i, t, current_value, target_value, current_qty))
                 else:
-                    logger.info("HOLD %s | Position=%.1f%%", t, position_pct * 100)
+                    hold_indices.append(i)
+
+            # Pass 1: SELLS then Pass 2: BUYS via extracted pure function.
+            remaining_capital, bought_today = _execute_rebalance_passes(
+                sell_candidates=sell_candidates,
+                buy_candidates=buy_candidates,
+                broker=broker,
+                available_capital=available_capital,
+                portfolio_value=portfolio_value,
+                target_holdings=target_holdings,
+                specialist_list=specialist_list,
+                fractional=FRACTIONAL,
+                latest_prices=latest_prices,
+                pending_sells=pending_sells,
+                pending_buys=pending_buys,
+                bought_since=bought_since,
+                sold_since=sold_since,
+                bought_today=bought_today,
+                imf_guard=imf_guard,
+                notify_fn=send_discord_notification,
+            )
+
+            for i in hold_indices:
+                logger.info("HOLD %s | Position=%.1f%%", tickers[i], float(target_holdings[i]) * 100)
 
             logger.info("Cycle completed (type=%s)", "ollama_refresh" if do_ollama else "cache_only")
             if _interruptible_sleep(interval_sec):

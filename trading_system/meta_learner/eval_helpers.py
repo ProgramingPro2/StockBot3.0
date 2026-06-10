@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import random
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +16,26 @@ from ..config import PPO_EARLY_STOPPING_OVERFIT_THRESHOLD
 from .env import HistoricalTradingEnv
 
 
+def _seed_everything(seed: int) -> None:
+    """Seed numpy, random, torch, and SB3 for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        from stable_baselines3.common.utils import set_random_seed as _sb3_seed
+        _sb3_seed(seed)
+    except Exception:
+        pass
+
+
 def _compute_annualized_sharpe(returns: np.ndarray) -> float:
-    """Compute annualized Sharpe ratio from daily returns."""
-    if returns.size == 0:
+    """Compute annualized Sharpe ratio (sample std, ddof=1, sqrt(252) annualization)."""
+    if returns.size < 2:
         return 0.0
     mu = float(np.mean(returns))
-    sigma = float(np.std(returns))
+    sigma = float(np.std(returns, ddof=1))
     if sigma <= 1e-12:
         return 0.0
     sharpe = (mu / sigma) * math.sqrt(252.0)
@@ -29,8 +44,21 @@ def _compute_annualized_sharpe(returns: np.ndarray) -> float:
     return float(sharpe)
 
 
+def compute_annualized_sharpe(returns: np.ndarray) -> float:
+    """Public wrapper: annualized Sharpe (sample std, ddof=1, sqrt(252)) from daily returns."""
+    return _compute_annualized_sharpe(np.asarray(returns, dtype=np.float64))
+
+
 def _predict_actions_deterministic(model: Any, obs: np.ndarray) -> np.ndarray:
-    """Fast deterministic policy inference on the model device (avoids SB3 predict overhead)."""
+    """Fast deterministic policy inference.
+
+    Uses direct SB3 policy forward pass when the model has ``device`` (avoids
+    SB3 predict overhead).  Falls back to ``model.predict()`` for lightweight
+    test stubs or non-SB3 models.
+    """
+    if not hasattr(model, "device"):
+        action, _ = model.predict(obs, deterministic=True)
+        return np.asarray(action, dtype=np.float32).reshape(-1)
     device = model.device
     obs_t = obs_as_tensor(np.asarray(obs, dtype=np.float32).reshape(1, -1), device)
     with torch.inference_mode():

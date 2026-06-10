@@ -14,6 +14,7 @@ JobKind = Literal[
     "autodiscover",
     "train-universe",
     "benchmark-device",
+    "specialist-cache",
     "test",
 ]
 
@@ -47,6 +48,7 @@ class TrainParams(BaseModel):
     n_envs: Optional[int] = None
     torch_vec: bool = False
     ignore_early_stopping: bool = False
+    walk_forward: bool = False
     debug: bool = False
 
 
@@ -81,6 +83,7 @@ class TuneParams(BaseModel):
 class BacktestParams(BaseModel):
     tickers: Optional[str] = None
     model: Optional[str] = None
+    in_sample: bool = False
 
 
 class PaperLiveParams(BaseModel):
@@ -106,6 +109,15 @@ class BenchmarkParams(BaseModel):
     timesteps: int = 20_000
     use_historical: bool = False
     tickers: Optional[str] = None
+
+
+class SpecialistCacheParams(BaseModel):
+    tickers: Optional[str] = None
+    start: str = "2015-01-01"
+    end: Optional[str] = None
+    refit_every: Optional[int] = None
+    window: int = 21
+    force_rebuild: bool = False
 
 
 class StartJobResponse(BaseModel):
@@ -151,6 +163,9 @@ class ModelInfo(BaseModel):
     mtime: float
     is_default: bool = False
     is_live_default: bool = False
+    feature_source: Optional[str] = None
+    saved_at: Optional[str] = None
+    n_assets: Optional[int] = None
 
 
 class ModelsResponse(BaseModel):

@@ -119,11 +119,16 @@ def rebalance_multi_asset(
     min_hold_bars: int,
     min_reentry_bars: int,
     imf_guard: IntradayMarginGuard,
-    session_key: SessionKey,
+    session_key: SessionKey,  # accepted but not used; same-session detection uses bar_index equality (daily-bar assumption)
     equity_dollars: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     One row of portfolio backtest-style rebalancing with optional IMF rules.
+
+    ``session_key`` is accepted for call-site compatibility but not consulted;
+    the same-session (bought-this-bar) check uses ``bar_index`` directly, which
+    is correct when each bar represents one trading day.
+
     Returns (new_effective, new_last_buy_bar, new_last_sell_bar).
     """
     n_assets = len(effective_weights)

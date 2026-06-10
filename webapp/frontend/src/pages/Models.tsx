@@ -1,21 +1,14 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Package, Star, Trash2 } from "lucide-react";
-import { ApiClient } from "../lib/api";
+import { ApiClient, type ModelInfo, type ModelsResponse } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import { formatBytes, formatRelative } from "../lib/format";
-import { useState } from "react";
-
-type Model = {
-  name: string;
-  path: string;
-  size_bytes: number;
-  mtime: number;
-};
 
 export default function Models() {
   const qc = useQueryClient();
   const [error, setError] = useState<string | null>(null);
-  const models = useQuery<{ models: Model[]; live_default: string | null }>({
+  const models = useQuery<ModelsResponse>({
     queryKey: ["models"],
     queryFn: ApiClient.models,
     refetchInterval: 6_000,
@@ -43,10 +36,12 @@ export default function Models() {
         <div className="panel-padded border-danger/30 text-danger text-sm">{error}</div>
       )}
       <div className="panel overflow-hidden">
-        <table className="table-clean">
+          <table className="table-clean">
           <thead>
             <tr>
               <th>Name</th>
+              <th>Mode</th>
+              <th>Assets</th>
               <th>Modified</th>
               <th className="text-right">Size</th>
               <th className="text-right">Live default</th>
@@ -55,10 +50,29 @@ export default function Models() {
           </thead>
           <tbody>
             {(models.data?.models ?? []).map((m) => {
-              const isDefault = models.data?.live_default === m.path;
+              const isDefault = m.is_live_default;
+              const featureSource = m.feature_source ?? null;
               return (
                 <tr key={m.name}>
                   <td className="font-mono text-xs">{m.name}</td>
+                  <td>
+                    {featureSource ? (
+                      <span
+                        className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${
+                          featureSource === "specialist"
+                            ? "bg-violet-500/15 text-violet-300"
+                            : "bg-sky-500/15 text-sky-300"
+                        }`}
+                      >
+                        {featureSource}
+                      </span>
+                    ) : (
+                      <span className="text-ink-muted text-xs">—</span>
+                    )}
+                  </td>
+                  <td className="text-xs text-ink-muted">
+                    {m.n_assets != null ? m.n_assets : "—"}
+                  </td>
                   <td>{formatRelative(m.mtime)}</td>
                   <td className="text-right">{formatBytes(m.size_bytes)}</td>
                   <td className="text-right">

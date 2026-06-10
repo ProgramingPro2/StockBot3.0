@@ -82,6 +82,65 @@ def _reconstruction_loss(x: torch.Tensor, recon: torch.Tensor, mu: torch.Tensor,
     return mse + 0.1 * kld
 
 
+def _assign_regime_labels(
+    raw_feats: np.ndarray,
+    cluster_labels: np.ndarray,
+    n_clusters: int,
+) -> list[str]:
+    """
+    Assign Bull/Bear/Sideways/Crash labels to cluster indices deterministically.
+
+    Clusters are ranked by mean 1-day return (feature col 0) and mean volatility
+    (feature col 1) computed from the original (unnormalized) feature matrix.
+    Assignment order:
+      1. Highest mean return -> Bull
+      2. Lowest mean return AND highest volatility -> Crash
+      3. Second lowest mean return -> Bear
+      4. Remainder -> Sideways
+    This mapping is stable and interpretable regardless of which arbitrary KMeans
+    cluster index ends up with which centroid.
+    """
+    n = min(n_clusters, 4)  # only assign the four named regimes
+    regime_map = ["Sideways"] * n_clusters
+
+    mean_ret = np.array([
+        float(raw_feats[cluster_labels == c, 0].mean()) if np.any(cluster_labels == c) else 0.0
+        for c in range(n_clusters)
+    ])
+    mean_vol = np.array([
+        float(raw_feats[cluster_labels == c, 1].mean()) if np.any(cluster_labels == c) else 0.0
+        for c in range(n_clusters)
+    ])
+
+    remaining = list(range(n_clusters))
+
+    # Bull: highest mean return
+    bull = remaining[int(np.argmax(mean_ret[remaining]))]
+    regime_map[bull] = "Bull"
+    remaining.remove(bull)
+
+    if remaining:
+        # Crash: worst combination of low return + high volatility
+        # Normalize both dims to 0-1 within the remaining set before combining
+        ret_r = mean_ret[remaining]
+        vol_r = mean_vol[remaining]
+        ret_range = float(np.ptp(ret_r)) or 1.0
+        vol_range = float(np.ptp(vol_r)) or 1.0
+        crash_score = -(ret_r - ret_r.min()) / ret_range + (vol_r - vol_r.min()) / vol_range
+        crash = remaining[int(np.argmax(crash_score))]
+        regime_map[crash] = "Crash"
+        remaining.remove(crash)
+
+    if remaining:
+        # Bear: lowest mean return among what remains
+        bear = remaining[int(np.argmin(mean_ret[remaining]))]
+        regime_map[bear] = "Bear"
+        remaining.remove(bear)
+
+    # Everything else stays as Sideways
+    return regime_map
+
+
 def _ensure_model(retrain: bool = False, end_date: str | None = None) -> bool:
     """Load or train VAE + KMeans."""
     global _vae, _kmeans, _regime_labels, _scaler_mean, _scaler_std
@@ -121,18 +180,19 @@ def _ensure_model(retrain: bool = False, end_date: str | None = None) -> bool:
 
     n_features = feats.shape[1]
     input_dim = n_features
-    feats = feats.values
+    raw_feats = feats.values.copy()  # keep unnormalized for cluster statistics
 
     # Normalize
-    _scaler_mean = np.nanmean(feats, axis=0)
-    _scaler_std = np.nanstd(feats, axis=0)
+    _scaler_mean = np.nanmean(raw_feats, axis=0)
+    _scaler_std = np.nanstd(raw_feats, axis=0)
     _scaler_std[_scaler_std == 0] = 1
-    X = (feats - _scaler_mean) / _scaler_std
+    X = (raw_feats - _scaler_mean) / _scaler_std
     X = np.nan_to_num(X, nan=0.0)
 
     dataset = torch.FloatTensor(X)
     _bs = int(os.getenv("REGIME_VAE_BATCH_SIZE", "64").strip() or "64")
-    loader = torch.utils.data.DataLoader(dataset, batch_size=_bs, shuffle=True)
+    # drop_last avoids a batch of size 1 that would break BatchNorm1d running stats
+    loader = torch.utils.data.DataLoader(dataset, batch_size=_bs, shuffle=True, drop_last=(_bs > 1 and len(X) > _bs))
 
     vae = VAE(input_dim, VAE_LATENT_DIM, VAE_HIDDEN_DIMS)
     vae.to(_get_device())
@@ -141,6 +201,7 @@ def _ensure_model(retrain: bool = False, end_date: str | None = None) -> bool:
     from tqdm import tqdm
     _epochs = int(os.getenv("REGIME_VAE_EPOCHS", "50").strip() or "50")
     for epoch in tqdm(range(_epochs), desc="Regime VAE", unit="epoch"):
+        vae.train()
         for batch in loader:
             batch = batch.to(_get_device())
             opt.zero_grad()
@@ -157,19 +218,8 @@ def _ensure_model(retrain: bool = False, end_date: str | None = None) -> bool:
     kmeans = KMeans(n_clusters=VAE_REGIME_CLUSTERS, random_state=42, n_init=10)
     labels = kmeans.fit_predict(z)
 
-    # Map clusters to regime names by centroid characteristics
-    centroids = kmeans.cluster_centers_
-    regime_map = []
-    for i in range(VAE_REGIME_CLUSTERS):
-        if centroids[i, 0] > 0.1 and np.std(centroids[i]) < 0.5:
-            regime_map.append("Bull")
-        elif centroids[i, 0] < -0.1 and np.std(centroids[i]) > 0.5:
-            regime_map.append("Crash")
-        elif centroids[i, 0] < -0.05:
-            regime_map.append("Bear")
-        else:
-            regime_map.append("Sideways")
-    _regime_labels = regime_map
+    # Deterministic cluster-to-label mapping from original feature statistics
+    _regime_labels = _assign_regime_labels(raw_feats, labels, VAE_REGIME_CLUSTERS)
 
     REGIME_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(vae.state_dict(), model_path)
@@ -237,4 +287,4 @@ def detect_regime(spy_data: pd.DataFrame | None = None) -> dict:
     if recon_err > 0.5:
         flag = min(1.0, flag + 0.2)
 
-    return {"regime": regime, "flag": flag}
+    return {"regime": regime, "flag": float(np.clip(flag, 0.0, 1.0))}

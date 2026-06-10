@@ -18,6 +18,10 @@ def get_liquidity_score(
     """
     Get liquidity score for a ticker from volume percentile over the lookback window.
     Returns float in [0, 1]: higher = more liquid (current volume high vs recent history).
+
+    The reference window excludes the current bar so the current volume is compared
+    against a purely historical baseline (self-inclusion inflates the percentile toward
+    the middle because the current bar always counts as at least one match).
     """
     ticker = ticker.strip().upper()
     df = load_ohlcv(ticker)
@@ -26,20 +30,20 @@ def get_liquidity_score(
         return 0.5
 
     vol = df["volume"].dropna()
-    if len(vol) < window_short:
+    if len(vol) < window_short + 1:
         return 0.5
 
-    # Use window_long if enough history, else window_short
-    w = min(window_long, len(vol))
+    # Use window_long if enough history, else window_short; always exclude current bar
+    w = min(window_long, len(vol) - 1)
     if w < 5:
         return 0.5
 
-    recent = vol.tail(w).values.astype(float)
+    # Reference window: the w bars immediately before the current bar
+    reference = vol.iloc[-(w + 1):-1].values.astype(float)
     current = float(vol.iloc[-1])
-    if current <= 0 or np.nanmax(recent) <= 0:
+    if current <= 0 or np.nanmax(reference) <= 0:
         return 0.5
 
-    # Percentile of current volume within the recent series (0-100)
-    pct = float(np.sum(recent <= current) / len(recent)) * 100.0
-    score = np.clip(pct / 100.0, 0.0, 1.0)
-    return float(score)
+    pct = float(np.sum(reference <= current) / len(reference))
+    score = float(np.clip(pct, 0.0, 1.0))
+    return score

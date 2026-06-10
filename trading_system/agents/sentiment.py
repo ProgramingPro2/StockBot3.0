@@ -14,6 +14,10 @@ from ..utils.logger import get_logger
 
 logger = get_logger()
 
+# How long a cached sentiment score remains valid before the next call re-fetches.
+# Configurable via SENTIMENT_CACHE_TTL_HOURS env var; default 4 hours.
+_SENTIMENT_CACHE_TTL_SECONDS: float = float(os.getenv("SENTIMENT_CACHE_TTL_HOURS", "4")) * 3600.0
+
 
 class SentimentOutput(BaseModel):
     """Structured output from LLM."""
@@ -101,7 +105,7 @@ def _models_to_try() -> list[str]:
     return out
 
 
-# Per-ticker cache: (score, confidence, timestamp). Main controls refresh via force_refresh.
+# Per-ticker cache: (score, confidence, timestamp). TTL controlled by _SENTIMENT_CACHE_TTL_SECONDS.
 _sentiment_cache: dict[str, tuple[float, float, float]] = {}
 
 
@@ -110,11 +114,12 @@ def get_sentiment(ticker: str, force_refresh: bool = False) -> tuple[float, floa
     Get sentiment score and confidence for a ticker.
     Returns (sentiment_score, confidence, from_llm) in [-1, 1], [0, 1], and bool.
     When from_llm is False, caller should use proxy sentiment instead.
-    When force_refresh is False, may return cached value from a previous Ollama call.
+    When force_refresh is False, returns a cached value if it is still within TTL.
     """
     if not force_refresh and ticker in _sentiment_cache:
-        score, conf, _ = _sentiment_cache[ticker]
-        return score, conf, True
+        score, conf, ts = _sentiment_cache[ticker]
+        if time.time() - ts < _SENTIMENT_CACHE_TTL_SECONDS:
+            return score, conf, True
 
     if "OLLAMA_HOST" not in os.environ and OLLAMA_URL:
         host = OLLAMA_URL.replace("https://", "").replace("http://", "").strip()

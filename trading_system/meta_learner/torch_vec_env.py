@@ -79,6 +79,7 @@ class BatchedHistoricalTorchVecEnv(VecEnv):
         drawdown_penalty: float | None = None,
         trading_dates: np.ndarray | pd.DatetimeIndex | list | None = None,
         device: str | torch.device = "cuda",
+        obs_noise_std: float = 0.0,
     ) -> None:
         self.returns_np = np.asarray(returns_array, dtype=np.float32)
         self.n_days, na = self.returns_np.shape
@@ -125,6 +126,7 @@ class BatchedHistoricalTorchVecEnv(VecEnv):
         _day_m = 24 * 60
         self._min_hold_bars = 1 if MIN_HOLD_MINUTES_AFTER_BUY >= _day_m else 0
         self._min_reentry_bars = 1 if MIN_REENTRY_MINUTES_AFTER_SELL >= _day_m else 0
+        self._obs_noise_std = float(obs_noise_std)
 
         self._cursor = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self._step_in_episode = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -246,24 +248,24 @@ class BatchedHistoricalTorchVecEnv(VecEnv):
             portfolio_return_all[valid] = pr.to(torch.float32)
 
         infos: list[dict[str, Any]] = []
-        obs_batch = self._build_obs_batch()
+        # Build obs before resetting done envs — these are the terminal observations.
+        terminal_obs = self._build_obs_batch()
         portfolio_returns_np = portfolio_return_all.detach().cpu().numpy()
 
         for e in range(self.num_envs):
             info: dict[str, Any] = {"return": float(portfolio_returns_np[e])}
+            info["TimeLimit.truncated"] = False
             if past_end[e]:
                 info["return"] = 0.0
-                info["TimeLimit.truncated"] = False
-                info["terminal_observation"] = obs_batch[e]
+                info["terminal_observation"] = terminal_obs[e].copy()
                 self._reset_one(e, seed=None)
             elif bool(dones[e].item()):
-                info["TimeLimit.truncated"] = False
-                info["terminal_observation"] = obs_batch[e]
+                info["terminal_observation"] = terminal_obs[e].copy()
                 self._reset_one(e, seed=None)
-            else:
-                info["TimeLimit.truncated"] = False
             infos.append(info)
 
+        # Rebuild obs after resets: done envs now show post-reset state (SB3 VecEnv convention).
+        obs_batch = self._build_obs_batch()
         rewards_np = rewards.detach().cpu().numpy().astype(np.float32)
         dones_np = dones.detach().cpu().numpy().astype(bool)
         return obs_batch, rewards_np, dones_np, infos
@@ -279,6 +281,9 @@ class BatchedHistoricalTorchVecEnv(VecEnv):
             per = torch.cat([feats[:, :, :10], h.unsqueeze(-1)], dim=-1)
         obs = per.reshape(self.num_envs, -1)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
+        if self._obs_noise_std > 0.0:
+            noise = torch.randn_like(obs) * self._obs_noise_std
+            obs = (obs + noise).clamp(-1.0, 1.0)
         return _sanitize_obs(obs.detach().cpu().numpy().astype(np.float32))
 
     def close(self) -> None:

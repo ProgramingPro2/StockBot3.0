@@ -28,9 +28,13 @@ def get_volatility_score(ticker: str) -> float:
 
     vol_short = float(ret.tail(VOLATILITY_WINDOW_DAYS).std())
     vol_long = float(ret.tail(VOLATILITY_REF_WINDOW_DAYS).std())
-    if vol_long < 1e-10:
+    if not np.isfinite(vol_long) or vol_long < 1e-10:
+        return 0.5
+    if not np.isfinite(vol_short):
         return 0.5
 
-    ratio = min(1.0, vol_short / vol_long)
-    score = np.clip(ratio, 0.0, 1.0)
-    return float(score)
+    ratio = vol_short / vol_long
+    score = float(np.clip(ratio, 0.0, 1.0))
+    if not np.isfinite(score):
+        return 0.5
+    return score

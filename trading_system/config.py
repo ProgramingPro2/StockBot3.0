@@ -222,11 +222,10 @@ VAE_REGIME_CLUSTERS = 4  # Bull, Bear, Sideways, Crash
 
 # PPO (Meta-Learner)
 PPO_LEARNING_RATE = 3e-4
-# When using --use-tuned, n_steps is capped at this value for faster training (tune often picks 4096)
 PPO_N_STEPS = int(os.getenv("PPO_N_STEPS", "2048"))
 PPO_BATCH_SIZE = int(os.getenv("PPO_BATCH_SIZE", "256"))
 PPO_N_EPOCHS = int(os.getenv("PPO_N_EPOCHS", "10"))
-PPO_GAMMA = float(os.getenv("PPO_GAMMA", "0.95"))
+PPO_GAMMA = float(os.getenv("PPO_GAMMA", "0.99"))
 PPO_GAE_LAMBDA = 0.95
 PPO_CLIP_RANGE = 0.2
 PPO_ENT_COEF = float(os.getenv("PPO_ENT_COEF", "0.03"))
@@ -247,6 +246,8 @@ PPO_EARLY_STOPPING_OVERFIT_THRESHOLD = float(os.getenv("PPO_EARLY_STOPPING_OVERF
 PPO_WALK_FORWARD_FOLDS = int(os.getenv("PPO_WALK_FORWARD_FOLDS", "3"))
 # L2 regularization: Adam weight_decay (0 = disabled). Reduces overfitting.
 PPO_WEIGHT_DECAY = float(os.getenv("PPO_WEIGHT_DECAY", "0.0001"))
+# Global random seed for training reproducibility; tuning uses base_seed + trial.number per trial.
+PPO_SEED = int(os.getenv("PPO_SEED", "42"))
 # CPU threads for PPO when device=cpu; 0 = use all available
 PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 # Parallel envs for SubprocVecEnv / batched vec env; 1 = single env (no subprocess). With n_envs>1, total rollout = n_steps * n_envs
@@ -279,6 +280,17 @@ ENV_ALLOW_CASH_EXPOSURE = os.getenv("ENV_ALLOW_CASH_EXPOSURE", "true").lower() i
 # Proxy feature normalization
 PROXY_XSRANK_ENABLED = os.getenv("PROXY_XSRANK_ENABLED", "true").lower() in ("1", "true", "yes")
 PROXY_EXPANDING_ZSCORE = os.getenv("PROXY_EXPANDING_ZSCORE", "true").lower() in ("1", "true", "yes")
+
+# Feature source: proxy (default) or specialist (Phase 3 Mode B walk-forward matrix)
+FEATURE_SOURCE = os.getenv("FEATURE_SOURCE", "proxy").strip().lower()
+# Walk-forward refit cadence for specialist models (trading days between expanding-window refits)
+try:
+    SPECIALIST_REFIT_EVERY_BARS = max(1, int(os.getenv("SPECIALIST_REFIT_EVERY_BARS", "63").strip() or "63"))
+except (ValueError, TypeError):
+    SPECIALIST_REFIT_EVERY_BARS = 63
+# Cache directory for specialist walk-forward feature matrices (Mode B training)
+SPECIALIST_FEATURES_CACHE_DIR = CACHE_DIR / "specialist_features"
+SPECIALIST_FEATURES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Headless matplotlib
 import matplotlib

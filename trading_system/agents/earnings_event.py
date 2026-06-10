@@ -35,8 +35,19 @@ def get_event_risk_score(ticker: str) -> float:
                 dt = idx.to_pydatetime()
             else:
                 dt = idx
-            if hasattr(dt, "tzinfo") and dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+            # Normalize to UTC: handles both naive (assume UTC) and tz-aware datetimes
+            # (any timezone) so that the subtraction and comparison are consistent.
+            if isinstance(dt, datetime):
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+            else:
+                # Fallback for unexpected types (e.g. date objects)
+                try:
+                    dt = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+                except Exception:
+                    continue
             if dt > now:
                 future_dates.append(dt)
 
@@ -50,7 +61,7 @@ def get_event_risk_score(ticker: str) -> float:
             return 0.0
 
         score = max(0.0, 1.0 - delta / EVENT_RISK_LOOKBACK_DAYS)
-        return float(min(1.0, score))
+        return float(min(1.0, max(0.0, score)))
 
     except Exception as e:
         logger.debug("Earnings date fetch failed for %s: %s", ticker, e)

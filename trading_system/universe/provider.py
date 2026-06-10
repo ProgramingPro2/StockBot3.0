@@ -82,6 +82,14 @@ def get_candidate_tickers() -> list[str]:
             logger.warning("Could not read UNIVERSE_FILE: %s", e)
             return list(TRADE_TICKERS)
     if UNIVERSE_SOURCE == "sp500":
+        # Today's constituent list reflects survivorship bias: companies that were delisted,
+        # merged, or went bankrupt are absent. Use UNIVERSE_SOURCE=file with a fixed
+        # point-in-time ticker list to avoid this bias when training or running the scorer.
+        logger.warning(
+            "UNIVERSE_SOURCE=sp500 fetches today's S&P 500 constituent list, which induces "
+            "survivorship bias in scorer training and backtesting. Use UNIVERSE_SOURCE=file "
+            "with a fixed point-in-time list as the documented mitigation."
+        )
         cached = _read_sp500_cache()
         if cached:
             return cached

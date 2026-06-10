@@ -108,7 +108,7 @@ class TestHistoryWindow(unittest.TestCase):
         dates = pd.date_range("2020-01-01", periods=n_days, freq="B")
         tickers = ["SPY", "IWM"]
 
-        def fake_load_ohlcv(symbol: str, lookback_years: int = 5) -> pd.DataFrame:
+        def fake_load_ohlcv(symbol: str, lookback_years: int = 5, end=None, **kwargs) -> pd.DataFrame:
             df = pd.DataFrame(
                 {"close": 100.0 + np.cumsum(np.random.randn(n_days) * 0.5)},
                 index=dates,

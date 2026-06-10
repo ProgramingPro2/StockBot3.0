@@ -20,6 +20,11 @@ def register(app: typer.Typer) -> None:
             "-m",
             help="PPO model file (e.g. ppo_trader_2026-04-27.zip). Path or filename under models/meta_learner.",
         ),
+        in_sample: bool = typer.Option(
+            False,
+            "--in-sample",
+            help="Evaluate on all available data (no chronological train/test split). Default is out-of-sample.",
+        ),
         debug: bool = typer.Option(False, "--debug"),
         json_output: bool = typer.Option(False, "--json", help="Suppress Rich output; only emit machine-readable result."),
     ) -> None:
@@ -34,6 +39,7 @@ def register(app: typer.Typer) -> None:
                 {
                     "Tickers": tickers or "TRADE_TICKERS",
                     "Model": model or "(latest / default)",
+                    "Window": "in-sample (all data)" if in_sample else "out-of-sample (test split)",
                 },
             )
-        cmd_backtest(make_args(tickers=tickers, model=model, debug=debug))
+        cmd_backtest(make_args(tickers=tickers, model=model, in_sample=in_sample, debug=debug))

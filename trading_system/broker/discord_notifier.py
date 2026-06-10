@@ -3,6 +3,7 @@ Discord webhook notifications for trades.
 """
 import json
 import math
+import threading as _threading
 from pathlib import Path
 
 import requests
@@ -11,6 +12,17 @@ from ..config import DISCORD_WEBHOOK_URL
 from ..utils.logger import get_logger
 
 logger = get_logger()
+
+
+def _post_async(url: str, *, json_payload=None, data=None, files=None, timeout: int = 10) -> None:
+    """Fire-and-forget HTTP POST in a daemon thread; failures are logged, not raised."""
+    def _do() -> None:
+        try:
+            resp = requests.post(url, json=json_payload, data=data, files=files, timeout=timeout)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("Discord webhook post failed: %s", exc)
+    _threading.Thread(target=_do, daemon=True).start()
 
 
 def send_discord_notification(
@@ -66,13 +78,8 @@ def send_discord_notification(
         ]
     }
 
-    try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.warning("Discord notification failed: %s", e)
-        return False
+    _post_async(DISCORD_WEBHOOK_URL, json_payload=payload)
+    return True
 
 
 def send_training_complete_embed(
@@ -120,20 +127,22 @@ def send_training_complete_embed(
         ]
     }
 
+    # Read file data synchronously before handing off to the daemon thread so a
+    # deleted plot doesn't cause an error after the function has returned.
     try:
         with open(plot_path, "rb") as f:
             file_data = f.read()
-        resp = requests.post(
-            DISCORD_WEBHOOK_URL,
-            data={"payload_json": json.dumps(payload)},
-            files={"file": (filename, file_data, "image/png")},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return True
     except Exception as e:
-        logger.warning("Discord training-complete notification failed: %s", e)
+        logger.warning("Discord training-complete: could not read plot file: %s", e)
         return False
+
+    _post_async(
+        DISCORD_WEBHOOK_URL,
+        data={"payload_json": json.dumps(payload)},
+        files={"file": (filename, file_data, "image/png")},
+        timeout=15,
+    )
+    return True
 
 
 def send_boardroom_summary_embed(
@@ -166,13 +175,8 @@ def send_boardroom_summary_embed(
         ]
     }
 
-    try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.warning("Discord boardroom summary notification failed: %s", e)
-        return False
+    _post_async(DISCORD_WEBHOOK_URL, json_payload=payload)
+    return True
 
 
 def send_live_start_embed(
@@ -211,13 +215,8 @@ def send_live_start_embed(
         ]
     }
 
-    try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.warning("Discord live-start notification failed: %s", e)
-        return False
+    _post_async(DISCORD_WEBHOOK_URL, json_payload=payload)
+    return True
 
 
 def send_hpo_complete_embed(
@@ -263,10 +262,5 @@ def send_hpo_complete_embed(
         ]
     }
 
-    try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.warning("Discord HPO notification failed: %s", e)
-        return False
+    _post_async(DISCORD_WEBHOOK_URL, json_payload=payload)
+    return True

@@ -142,6 +142,11 @@ def _parallel_worker_entry(payload: tuple[int, int, dict[str, Any]]) -> dict[str
     kw = dict(kwargs)
     kw["n_trials"] = n_trials_i
     kw["show_progress"] = bool(kw.get("show_progress")) and rank == 0
+    # Per-worker sampler seed: identical seeds make all workers propose the same
+    # parameter sets in lockstep, wasting n_workers-1 of every concurrent batch.
+    from ..config import PPO_SEED
+
+    kw["sampler_seed"] = PPO_SEED + rank
     try:
         return run_tuning(**kw)
     except KeyError as exc:
@@ -154,6 +159,38 @@ def _parallel_worker_entry(payload: tuple[int, int, dict[str, Any]]) -> dict[str
             )
             return {}
         raise
+
+
+def _preseed_study(*, study_name: str, load_if_exists: bool, use_journal: bool) -> None:
+    """
+    Create (or clear-and-recreate) the Optuna study in the parent process.
+
+    Called once before worker processes are spawned so that every worker sees
+    an already-existing study and calls create_study(..., load_if_exists=True).
+    Without this, parallel workers race to write their own creation records into
+    the append-only JournalStorage log; the journal then contains multiple
+    creation events for the same study name, and the first trial's
+    ``study._get_trials()`` replay raises ``KeyError('Record does not exist.')``.
+    """
+    import optuna
+    from optuna.samplers import TPESampler
+
+    from .tuner import get_tune_storage
+
+    storage = get_tune_storage(use_journal_storage=use_journal)
+    if not load_if_exists:
+        try:
+            optuna.delete_study(study_name=study_name, storage=storage)
+        except Exception:
+            pass
+    optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        direction="maximize",
+        sampler=TPESampler(n_startup_trials=10, seed=42),
+        load_if_exists=True,
+    )
+    _log.debug("Pre-seeded study %r in parent before spawning workers.", study_name)
 
 
 def run_parallel_tuning(
@@ -192,6 +229,18 @@ def run_parallel_tuning(
         kwargs["precomputed_val_proxy"] = precompute_proxy_feature_matrix(val_returns)
     else:
         kwargs["precomputed_val_proxy"] = None
+
+    # Pre-create the study in the parent process so workers never race to
+    # create/delete the same JournalStorage study simultaneously.  Multiple
+    # concurrent create_study calls write duplicate name-creation records into
+    # the append-only journal log; when the first trial then replays the log to
+    # look up its study_id it hits KeyError('Record does not exist.').
+    _preseed_study(
+        study_name=str(kwargs.get("study_name", "ppo_tune")),
+        load_if_exists=bool(kwargs.get("load_if_exists", True)),
+        use_journal=use_journal,
+    )
+    kwargs["load_if_exists"] = True  # study now exists; workers must not recreate
 
     per_worker = _split_trials(n_trials, n_workers)
     ctx = get_context("spawn")

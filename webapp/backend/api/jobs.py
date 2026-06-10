@@ -15,6 +15,7 @@ from ..schemas import (
     JobInfo,
     JobListResponse,
     PaperLiveParams,
+    SpecialistCacheParams,
     StartJobResponse,
     StopJobResponse,
     TrainParams,
@@ -112,6 +113,12 @@ def start_train_universe(params: TrainUniverseParams) -> StartJobResponse:
 @router.post("/benchmark/start", response_model=StartJobResponse)
 def start_benchmark(params: BenchmarkParams) -> StartJobResponse:
     info = get_manager().start("benchmark-device", params.model_dump(exclude_none=True))
+    return StartJobResponse(job=info)
+
+
+@router.post("/specialist-cache/start", response_model=StartJobResponse)
+def start_specialist_cache(params: SpecialistCacheParams) -> StartJobResponse:
+    info = get_manager().start("specialist-cache", params.model_dump(exclude_none=True))
     return StartJobResponse(job=info)
 
 

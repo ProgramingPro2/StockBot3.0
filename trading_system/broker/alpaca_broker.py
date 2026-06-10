@@ -22,6 +22,7 @@ class AlpacaBroker:
         self.secret_key = secret_key or ALPACA_SECRET_KEY
         self.base_url = base_url or ALPACA_BASE_URL
         self.client: TradingClient | None = None
+        self._data_client = None  # lazy-initialized StockHistoricalDataClient
 
         if self.api_key and self.secret_key:
             try:
@@ -78,6 +79,76 @@ class AlpacaBroker:
         except Exception as e:
             logger.error("Failed to get all positions: %s", e)
             return []
+
+    def get_open_orders(self) -> list[dict]:
+        """
+        Return all currently open (pending) orders.
+        Used before placing new orders to avoid duplicate submissions.
+        """
+        if not self.client:
+            return []
+        try:
+            req = GetOrdersRequest(status="open", limit=500)
+            orders = self.client.get_orders(req)
+            return [
+                {
+                    "symbol": o.symbol,
+                    "side": o.side.value if o.side else None,
+                    "id": str(o.id),
+                }
+                for o in orders
+                if o.symbol and o.side
+            ]
+        except Exception as e:
+            logger.error("Failed to fetch open orders: %s", e)
+            return []
+
+    def get_latest_price(self, symbol: str) -> float | None:
+        """
+        Fetch real-time price for symbol via Alpaca market data.
+        Tries latest trade first, then falls back to quote midpoint.
+        Returns None if both fail (caller should fall back to cached close).
+        """
+        if not self.api_key or not self.secret_key:
+            return None
+        symbol = symbol.upper()
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestTradeRequest
+            if self._data_client is None:
+                self._data_client = StockHistoricalDataClient(
+                    api_key=self.api_key,
+                    secret_key=self.secret_key,
+                )
+            result = self._data_client.get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=symbol)
+            )
+            trade = result.get(symbol)
+            if trade is not None and trade.price:
+                return float(trade.price)
+        except Exception as e:
+            logger.debug("Latest trade price unavailable for %s: %s", symbol, e)
+        # Fall back to latest quote midpoint
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestQuoteRequest
+            if self._data_client is None:
+                self._data_client = StockHistoricalDataClient(
+                    api_key=self.api_key,
+                    secret_key=self.secret_key,
+                )
+            result = self._data_client.get_stock_latest_quote(
+                StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            )
+            quote = result.get(symbol)
+            if quote is not None:
+                bid = float(quote.bid_price or 0)
+                ask = float(quote.ask_price or 0)
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2.0
+        except Exception as e:
+            logger.debug("Latest quote unavailable for %s: %s", symbol, e)
+        return None
 
     def get_symbols_bought_on_date(
         self,

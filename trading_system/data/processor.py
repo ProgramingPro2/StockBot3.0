@@ -3,26 +3,11 @@ Normalization, scaling, and data preparation for specialists.
 """
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler
 
 from ..config import TFT_MAX_ENCODER_LENGTH, TFT_MAX_PREDICTION_LENGTH
 from ..utils.logger import get_logger
 
 logger = get_logger()
-
-
-def _robust_scale(df: pd.DataFrame, columns: list[str]) -> tuple[pd.DataFrame, RobustScaler]:
-    """Apply RobustScaler to columns; handle NaNs."""
-    scaler = RobustScaler()
-    df = df.copy()
-    for col in columns:
-        if col not in df.columns:
-            continue
-        mask = df[col].notna()
-        if mask.sum() < 2:
-            continue
-        df.loc[mask, col] = scaler.fit_transform(df.loc[mask, [col]].values)
-    return df, scaler
 
 
 def prepare_tft_data(
@@ -53,7 +38,7 @@ def prepare_tft_data(
 
     # Rolling features
     df["vol_20d"] = df["return_1d"].rolling(20).std()
-    df["vol_20d"] = df["vol_20d"].bfill().fillna(0)
+    df["vol_20d"] = df["vol_20d"].fillna(0)
     df["return_1d"] = df["return_1d"].fillna(0)
 
     # Drop rows without valid target (for training only)
@@ -82,7 +67,7 @@ def prepare_tft_data_inference(
     df["forward_return_30d"] = 0.0
     df[group_id] = ticker if ticker else "asset"
     df["vol_20d"] = df["return_1d"].rolling(20).std()
-    df["vol_20d"] = df["vol_20d"].bfill().fillna(0)
+    df["vol_20d"] = df["vol_20d"].fillna(0)
     df["return_1d"] = df["return_1d"].fillna(0)
     return df
 
@@ -102,7 +87,7 @@ def prepare_regime_features(spy_df: pd.DataFrame, window: int = 20) -> pd.DataFr
 
     df["return"] = df["close"].pct_change()
     df["vol"] = df["return"].rolling(window).std()
-    df["vol"] = df["vol"].bfill().fillna(0)
+    df["vol"] = df["vol"].fillna(0)
     df["return_5d"] = df["close"].pct_change(5)
     df["return_20d"] = df["close"].pct_change(window)
     if "volume" in df.columns:
@@ -141,7 +126,7 @@ def add_momentum_features(df: pd.DataFrame, window: int = 20, rsi_period: int = 
     low = df["low"] if "low" in df.columns else df["close"]
     tr = np.maximum(high - low, np.maximum(abs(high - df["close"].shift(1)), abs(low - df["close"].shift(1))))
     df["atr"] = tr.rolling(rsi_period, min_periods=1).mean()
-    df["atr"] = df["atr"].replace(0, np.nan).bfill().fillna(0.01)
+    df["atr"] = df["atr"].replace(0, np.nan).fillna(0.01)
     df["return_1d"] = df["return_1d"].fillna(0)
     df["return_5d"] = df["return_5d"].fillna(0)
     df["return_20d"] = df["return_20d"].fillna(0)

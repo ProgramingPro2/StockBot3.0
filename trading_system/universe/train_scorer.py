@@ -63,14 +63,22 @@ def train_scorer_from_returns(
     n_estimators: int = 100,
     max_depth: int = 4,
     learning_rate: float = 0.05,
+    test_window_days: int | None = None,
 ) -> None:
     """
     Build X (feature matrix) and y (binary: 1 if forward return in top quartile) from aligned returns.
     returns_array: shape (n_days, n_assets). Train ScorerModel and save.
+
+    test_window_days: number of trailing days to reserve as a temporal holdout (not used for
+        training). Defaults to forward_days so the scorer is never fit on the most recent
+        rows used for evaluation. Set to 0 to disable.
     """
     n_days = returns_array.shape[0]
     min_start = window
-    max_start = n_days - forward_days - 1
+    # Reserve the final test_window_days rows so the scorer is not trained on rows that
+    # will be used for out-of-sample evaluation.
+    holdout = test_window_days if test_window_days is not None else forward_days
+    max_start = n_days - forward_days - 1 - max(0, holdout)
     if max_start <= min_start:
         logger.error("Insufficient history for training universe scorer (need %d+ days)", window + forward_days)
         return

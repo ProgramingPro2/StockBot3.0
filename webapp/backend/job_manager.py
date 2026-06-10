@@ -34,6 +34,7 @@ ALL_KINDS: set[JobKind] = {
     "autodiscover",
     "train-universe",
     "benchmark-device",
+    "specialist-cache",
     "test",
 }
 
@@ -131,12 +132,15 @@ def _argv_for(kind: JobKind, params: dict[str, Any]) -> list[str]:
         "use_tuned": "--use-tuned",
         "retrain": "--retrain",
         "ignore_early_stopping": "--ignore-early-stopping",
+        "walk_forward": "--walk-forward",
+        "in_sample": "--in-sample",
         "autodiscover": "--autodiscover",
         "save": "--save",
         "single_thread": "--single-thread",
         "new": "--new",
         "debug": "--debug",
         "torch_vec": "--torch-vec",
+        "force_rebuild": "--force-rebuild",
     }
     value_flags = {
         "timesteps": "--timesteps",
@@ -156,6 +160,10 @@ def _argv_for(kind: JobKind, params: dict[str, Any]) -> list[str]:
         "learning_rate": "--learning-rate",
         "tuned_study": "--tuned-study",
         "parallel_trials": "--parallel-trials",
+        "start": "--start",
+        "end": "--end",
+        "refit_every": "--refit-every",
+        "window": "--window",
     }
     for key, flag in value_flags.items():
         if key in params and params[key] is not None and params[key] != "":

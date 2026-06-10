@@ -2,6 +2,7 @@
 Historical feature store: point-in-time price/volume features from OHLCV only.
 No future data or external APIs; used for training, tuning, and backtest.
 """
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,8 @@ from .processor import add_momentum_features
 logger = get_logger()
 
 FEATURE_STORE_CACHE_DIR = CACHE_DIR / "feature_store"
+# Bump this string whenever the feature schema changes to invalidate existing caches.
+_FEATURE_STORE_SCHEMA_VERSION = "v1"
 # Feature names that match PPO observation schema (price/volume-only subset)
 PRICE_VOLUME_FEATURE_NAMES = [
     "return_1d",
@@ -30,6 +33,12 @@ PRICE_VOLUME_FEATURE_NAMES = [
     "rolling_return_21d",
     "rolling_vol_21d",
 ]
+
+
+def _feature_cache_suffix(window: int) -> str:
+    """Short hash of feature names + window + schema version for cache invalidation."""
+    sig = str(sorted(PRICE_VOLUME_FEATURE_NAMES)) + str(window) + _FEATURE_STORE_SCHEMA_VERSION
+    return hashlib.md5(sig.encode()).hexdigest()[:8]
 
 
 def _build_single_ticker_features(
@@ -53,7 +62,7 @@ def _build_single_ticker_features(
     df["return_5d"] = df["close"].pct_change(5)
     df["return_20d"] = df["close"].pct_change(window)
     df["vol_20d"] = df["return_1d"].rolling(window).std()
-    df["vol_20d"] = df["vol_20d"].bfill().fillna(0.01)
+    df["vol_20d"] = df["vol_20d"].fillna(0.01)
     # ATR as percent of price (normalized)
     atr = df["atr"] if "atr" in df.columns else df["close"].rolling(14).std().fillna(0.01)
     df["atr_pct"] = (atr / (df["close"] + 1e-12)).clip(0, 0.5)
@@ -64,7 +73,8 @@ def _build_single_ticker_features(
     df["volatility_score"] = np.clip(0.5 + vol_norm, 0.0, 1.0)
     # Volume ratio: current / 20d mean
     if "volume" in df.columns:
-        vol_ma = df["volume"].rolling(window).mean().replace(0, np.nan).bfill()
+        # ffill propagates the last known MA forward (no lookahead); fillna(1.0) handles start-of-series.
+        vol_ma = df["volume"].rolling(window).mean().replace(0, np.nan).ffill().fillna(1.0)
         df["volume_ratio"] = (df["volume"] / vol_ma).fillna(1.0).clip(0, 5)
     else:
         df["volume_ratio"] = 1.0
@@ -77,7 +87,7 @@ def _build_single_ticker_features(
     cols = [c for c in PRICE_VOLUME_FEATURE_NAMES if c in df.columns]
     out = df[cols].copy()
     out["ticker"] = ticker
-    return out.dropna(how="all").replace([np.inf, -np.inf], np.nan).ffill().bfill()
+    return out.dropna(how="all").replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
 
 
 def build_feature_dataset(
@@ -94,7 +104,9 @@ def build_feature_dataset(
     tickers = [t.strip().upper() for t in tickers if t.strip()]
     if not tickers:
         return None
-    cache_path = cache_path or (FEATURE_STORE_CACHE_DIR / "features.parquet")
+    if cache_path is None:
+        suffix = _feature_cache_suffix(window=21)
+        cache_path = FEATURE_STORE_CACHE_DIR / f"features_{suffix}.parquet"
     if use_cache and cache_path.exists():
         try:
             cached = pd.read_parquet(cache_path)

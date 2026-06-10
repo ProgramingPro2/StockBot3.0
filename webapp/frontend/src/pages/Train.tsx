@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Flame, Play, ExternalLink, Wand2 } from "lucide-react";
-import { ApiClient, type TuneStudySummary } from "../lib/api";
+import { Flame, Play, ExternalLink, Wand2, Database } from "lucide-react";
+import { ApiClient, type SpecialistCacheParams, type TuneStudySummary } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import JobControl from "../components/JobControl";
 import LogStream from "../components/LogStream";
@@ -34,13 +34,19 @@ export default function Train() {
   const [tunedStudy, setTunedStudy] = useState("");
   const [retrain, setRetrain] = useState(false);
   const [ignoreEarlyStopping, setIgnoreEarlyStopping] = useState(false);
+  const [walkForward, setWalkForward] = useState(false);
   const [nEnvs, setNEnvs] = useState<number | "">("");
   const [torchVec, setTorchVec] = useState(false);
   const [calibrationNote, setCalibrationNote] = useState<string | null>(null);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [cacheStart, setCacheStart] = useState("2015-01-01");
+  const [cacheEnd, setCacheEnd] = useState("");
+  const [cacheRefitEvery, setCacheRefitEvery] = useState<number | "">("");
+  const [cacheForceRebuild, setCacheForceRebuild] = useState(false);
 
   const job = useJobByKind("train");
+  const cacheJob = useJobByKind("specialist-cache");
   const jobId = activeJobId ?? job?.id ?? null;
 
   const result = useQuery({
@@ -81,7 +87,17 @@ export default function Train() {
     if (historicalRatio !== "") params.historical_ratio = historicalRatio;
     if (nEnvs !== "") params.n_envs = nEnvs;
     if (torchVec) params.torch_vec = true;
+    if (walkForward) params.walk_forward = true;
     return ApiClient.startTrain(params);
+  };
+
+  const onStartCache = async () => {
+    const params: SpecialistCacheParams = { start: cacheStart };
+    if (tickers) params.tickers = tickers;
+    if (cacheEnd) params.end = cacheEnd;
+    if (cacheRefitEvery !== "") params.refit_every = cacheRefitEvery;
+    if (cacheForceRebuild) params.force_rebuild = true;
+    return ApiClient.startSpecialistCache(params);
   };
 
   const applyCalibration = async () => {
@@ -234,6 +250,12 @@ export default function Train() {
               checked={ignoreEarlyStopping}
               onChange={setIgnoreEarlyStopping}
             />
+            <Toggle
+              label="Walk-forward evaluation"
+              hint="After training, run 3-fold expanding walk-forward evaluation and report mean out-of-sample Sharpe."
+              checked={walkForward}
+              onChange={setWalkForward}
+            />
           </div>
 
           <div className="pt-2">
@@ -242,6 +264,67 @@ export default function Train() {
               onStart={onStart}
               startLabel="Start training"
               startIcon={<Play className="h-4 w-4" />}
+              busyLabel="Submitting…"
+              onStarted={(info) => setActiveJobId(info.id)}
+            />
+          </div>
+
+          <div className="space-y-3 border-t border-bg-border pt-4">
+            <h2 className="flex items-center gap-2 text-base font-semibold">
+              <Database className="h-4 w-4" />
+              Specialist feature cache (Mode B)
+            </h2>
+            <p className="text-xs text-ink-muted leading-relaxed">
+              Pre-generates the walk-forward specialist feature matrix used when
+              FEATURE_SOURCE=specialist (set on the Config page). Uses the tickers field
+              above; takes minutes to hours depending on the date range. Training with
+              FEATURE_SOURCE=specialist reuses this cache automatically.
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Start date">
+                <input
+                  type="date"
+                  className="input"
+                  value={cacheStart}
+                  onChange={(e) => setCacheStart(e.target.value)}
+                />
+              </Field>
+              <Field label="End date" hint="Blank = today.">
+                <input
+                  type="date"
+                  className="input"
+                  value={cacheEnd}
+                  onChange={(e) => setCacheEnd(e.target.value)}
+                />
+              </Field>
+            </div>
+            <Field
+              label="Refit cadence (bars)"
+              hint="Walk-forward model refit interval; blank uses SPECIALIST_REFIT_EVERY_BARS (63 = quarterly)."
+            >
+              <input
+                type="number"
+                className="input"
+                min={21}
+                step={21}
+                value={cacheRefitEvery}
+                onChange={(e) =>
+                  setCacheRefitEvery(e.target.value === "" ? "" : parseInt(e.target.value, 10))
+                }
+                placeholder="default"
+              />
+            </Field>
+            <Toggle
+              label="Force rebuild"
+              hint="Regenerate even if a compatible cache exists."
+              checked={cacheForceRebuild}
+              onChange={setCacheForceRebuild}
+            />
+            <JobControl
+              job={cacheJob}
+              onStart={onStartCache}
+              startLabel="Build specialist cache"
+              startIcon={<Database className="h-4 w-4" />}
               busyLabel="Submitting…"
               onStarted={(info) => setActiveJobId(info.id)}
             />

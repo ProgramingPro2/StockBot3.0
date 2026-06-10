@@ -76,7 +76,35 @@ def _parse_news(raw: list, max_items: int) -> list[NewsItem]:
     return items
 
 
-def _fetch_alpaca_news(ticker: str, max_items: int) -> list[NewsItem]:
+def _parse_published(pub_str: str | None) -> datetime | None:
+    """Parse a news publication timestamp string into a UTC-aware datetime. Returns None on failure."""
+    if pub_str is None:
+        return None
+    # Unix timestamp (integer or float as string)
+    try:
+        return datetime.fromtimestamp(float(pub_str), tz=timezone.utc)
+    except (ValueError, TypeError, OSError):
+        pass
+    # ISO 8601 / RFC 3339
+    try:
+        return datetime.fromisoformat(str(pub_str).replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
+
+
+def _filter_as_of(items: list[NewsItem], as_of: datetime) -> list[NewsItem]:
+    """Remove articles whose publication timestamp is after as_of."""
+    cutoff = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
+    out: list[NewsItem] = []
+    for item in items:
+        pub = _parse_published(item.published)
+        if pub is None or pub <= cutoff:
+            out.append(item)
+    return out
+
+
+def _fetch_alpaca_news(ticker: str, max_items: int, as_of: datetime | None = None) -> list[NewsItem]:
     """Fetch news for ticker from Alpaca Data API (Benzinga). Returns [] if disabled or error."""
     if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
         return []
@@ -89,7 +117,9 @@ def _fetch_alpaca_news(ticker: str, max_items: int) -> list[NewsItem]:
     try:
         _throttle()
         client = NewsClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-        end = datetime.now(timezone.utc)
+        end = as_of or datetime.now(timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
         start = end - timedelta(days=7)
         req = NewsRequest(symbols=ticker.upper(), start=start, end=end, limit=max_items)
         news_set = client.get_news(req)
@@ -185,11 +215,19 @@ def _dedupe_and_rank(news: list[NewsItem], ticker: str, strict: bool = True) -> 
     return relevant
 
 
-def fetch_news(ticker: str, max_items: int = 20) -> list[NewsItem]:
+def fetch_news(
+    ticker: str,
+    max_items: int = 20,
+    as_of: datetime | None = None,
+) -> list[NewsItem]:
     """
     Fetch recent news for a ticker. Ticker-specific: uses Search(ticker) first (best for
     single-name tickers like AAPL, TSLA), then Ticker.news; merges, dedupes, and ranks
     items that mention the ticker higher so the LLM sees the most relevant content first.
+
+    as_of: when provided, articles published after this datetime are filtered out.
+        Live callers pass None (use current time). Historical/backtest callers must pass the
+        decision timestamp to prevent future news from leaking into observations.
     """
     ticker = ticker.upper()
     cache_path = _news_cache_path(ticker)
@@ -200,7 +238,8 @@ def fetch_news(ticker: str, max_items: int = 20) -> list[NewsItem]:
         try:
             with open(cache_path) as f:
                 raw = json.load(f)
-            return [NewsItem(**item) for item in raw]
+            items = [NewsItem(**item) for item in raw]
+            return _filter_as_of(items, as_of) if as_of is not None else items
         except Exception:
             return []
 
@@ -213,7 +252,7 @@ def fetch_news(ticker: str, max_items: int = 20) -> list[NewsItem]:
 
     for attempt in range(3):
         try:
-            from_alpaca = _fetch_alpaca_news(ticker, max_items)
+            from_alpaca = _fetch_alpaca_news(ticker, max_items, as_of=as_of)
             _throttle()
             search_raw: list = []
             ticker_raw: list = []
@@ -231,6 +270,8 @@ def fetch_news(ticker: str, max_items: int = 20) -> list[NewsItem]:
             from_search = _parse_news(search_raw, max_items)
             from_ticker = _parse_news(ticker_raw, max_items)
             combined = from_alpaca + from_search + [n for n in from_ticker if n not in from_search]
+            if as_of is not None:
+                combined = _filter_as_of(combined, as_of)
             if not combined:
                 if attempt < 2:
                     time.sleep(1 + attempt)

@@ -23,6 +23,10 @@ class ProxySpecialistFn:
     """
     Picklable callable that yields proxy specialist outputs from historical returns.
     Used by training and tuning with SubprocVecEnv.
+
+    After each call, ``last_start`` holds the sampled index so callers can generate
+    ``bootstrap_returns`` from ``returns_array[last_start : last_start + episode_days]``
+    to keep obs features and reward returns aligned to the same window.
     """
 
     def __init__(self, returns_array: np.ndarray, n_assets: int, window: int = 21):
@@ -32,6 +36,8 @@ class ProxySpecialistFn:
         self.n_days = self.returns_array.shape[0]
         # Approximate live proxy-sentiment staleness (same cadence as backtest; no Ollama).
         self._last_sentiment_vec: np.ndarray | None = None
+        # Start index used by the most recent call; readable by callers generating bootstrap_returns.
+        self.last_start: int = self.window
 
     def __call__(self) -> list[dict]:
         start = (
@@ -39,6 +45,7 @@ class ProxySpecialistFn:
             if self.n_days > self.window
             else self.window
         )
+        self.last_start = start
         n_every = sentiment_refresh_every_n_bars()
         refresh = self._last_sentiment_vec is None or random.random() < (1.0 / n_every)
         if refresh:

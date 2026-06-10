@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { BarChart3, Play } from "lucide-react";
-import { ApiClient } from "../lib/api";
+import { ApiClient, type ModelInfo, type ModelsResponse } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import JobControl from "../components/JobControl";
 import LogStream from "../components/LogStream";
@@ -13,23 +13,17 @@ import { useDefaultTickers } from "../hooks/useStaticConfig";
 import { formatBytes, formatRelative } from "../lib/format";
 import EquitySeriesChart from "../components/EquitySeriesChart";
 
-type Model = {
-  name: string;
-  path: string;
-  size_bytes: number;
-  mtime: number;
-};
-
 export default function Backtest() {
   const defaults = useDefaultTickers();
   const [tickers, setTickers] = useState("");
   const [model, setModel] = useState("");
+  const [inSample, setInSample] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
 
   const job = useJobByKind("backtest");
   const jobId = activeId ?? job?.id ?? null;
 
-  const models = useQuery<{ models: Model[] }>({
+  const models = useQuery<ModelsResponse>({
     queryKey: ["models"],
     queryFn: ApiClient.models,
     refetchInterval: 10_000,
@@ -49,6 +43,7 @@ export default function Backtest() {
     const params: Record<string, unknown> = {};
     if (tickers) params.tickers = tickers;
     if (model) params.model = model;
+    if (inSample) params.in_sample = true;
     return ApiClient.startBacktest(params);
   };
 
@@ -79,13 +74,30 @@ export default function Backtest() {
               onChange={(e) => setModel(e.target.value)}
             >
               <option value="">(default / latest)</option>
-              {(models.data?.models ?? []).map((m) => (
+              {(models.data?.models ?? []).map((m: ModelInfo) => (
                 <option key={m.name} value={m.name}>
-                  {m.name} · {formatBytes(m.size_bytes)} · {formatRelative(m.mtime)}
+                  {m.name}
+                  {m.feature_source ? ` [${m.feature_source}]` : ""}
+                  {" · "}
+                  {formatBytes(m.size_bytes)} · {formatRelative(m.mtime)}
                 </option>
               ))}
             </select>
           </Field>
+          <label className="flex items-start justify-between gap-3 rounded-lg border border-bg-border bg-bg-subtle px-3 py-2 text-sm cursor-pointer">
+            <span className="min-w-0">
+              <span className="block">In-sample mode</span>
+              <span className="mt-0.5 block text-xs text-ink-muted font-normal">
+                Default is out-of-sample (holds out the most recent test window per TEST_WINDOW_DAYS). Enable to evaluate on all available data instead.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 shrink-0 accent-accent"
+              checked={inSample}
+              onChange={(e) => setInSample(e.target.checked)}
+            />
+          </label>
           <JobControl
             job={job}
             onStart={onStart}

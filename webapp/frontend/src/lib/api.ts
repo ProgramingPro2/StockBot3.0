@@ -110,9 +110,11 @@ export const ApiClient = {
     api.post("/api/jobs/train-universe/start", params).then((r) => r.data.job),
   startBenchmark: (params: Record<string, unknown>) =>
     api.post("/api/jobs/benchmark/start", params).then((r) => r.data.job),
+  startSpecialistCache: (params: SpecialistCacheParams) =>
+    api.post("/api/jobs/specialist-cache/start", params).then((r) => r.data.job),
   stopJob: (id: string) => api.post(`/api/jobs/${id}/stop`).then((r) => r.data.job),
   killJob: (id: string) => api.post(`/api/jobs/${id}/kill`).then((r) => r.data.job),
-  models: () => api.get("/api/models").then((r) => r.data),
+  models: () => api.get<ModelsResponse>("/api/models").then((r) => r.data),
   setLiveDefault: (name: string | null) =>
     api.post("/api/models/live-default", null, { params: { name } }).then((r) => r.data),
   deleteModel: (name: string) =>
@@ -139,6 +141,32 @@ export const ApiClient = {
   system: () => api.get("/api/system").then((r) => r.data),
   getPpoCalibration: () =>
     api.get<PpoCalibration>("/api/system/ppo-calibration").then((r) => r.data),
+};
+
+export type SpecialistCacheParams = {
+  tickers?: string;
+  start?: string;
+  end?: string;
+  refit_every?: number;
+  window?: number;
+  force_rebuild?: boolean;
+};
+
+export type ModelInfo = {
+  name: string;
+  path: string;
+  size_bytes: number;
+  mtime: number;
+  is_default: boolean;
+  is_live_default: boolean;
+  feature_source?: string | null;
+  saved_at?: string | null;
+  n_assets?: number | null;
+};
+
+export type ModelsResponse = {
+  models: ModelInfo[];
+  live_default: string | null;
 };
 
 export type EnvVarRecord = {
