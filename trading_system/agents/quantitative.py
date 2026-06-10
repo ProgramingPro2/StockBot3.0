@@ -78,6 +78,7 @@ def _forecast_to_probability(forecast: float, scale: float = 20.0) -> float:
 def _ensure_model(
     ticker: str | list[str] | None = None,
     retrain: bool = False,
+    end_date: str | None = None,
 ) -> bool:
     """Load or train TFT model. ticker: single symbol, list of symbols (train on all), or None for SPY."""
     global _model, _training_dataset
@@ -102,7 +103,7 @@ def _ensure_model(
 
     parts: list[pd.DataFrame] = []
     for t in tickers:
-        df = load_ohlcv(t, lookback_years=YFINANCE_LOOKBACK_YEARS)
+        df = load_ohlcv(t, lookback_years=YFINANCE_LOOKBACK_YEARS, end=end_date)
         if df.empty or len(df) < TFT_MAX_ENCODER_LENGTH + TFT_MAX_PREDICTION_LENGTH + 100:
             logger.warning("Insufficient data for TFT training: %s", t)
             continue

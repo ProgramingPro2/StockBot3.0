@@ -226,10 +226,10 @@ PPO_LEARNING_RATE = 3e-4
 PPO_N_STEPS = int(os.getenv("PPO_N_STEPS", "2048"))
 PPO_BATCH_SIZE = int(os.getenv("PPO_BATCH_SIZE", "256"))
 PPO_N_EPOCHS = int(os.getenv("PPO_N_EPOCHS", "10"))
-PPO_GAMMA = 0.99
+PPO_GAMMA = float(os.getenv("PPO_GAMMA", "0.95"))
 PPO_GAE_LAMBDA = 0.95
 PPO_CLIP_RANGE = 0.2
-PPO_ENT_COEF = 0.01
+PPO_ENT_COEF = float(os.getenv("PPO_ENT_COEF", "0.03"))
 PPO_NET_ARCH: dict | list = None  # None = default; or {"pi": [64, 64], "vf": [64, 64]}
 PPO_TOTAL_TIMESTEPS = int(os.getenv("PPO_TOTAL_TIMESTEPS", "500000"))  # Try 1000000+ with --use-historical --use-tuned
 # Save checkpoint every N timesteps during training (0 = disable)
@@ -237,13 +237,16 @@ PPO_CHECKPOINT_FREQ = int(os.getenv("PPO_CHECKPOINT_FREQ", "100000"))
 PPO_CHECKPOINT_KEEP_LAST = int(os.getenv("PPO_CHECKPOINT_KEEP_LAST", "5"))
 OUTPUT_PLOT_KEEP_LAST = int(os.getenv("OUTPUT_PLOT_KEEP_LAST", "5"))
 # Early stopping: stop if eval reward has no improvement for this many consecutive evaluations (0 = disabled)
-PPO_EARLY_STOPPING_PATIENCE = int(os.getenv("PPO_EARLY_STOPPING_PATIENCE", "5"))
+PPO_EARLY_STOPPING_PATIENCE = int(os.getenv("PPO_EARLY_STOPPING_PATIENCE", "3"))
 # Eval every N timesteps for early stopping; 0 = no early stopping
 PPO_EARLY_STOPPING_EVAL_FREQ = int(os.getenv("PPO_EARLY_STOPPING_EVAL_FREQ", "50000"))
 # Minimum improvement in eval reward to count as improvement
-PPO_EARLY_STOPPING_MIN_DELTA = float(os.getenv("PPO_EARLY_STOPPING_MIN_DELTA", "0.01"))
+PPO_EARLY_STOPPING_MIN_DELTA = float(os.getenv("PPO_EARLY_STOPPING_MIN_DELTA", "0.05"))
+# Stop immediately if val Sharpe drops more than this below its best (overfitting signal); 0 = disabled
+PPO_EARLY_STOPPING_OVERFIT_THRESHOLD = float(os.getenv("PPO_EARLY_STOPPING_OVERFIT_THRESHOLD", "1.5"))
+PPO_WALK_FORWARD_FOLDS = int(os.getenv("PPO_WALK_FORWARD_FOLDS", "3"))
 # L2 regularization: Adam weight_decay (0 = disabled). Reduces overfitting.
-PPO_WEIGHT_DECAY = float(os.getenv("PPO_WEIGHT_DECAY", "0"))
+PPO_WEIGHT_DECAY = float(os.getenv("PPO_WEIGHT_DECAY", "0.0001"))
 # CPU threads for PPO when device=cpu; 0 = use all available
 PPO_CPU_THREADS = int(os.getenv("PPO_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 # Parallel envs for SubprocVecEnv / batched vec env; 1 = single env (no subprocess). With n_envs>1, total rollout = n_steps * n_envs
@@ -267,11 +270,15 @@ TEST_WINDOW_PLACEMENT = (
 
 # Environment
 # Reward: use rolling Sharpe only when we have enough steps; keep window <= episode length so reward is reachable
-ENV_EPISODE_DAYS = int(os.getenv("ENV_EPISODE_DAYS", "42"))  # ~2 months
+ENV_EPISODE_DAYS = int(os.getenv("ENV_EPISODE_DAYS", "126"))  # ~6 months
 ENV_ROLLING_SHARPE_DAYS = min(252, max(5, ENV_EPISODE_DAYS - 5))  # reachable within episode
 ENV_REWARD_DRAWDOWN_PENALTY = float(os.getenv("ENV_REWARD_DRAWDOWN_PENALTY", "0.7"))  # 0.3-1.0; stronger = more defensive
 ENV_OBS_ROLLING_FEATURES = True  # Add rolling return 5d/21d and vol 21d per asset
 ENV_ALLOW_CASH_EXPOSURE = os.getenv("ENV_ALLOW_CASH_EXPOSURE", "true").lower() in ("1", "true", "yes")  # When True, sum(action) = total exposure (capped at 1); rest in cash
+
+# Proxy feature normalization
+PROXY_XSRANK_ENABLED = os.getenv("PROXY_XSRANK_ENABLED", "true").lower() in ("1", "true", "yes")
+PROXY_EXPANDING_ZSCORE = os.getenv("PROXY_EXPANDING_ZSCORE", "true").lower() in ("1", "true", "yes")
 
 # Headless matplotlib
 import matplotlib

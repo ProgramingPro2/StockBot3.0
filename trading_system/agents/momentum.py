@@ -28,12 +28,15 @@ logger = get_logger()
 FEATURE_COLS = ["return_5d", "return_20d", "rsi", "atr"]
 
 
-def _build_training_data_single_pass(tickers: list[str]) -> tuple[pd.DataFrame, np.ndarray]:
+def _build_training_data_single_pass(
+    tickers: list[str],
+    end_date: str | None = None,
+) -> tuple[pd.DataFrame, np.ndarray]:
     """Build feature matrix and target in one pass per ticker."""
     X_list: list[pd.DataFrame] = []
     y_list: list[np.ndarray] = []
     for ticker in tickers:
-        df = load_ohlcv(ticker, lookback_years=min(5, YFINANCE_LOOKBACK_YEARS))
+        df = load_ohlcv(ticker, lookback_years=min(5, YFINANCE_LOOKBACK_YEARS), end=end_date)
         if df.empty or len(df) < MOMENTUM_WINDOW_DAYS + MOMENTUM_FORWARD_DAYS + 10:
             continue
         df = add_momentum_features(df, window=20)
@@ -59,7 +62,11 @@ _imputer: SimpleImputer | None = None
 _scaler: StandardScaler | None = None
 
 
-def _ensure_model(tickers: list[str] | None = None, retrain: bool = False) -> bool:
+def _ensure_model(
+    tickers: list[str] | None = None,
+    retrain: bool = False,
+    end_date: str | None = None,
+) -> bool:
     """Load or train Momentum model."""
     global _model, _imputer, _scaler
 
@@ -78,7 +85,7 @@ def _ensure_model(tickers: list[str] | None = None, retrain: bool = False) -> bo
     if tickers is None:
         tickers = ["SPY", "IWM", "XLE", "XLF", "EEM", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN"]
 
-    X, y = _build_training_data_single_pass(tickers)
+    X, y = _build_training_data_single_pass(tickers, end_date=end_date)
     if X.empty or len(X) < 100:
         logger.warning("Insufficient data for momentum model training")
         return False

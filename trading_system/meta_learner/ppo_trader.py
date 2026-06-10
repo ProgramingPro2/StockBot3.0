@@ -233,6 +233,7 @@ def _make_env_fn(
     daily_aux_features: np.ndarray | None = None,
     historical_trading_dates: Any = None,
     proxy_feature_cache: np.ndarray | None = None,
+    obs_noise_std: float = 0.0,
 ) -> gym.Env:
     """
     Picklable factory that creates one env for SubprocVecEnv.
@@ -251,6 +252,7 @@ def _make_env_fn(
             daily_aux_features=daily_aux_features,
             trading_dates=historical_trading_dates,
             proxy_feature_cache=proxy_feature_cache,
+            obs_noise_std=obs_noise_std,
         )
     elif mode == "mixed" and historical_returns is not None and 0 < historical_ratio < 1:
         hist_env = HistoricalTradingEnv(
@@ -259,6 +261,7 @@ def _make_env_fn(
             daily_aux_features=daily_aux_features,
             trading_dates=historical_trading_dates,
             proxy_feature_cache=proxy_feature_cache,
+            obs_noise_std=obs_noise_std,
         )
         synth_env = SpecialistWrapper(
             n_assets=n_assets,
@@ -366,6 +369,8 @@ class PPOTrader:
             logging.getLogger("boardroom").info(
                 "Training with tuned params (baseline eval reward: %.4f)", best_value
             )
+        # Extract env-level params early so they don't reach the PPO constructor.
+        train_obs_noise_std = float(kwargs.pop("obs_noise_std", 0.0))
 
         specialist_fn = specialist_fn  # None => use _random_specialist_outputs in factory
         n_envs = n_envs if n_envs is not None else PPO_N_ENVS
@@ -448,6 +453,7 @@ class PPOTrader:
                     daily_aux_features=daily_aux_features,
                     historical_trading_dates=historical_trading_dates,
                     proxy_feature_cache=proxy_feature_cache,
+                    obs_noise_std=train_obs_noise_std,
                 )
         else:
             env_fns = [
@@ -462,6 +468,7 @@ class PPOTrader:
                     daily_aux_features=daily_aux_features,
                     historical_trading_dates=historical_trading_dates,
                     proxy_feature_cache=proxy_feature_cache,
+                    obs_noise_std=train_obs_noise_std,
                 )
                 for i in range(n_envs)
             ]
@@ -529,10 +536,13 @@ class PPOTrader:
             policy_kwargs = kwargs.pop("policy_kwargs", None) or PPO_NET_ARCH
             if policy_kwargs is None:
                 policy_kwargs = {}
-            if isinstance(policy_kwargs, dict) and PPO_WEIGHT_DECAY > 0:
+            # Tuned weight_decay takes precedence over the config default.
+            wd = float(kwargs.pop("weight_decay", PPO_WEIGHT_DECAY))
+            if isinstance(policy_kwargs, dict) and wd > 0:
                 policy_kwargs = dict(policy_kwargs)
                 policy_kwargs.setdefault("optimizer_kwargs", {})
-                policy_kwargs["optimizer_kwargs"]["weight_decay"] = PPO_WEIGHT_DECAY
+                policy_kwargs["optimizer_kwargs"]["weight_decay"] = wd
+            vf_coef = float(kwargs.pop("vf_coef", 0.5))
             self.model = PPO(
                 "MlpPolicy",
                 env,
@@ -544,6 +554,7 @@ class PPOTrader:
                 gae_lambda=kwargs.pop("gae_lambda", PPO_GAE_LAMBDA),
                 clip_range=kwargs.pop("clip_range", PPO_CLIP_RANGE),
                 ent_coef=kwargs.pop("ent_coef", PPO_ENT_COEF),
+                vf_coef=vf_coef,
                 policy_kwargs=policy_kwargs,
                 device=device,
                 verbose=1,

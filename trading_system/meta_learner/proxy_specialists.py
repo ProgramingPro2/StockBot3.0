@@ -7,7 +7,40 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ..config import ENV_OBS_ROLLING_FEATURES
+from ..config import ENV_OBS_ROLLING_FEATURES, PROXY_XSRANK_ENABLED, PROXY_EXPANDING_ZSCORE
+
+
+def _cross_sectional_rank(x: np.ndarray) -> np.ndarray:
+    """Rank values cross-sectionally across assets; returns percentile rank in [-1, 1].
+    With only 1 asset there is nothing to rank against, so returns zeros."""
+    n = len(x)
+    if n <= 1:
+        return np.zeros_like(x, dtype=np.float32)
+    ranks = np.argsort(np.argsort(x)).astype(np.float32)
+    return ((ranks / max(n - 1, 1)) * 2.0 - 1.0).astype(np.float32)
+
+
+def _expanding_zscore_3d(matrix: np.ndarray, min_periods: int = 63) -> np.ndarray:
+    """
+    Apply expanding-window z-score normalization along the time axis (axis 0).
+    Uses Welford-style cumulative stats for O(n) time complexity.
+    Shape: (n_days, n_assets, n_features). Returns values clipped to [-1, 1].
+    Before min_periods is reached, returns the original values (no normalization applied).
+    """
+    out = matrix.copy().astype(np.float64)
+    mat = matrix.astype(np.float64)
+    running_sum = np.zeros_like(mat[0])
+    running_sq  = np.zeros_like(mat[0])
+    for t in range(len(mat)):
+        running_sum += mat[t]
+        running_sq  += mat[t] ** 2
+        count = t + 1
+        if count >= min_periods:
+            mu    = running_sum / count
+            var   = running_sq / count - mu ** 2
+            sigma = np.sqrt(np.maximum(var, 1e-8))
+            out[t] = np.clip((mat[t] - mu) / sigma, -3.0, 3.0) / 3.0
+    return out.astype(np.float32)
 
 
 def normalize_action_max_unit_exposure(action: np.ndarray) -> np.ndarray:
@@ -94,6 +127,12 @@ def proxy_specialists_vectorized(returns_2d: np.ndarray) -> np.ndarray:
     ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
     vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
 
+    if PROXY_XSRANK_ENABLED and returns_2d.shape[1] > 1:
+        sentiment = _cross_sectional_rank(sentiment)
+        momentum = _cross_sectional_rank(momentum)
+        quant_prob = np.clip((_cross_sectional_rank(np.clip(mean_ret * 20, -0.5, 0.5)) + 1.0) / 2.0, 0.0, 1.0)
+        relative_strength = _cross_sectional_rank(mean_ret)
+
     return np.column_stack(
         (
             sentiment,
@@ -149,6 +188,13 @@ def proxy_specialists_vectorized_batch(windows: np.ndarray) -> np.ndarray:
     ret_5d_norm = np.clip(ret_5d * 50, -1, 1)
     ret_21d_norm = np.clip(ret_21d * 50, -1, 1)
     vol_21d_norm = np.clip((vol_21d - 0.01) * 50, -1, 1)
+
+    if PROXY_XSRANK_ENABLED and M > 1:
+        sentiment = np.apply_along_axis(_cross_sectional_rank, axis=1, arr=sentiment)
+        momentum = np.apply_along_axis(_cross_sectional_rank, axis=1, arr=momentum)
+        _trend_ranked = np.apply_along_axis(_cross_sectional_rank, axis=1, arr=np.clip(mean_ret * 20, -0.5, 0.5))
+        quant_prob = np.clip((_trend_ranked + 1.0) / 2.0, 0.0, 1.0)
+        relative_strength = np.apply_along_axis(_cross_sectional_rank, axis=1, arr=mean_ret)
 
     return np.stack(
         (
@@ -256,6 +302,8 @@ def precompute_proxy_feature_matrix(returns_matrix: np.ndarray, window: int = 21
     n_feat = n - window
     batch = win[:n_feat]
     out[window:] = proxy_specialists_vectorized_batch(batch)
+    if PROXY_EXPANDING_ZSCORE:
+        out = _expanding_zscore_3d(out)
     return out
 
 

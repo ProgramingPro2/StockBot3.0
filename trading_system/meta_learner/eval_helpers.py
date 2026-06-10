@@ -7,8 +7,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import torch
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.utils import obs_as_tensor
 
+from ..config import PPO_EARLY_STOPPING_OVERFIT_THRESHOLD
 from .env import HistoricalTradingEnv
 
 
@@ -24,6 +27,15 @@ def _compute_annualized_sharpe(returns: np.ndarray) -> float:
     if not np.isfinite(sharpe):
         return 0.0
     return float(sharpe)
+
+
+def _predict_actions_deterministic(model: Any, obs: np.ndarray) -> np.ndarray:
+    """Fast deterministic policy inference on the model device (avoids SB3 predict overhead)."""
+    device = model.device
+    obs_t = obs_as_tensor(np.asarray(obs, dtype=np.float32).reshape(1, -1), device)
+    with torch.inference_mode():
+        actions, _, _ = model.policy.forward(obs_t, deterministic=True)
+    return actions.detach().cpu().numpy().reshape(-1).astype(np.float32)
 
 
 def _deterministic_validation_walk_core(
@@ -44,7 +56,7 @@ def _deterministic_validation_walk_core(
 
     daily_returns: list[float] = []
     while env._cursor < env.n_days - 1:
-        action, _ = model.predict(obs, deterministic=True)
+        action = _predict_actions_deterministic(model, obs)
         obs, _, terminated, truncated, info = env.step(action)
         daily_returns.append(float(info.get("return", 0.0)))
         if terminated or truncated:
@@ -109,6 +121,8 @@ class SharpeEvalCallback(BaseCallback):
         trading_dates: np.ndarray | pd.DatetimeIndex | list | None = None,
         proxy_feature_cache: np.ndarray | None = None,
         optuna_trial: Any | None = None,
+        patience: int = 0,
+        overfit_threshold: float | None = None,
         verbose: int = 0,
     ):
         super().__init__(verbose=verbose)
@@ -116,6 +130,12 @@ class SharpeEvalCallback(BaseCallback):
         self.n_assets = n_assets
         self.eval_freq = int(eval_freq)
         self.min_delta = float(min_delta)
+        self.patience = max(0, int(patience))
+        # Use config default when not explicitly overridden; 0 disables the check.
+        if overfit_threshold is None:
+            overfit_threshold = PPO_EARLY_STOPPING_OVERFIT_THRESHOLD
+        self.overfit_threshold = max(0.0, float(overfit_threshold))
+        self._stagnant_evals = 0
         self.daily_aux_features = daily_aux_features
         self.trading_dates = trading_dates
         self.optuna_trial = optuna_trial
@@ -171,9 +191,21 @@ class SharpeEvalCallback(BaseCallback):
         if improved:
             self.best_mean_reward = self.last_mean_reward
             self.has_improved = True
+            self._stagnant_evals = 0
             if self.best_model_save_path is not None:
                 self.best_model_save_path.parent.mkdir(parents=True, exist_ok=True)
                 self.model.save(str(self.best_model_save_path))
+        else:
+            # Hard stop if val Sharpe has degraded sharply below its best (overfitting signal).
+            if (
+                self.overfit_threshold > 0.0
+                and self.best_mean_reward is not None
+                and self.last_mean_reward < (self.best_mean_reward - self.overfit_threshold)
+            ):
+                return False
+            self._stagnant_evals += 1
+            if self.patience > 0 and self._stagnant_evals >= self.patience:
+                return False
         return True
 
     def _on_training_end(self) -> None:

@@ -1,5 +1,6 @@
 .PHONY: help install web web-dev web-prod frontend-dev frontend-build \
-        docker-build docker-up docker-up-ollama docker-down test cli
+        docker-build docker-up docker-up-ollama docker-down test cli \
+        mps-start mps-stop mps-status mps-restart mps-install-profile mps-install-systemd
 
 PYTHON ?= python
 HOST ?= 0.0.0.0
@@ -21,6 +22,13 @@ help:
 	@echo "  docker-up          Run webapp + tensorboard with GPU"
 	@echo "  docker-up-ollama   Same as docker-up plus the Ollama service"
 	@echo "  docker-down        Stop everything"
+	@echo ""
+	@echo "  mps-start          Start NVIDIA MPS (multi-user; needs sudo)"
+	@echo "  mps-stop           Stop NVIDIA MPS"
+	@echo "  mps-status         MPS daemon + GPU utilization"
+	@echo "  mps-restart        Stop then start MPS"
+	@echo "  mps-install-profile  Install /etc/profile.d snippet (sudo)"
+	@echo "  mps-install-systemd  Install systemd unit for boot-time MPS (sudo)"
 
 install:
 	$(PYTHON) -m pip install -r requirements.txt -r requirements-web.txt
@@ -57,3 +65,27 @@ docker-up-ollama:
 
 docker-down:
 	docker compose -f docker/docker-compose.yml --profile ollama down
+
+# NVIDIA MPS: multiplex CUDA compute (tune + Docker Ollama + host ComfyUI). Graphics apps are unaffected.
+mps-start:
+	sudo bash scripts/nvidia-mps.sh start
+
+mps-stop:
+	sudo bash scripts/nvidia-mps.sh stop
+
+mps-status:
+	bash scripts/nvidia-mps.sh status
+
+mps-restart:
+	sudo bash scripts/nvidia-mps.sh restart
+
+mps-install-profile:
+	sudo cp docker/nvidia-mps-profile.sh /etc/profile.d/nvidia-mps.sh
+	sudo chmod 644 /etc/profile.d/nvidia-mps.sh
+	@echo "Installed /etc/profile.d/nvidia-mps.sh — open a new shell or: source /etc/profile.d/nvidia-mps.sh"
+
+mps-install-systemd:
+	sudo cp docker/nvidia-mps.service /etc/systemd/system/nvidia-mps.service
+	sudo systemctl daemon-reload
+	sudo systemctl enable nvidia-mps.service
+	@echo "Enabled nvidia-mps.service — start with: sudo systemctl start nvidia-mps"

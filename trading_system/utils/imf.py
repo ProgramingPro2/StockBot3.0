@@ -11,6 +11,11 @@ from typing import Union
 import numpy as np
 import pandas as pd
 
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+
 SessionKey = Union[date, int]
 
 
@@ -147,4 +152,81 @@ def rebalance_multi_asset(
                 continue
             new_effective[i] = float(target_holdings[i])
             new_sell[i] = bar_index
+    return new_effective, new_buy, new_sell
+
+
+def rebalance_multi_asset_batched(
+    effective_weights: "torch.Tensor",
+    target_holdings: "torch.Tensor",
+    portfolio_value: "torch.Tensor",
+    rebalance_band: "torch.Tensor",
+    bar_index: "torch.Tensor",
+    last_buy_bar: "torch.Tensor",
+    last_sell_bar: "torch.Tensor",
+    min_hold_bars: int,
+    min_reentry_bars: int,
+    *,
+    imf_restrictions_enabled: bool = False,
+    min_intraday_equity: float = 0.0,
+    intraday_multiplier: float = 1.0,
+    equity_dollars: "torch.Tensor | None" = None,
+) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """
+    Vectorized rebalance for ``(num_envs, n_assets)`` tensors on CUDA/CPU.
+
+    Matches ``rebalance_multi_asset`` when IMF restrictions are disabled (default).
+    """
+    if torch is None:
+        raise RuntimeError("torch is required for rebalance_multi_asset_batched")
+
+    new_effective = effective_weights.clone()
+    new_buy = last_buy_bar.clone()
+    new_sell = last_sell_bar.clone()
+
+    pv = portfolio_value.unsqueeze(-1)
+    band = rebalance_band.unsqueeze(-1)
+    bar = bar_index.unsqueeze(-1).to(dtype=new_buy.dtype)
+
+    current_value = pv * new_effective
+    target_value = pv * target_holdings
+
+    is_increase = target_value > current_value + band
+    is_decrease = current_value > target_value + band
+
+    if min_reentry_bars <= 0:
+        can_after_sell = bar > new_sell
+    else:
+        can_after_sell = (bar - new_sell) >= min_reentry_bars
+
+    if min_hold_bars <= 0:
+        can_after_buy = bar > new_buy
+    else:
+        can_after_buy = (bar - new_buy) >= min_hold_bars
+
+    bought_this_session = new_buy == bar
+
+    buy_mask = is_increase & can_after_sell
+    if imf_restrictions_enabled:
+        eq = equity_dollars if equity_dollars is not None else portfolio_value
+        mult = torch.where(
+            eq >= float(min_intraday_equity),
+            torch.tensor(float(intraday_multiplier), device=eq.device, dtype=eq.dtype),
+            torch.tensor(1.0, device=eq.device, dtype=eq.dtype),
+        )
+        intraday_bp = eq.unsqueeze(-1) * mult.unsqueeze(-1)
+        buy_notional = target_value - current_value
+        buy_mask = buy_mask & (buy_notional <= intraday_bp + 1e-6)
+
+    if imf_restrictions_enabled:
+        eq = equity_dollars if equity_dollars is not None else portfolio_value
+        allow_same_day = (eq >= float(min_intraday_equity)).unsqueeze(-1)
+        sell_allowed = can_after_buy | (bought_this_session & allow_same_day)
+    else:
+        sell_allowed = can_after_buy & ~bought_this_session
+
+    sell_mask = is_decrease & sell_allowed
+
+    new_effective = torch.where(buy_mask | sell_mask, target_holdings, new_effective)
+    new_buy = torch.where(buy_mask, bar, new_buy)
+    new_sell = torch.where(sell_mask, bar, new_sell)
     return new_effective, new_buy, new_sell

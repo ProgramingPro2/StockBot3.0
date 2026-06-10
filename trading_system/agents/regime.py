@@ -82,7 +82,7 @@ def _reconstruction_loss(x: torch.Tensor, recon: torch.Tensor, mu: torch.Tensor,
     return mse + 0.1 * kld
 
 
-def _ensure_model(retrain: bool = False) -> bool:
+def _ensure_model(retrain: bool = False, end_date: str | None = None) -> bool:
     """Load or train VAE + KMeans."""
     global _vae, _kmeans, _regime_labels, _scaler_mean, _scaler_std
 
@@ -110,7 +110,7 @@ def _ensure_model(retrain: bool = False) -> bool:
 
     # Train on SPY
     from ..config import YFINANCE_LOOKBACK_YEARS
-    spy = load_ohlcv("SPY", lookback_years=YFINANCE_LOOKBACK_YEARS)
+    spy = load_ohlcv("SPY", lookback_years=YFINANCE_LOOKBACK_YEARS, end=end_date)
     if spy.empty or len(spy) < 500:
         logger.warning("Insufficient SPY data for regime VAE")
         return False

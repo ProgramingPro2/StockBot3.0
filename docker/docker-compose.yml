@@ -14,6 +14,9 @@ services:
       BOARDROOM_TB_UPSTREAM: http://tensorboard:6006
       BOARDROOM_DISABLE_TB: "1"
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      # Connect to host NVIDIA MPS when enabled (make mps-start)
+      CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+      CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
     env_file:
       - ../.env
     volumes:
@@ -22,6 +25,8 @@ services:
       - ../trading_system/outputs:/app/trading_system/outputs
       - ../trading_system/models:/app/trading_system/models
       - ../trading_system/data/cache:/app/trading_system/data/cache
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -62,8 +67,13 @@ services:
     profiles: ["ollama"]
     ports:
       - "11434:11434"
+    environment:
+      CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+      CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
     volumes:
       - ollama-data:/root/.ollama
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
     deploy:
       resources:
         reservations:

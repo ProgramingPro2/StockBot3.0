@@ -273,12 +273,14 @@ def _load_aligned_returns(
     tickers: list[str],
     lookback_years: int | None = None,
     max_days: int | None = None,
+    end_date: str | None = None,
 ):
     """
     Load and align OHLCV returns for tickers.
     Returns (aligned_df, returns_array).
     lookback_years: years of history to load (default from config TRAIN_WINDOW_YEARS).
     max_days: if set, keep only the last max_days rows (explicit override only; default uses full loaded window).
+    end_date: if set, passed to load_ohlcv as the end date cutoff (YYYY-MM-DD string).
     """
     from ..config import TRAIN_WINDOW_YEARS
     from ..data.loader import load_ohlcv
@@ -286,7 +288,7 @@ def _load_aligned_returns(
     years = lookback_years if lookback_years is not None else TRAIN_WINDOW_YEARS
     dfs: list[pd.DataFrame] = []
     for t in tickers:
-        df = load_ohlcv(t, lookback_years=years)
+        df = load_ohlcv(t, lookback_years=years, end=end_date)
         if df.empty or len(df) < 252:
             return None, None
         df = df[["close"]].copy()
@@ -347,6 +349,35 @@ def _chronological_train_test_split(
     return train_returns, test_returns, aligned_train, aligned_test
 
 
+def _walk_forward_splits(
+    returns_array: np.ndarray,
+    aligned: pd.DataFrame,
+    n_folds: int = 3,
+    test_days: int = 252,
+    min_train_days: int = 504,
+) -> list[tuple]:
+    """
+    Expanding-window walk-forward splits.
+    Returns list of (train_returns, val_returns, test_returns, aligned_test) tuples in chronological order.
+    Each successive fold adds one more test_days block of training data.
+    """
+    n = len(returns_array)
+    splits = []
+    for i in range(n_folds):
+        test_end = n - i * test_days
+        test_start = test_end - test_days
+        train_end = test_start
+        if train_end < min_train_days + test_days:
+            continue
+        val_days = max(21, min(252, train_end // 5))
+        train_returns = returns_array[: train_end - val_days]
+        val_returns = returns_array[train_end - val_days : train_end]
+        test_returns = returns_array[test_start:test_end]
+        aligned_test = aligned.iloc[test_start:test_end]
+        splits.append((train_returns, val_returns, test_returns, aligned_test))
+    return list(reversed(splits))
+
+
 def _tuned_params_payload_for_train(args: argparse.Namespace) -> dict[str, Any] | None:
     """Best tuned hyperparameters dict for training, or None."""
     if not getattr(args, "use_tuned", False):
@@ -391,45 +422,6 @@ def cmd_train(args: argparse.Namespace) -> None:
     except Exception:  # noqa: BLE001
         pass
 
-    logger.info("Training specialists for %d tickers: %s", n_assets, tickers)
-    try:
-        parallel = os.environ.get("TRAIN_SPECIALISTS_PARALLEL", "1").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-
-        def _run_specialists_sequential() -> None:
-            ensure_quantitative(tickers, retrain=args.retrain)
-            ensure_fundamental(tickers)
-            ensure_regime(retrain=args.retrain)
-            ensure_momentum(tickers, retrain=args.retrain)
-
-        if parallel:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            futures = {}
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                futures[ex.submit(ensure_quantitative, tickers, args.retrain)] = "quantitative"
-                futures[ex.submit(ensure_fundamental, tickers)] = "fundamental"
-                futures[ex.submit(ensure_regime, args.retrain)] = "regime"
-                futures[ex.submit(ensure_momentum, tickers, args.retrain)] = "momentum"
-                for fut in as_completed(futures):
-                    name = futures[fut]
-                    try:
-                        fut.result()
-                    except BaseException:
-                        logger.exception("Specialist %s failed", name)
-                        raise
-        else:
-            _run_specialists_sequential()
-    except BaseException:
-        try:
-            record_end(run_boardroom_id, status="failed")
-        except Exception:  # noqa: BLE001
-            pass
-        raise
-
     historical_ratio = getattr(args, "historical_ratio", None)
     if historical_ratio is not None:
         pass
@@ -449,6 +441,8 @@ def cmd_train(args: argparse.Namespace) -> None:
     validation_returns = None
     aligned_full = None
     aligned_test = None
+    returns_array = None
+    _aligned_train = None
     if historical_ratio > 0:
         aligned_full, returns_array = _load_aligned_returns(tickers)
         if returns_array is not None and aligned_full is not None:
@@ -498,6 +492,53 @@ def cmd_train(args: argparse.Namespace) -> None:
         else:
             logger.warning("Could not load historical data; falling back to synthetic env")
             historical_ratio = 0.0
+
+    # Derive specialist cutoff: specialists must not train on data from inside the test window.
+    # We pass the last date of the training window so load_ohlcv excludes test-window data.
+    specialist_cutoff: str | None = (
+        str(_aligned_train.index[-1].date()) if _aligned_train is not None else None
+    )
+    if specialist_cutoff is not None:
+        logger.info("Specialist training cutoff: %s (test-window data excluded from specialist training)", specialist_cutoff)
+
+    logger.info("Training specialists for %d tickers: %s", n_assets, tickers)
+    try:
+        parallel = os.environ.get("TRAIN_SPECIALISTS_PARALLEL", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+        def _run_specialists_sequential() -> None:
+            ensure_quantitative(tickers, retrain=args.retrain, end_date=specialist_cutoff)
+            ensure_fundamental(tickers)
+            ensure_regime(retrain=args.retrain, end_date=specialist_cutoff)
+            ensure_momentum(tickers, retrain=args.retrain, end_date=specialist_cutoff)
+
+        if parallel:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            futures = {}
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures[ex.submit(ensure_quantitative, tickers, args.retrain, end_date=specialist_cutoff)] = "quantitative"
+                futures[ex.submit(ensure_fundamental, tickers)] = "fundamental"
+                futures[ex.submit(ensure_regime, args.retrain, end_date=specialist_cutoff)] = "regime"
+                futures[ex.submit(ensure_momentum, tickers, args.retrain, end_date=specialist_cutoff)] = "momentum"
+                for fut in as_completed(futures):
+                    name = futures[fut]
+                    try:
+                        fut.result()
+                    except BaseException:
+                        logger.exception("Specialist %s failed", name)
+                        raise
+        else:
+            _run_specialists_sequential()
+    except BaseException:
+        try:
+            record_end(run_boardroom_id, status="failed")
+        except Exception:  # noqa: BLE001
+            pass
+        raise
 
     logger.info("Training meta-learner (PPO)...")
     daily_aux_features = None
@@ -587,6 +628,60 @@ def cmd_train(args: argparse.Namespace) -> None:
         )
 
     train_use_torch_vec = True if getattr(args, "torch_vec", False) else None
+
+    if getattr(args, "walk_forward", False) and returns_array is not None and aligned_full is not None:
+        _wf_folds = int(os.environ.get("PPO_WALK_FORWARD_FOLDS", "3"))
+        wf_splits = _walk_forward_splits(returns_array, aligned_full, n_folds=_wf_folds)
+        if not wf_splits:
+            logger.warning("Walk-forward: not enough data for %d folds; skipping evaluation", _wf_folds)
+        else:
+            fold_sharpes: list[float] = []
+            for fold_idx, (fold_train, fold_val, fold_test, fold_aligned_test) in enumerate(wf_splits):
+                try:
+                    logger.info(
+                        "Walk-forward fold %d/%d: train=%d val=%d test=%d days",
+                        fold_idx + 1, len(wf_splits), len(fold_train), len(fold_val), len(fold_test),
+                    )
+                    fold_trader = PPOTrader(n_assets=n_assets, load=False)
+                    fold_specialist_fn = (
+                        create_proxy_specialist_fn(fold_train, n_assets) if len(fold_train) > 21 else None
+                    )
+                    fold_proxy_cache = None
+                    if len(fold_train) > 21:
+                        from ..meta_learner.proxy_specialists import precompute_proxy_feature_matrix as _wf_pcpm
+                        fold_proxy_cache = _wf_pcpm(np.asarray(fold_train, dtype=np.float32))
+                    fold_trader.train(
+                        total_timesteps=args.timesteps,
+                        specialist_fn=fold_specialist_fn,
+                        historical_returns=fold_train,
+                        historical_ratio=historical_ratio,
+                        validation_returns=fold_val,
+                        ppo_kwargs=ppo_kwargs,
+                        n_envs=getattr(args, "n_envs", None),
+                        proxy_feature_cache=fold_proxy_cache,
+                        ignore_early_stopping=getattr(args, "ignore_early_stopping", False),
+                        use_torch_vec=train_use_torch_vec,
+                    )
+                    fold_result = _run_backtest(tickers, fold_trader, aligned_df=fold_aligned_test)
+                    if fold_result is not None:
+                        _, fold_rets, _, _, _, _, _, _ = fold_result
+                        oos_sharpe = float(fold_rets.mean() / (fold_rets.std() + 1e-8) * (252 ** 0.5))
+                        fold_sharpes.append(oos_sharpe)
+                        logger.info("Walk-forward fold %d OOS Sharpe: %.3f", fold_idx + 1, oos_sharpe)
+                    else:
+                        logger.warning("Walk-forward fold %d backtest returned no result", fold_idx + 1)
+                except Exception:
+                    logger.exception("Walk-forward fold %d failed; continuing", fold_idx + 1)
+            if fold_sharpes:
+                logger.info(
+                    "Walk-forward OOS Sharpe: mean=%.3f std=%.3f folds=%s",
+                    np.mean(fold_sharpes),
+                    np.std(fold_sharpes),
+                    [round(s, 3) for s in fold_sharpes],
+                )
+            else:
+                logger.warning("Walk-forward: no folds completed successfully")
+
     dated_path = trader.train(
         total_timesteps=args.timesteps,
         specialist_fn=specialist_fn_for_train,
@@ -1091,7 +1186,7 @@ def cmd_tune(args: argparse.Namespace) -> None:
     import os
     import time
 
-    from ..config import PPO_PARALLEL_TRIALS
+    from ..config import PPO_N_ENVS, PPO_PARALLEL_TRIALS
     from ..meta_learner.tuner import PPO_TUNE_PARAMS_PATH, run_tuning, tune_best_params_json_path
 
     tickers = _tickers_from_args(args)
@@ -1102,12 +1197,15 @@ def cmd_tune(args: argparse.Namespace) -> None:
 
     n_trials = getattr(args, "n_trials", None) or 50
     timesteps = getattr(args, "timesteps", None) or 100_000
+    n_evaluations = getattr(args, "n_evaluations", None) or 3
+    eval_patience = getattr(args, "eval_patience", None) or 0
+    no_tb = bool(getattr(args, "no_tb", False))
     timeout = getattr(args, "timeout", 0) or 0
     start_new = getattr(args, "new", False)
     study_name_arg = getattr(args, "study_name", None)
     n_envs = getattr(args, "n_envs", None)
     if n_envs is None:
-        n_envs = min(32, os.cpu_count() or 8)
+        n_envs = PPO_N_ENVS
     parallel_trials = getattr(args, "parallel_trials", None)
     if parallel_trials is None:
         parallel_trials = PPO_PARALLEL_TRIALS
@@ -1202,10 +1300,11 @@ def cmd_tune(args: argparse.Namespace) -> None:
         return
 
     logger.info(
-        "Running hyperparameter tuning for %d tickers (%d trials, %d timesteps/trial, study=%s, n_envs=%s, parallel_trials=%s)...",
+        "Running hyperparameter tuning for %d tickers (%d trials, %d timesteps/trial, %d evals/trial, study=%s, n_envs=%s, parallel_trials=%s)...",
         n_assets,
         n_trials,
         timesteps,
+        n_evaluations,
         study_name,
         n_envs,
         parallel_trials,
@@ -1217,6 +1316,9 @@ def cmd_tune(args: argparse.Namespace) -> None:
         "n_assets": n_assets,
         "n_trials": n_trials,
         "n_timesteps": timesteps,
+        "n_evaluations": n_evaluations,
+        "eval_patience": eval_patience,
+        "disable_tensorboard": no_tb,
         "timeout": timeout if timeout > 0 else None,
         "n_envs": n_envs,
         "study_name": study_name,
@@ -1297,6 +1399,61 @@ def cmd_tune_status(args: argparse.Namespace) -> None:
         best_trial = info.get("best_trial")
         best_str = f" best_value=%.4f (trial %s)" % (best_value, best_trial) if best_value is not None else " (no completed trials)"
         logger.info("  %s: n_trials=%d%s", name, n_trials, best_str)
+
+
+def cmd_tune_export(args: argparse.Namespace) -> None:
+    """Export best params from a named study to its per-study JSON and the canonical ppo_tune_best.json."""
+    from ..meta_learner.tuner import (
+        PPO_TUNE_PARAMS_PATH,
+        export_best_params_after_study,
+        get_tune_status,
+        tune_best_params_json_path,
+    )
+
+    study_name = getattr(args, "study_name", None)
+    json_output = getattr(args, "json_output", False)
+
+    if study_name is None:
+        status = get_tune_status(study_name=None)
+        names = sorted(status.get("study_names", []))
+        if not names:
+            logger.error("No tuning studies found in storage.")
+            return
+        if sys.stdin.isatty():
+            study_name = _prompt_resume_study_name()
+        if not study_name:
+            logger.error(
+                "No study name provided. Use --study-name NAME. Available: %s",
+                ", ".join(repr(n) for n in names),
+            )
+            return
+
+    from ..meta_learner.tuner import _journal_storage_available
+
+    use_journal = _journal_storage_available()
+    per_study_path = tune_best_params_json_path(study_name)
+    best = export_best_params_after_study(
+        study_name,
+        per_study_path,
+        use_journal_storage=use_journal,
+    )
+    if not best:
+        logger.error("Study %r not found or has no completed trials.", study_name)
+        return
+
+    if json_output:
+        import json as _json
+        print(_json.dumps(best, indent=2))
+    else:
+        logger.info(
+            "Exported best params for study %r -> %s (also mirrored to %s)",
+            study_name,
+            per_study_path,
+            PPO_TUNE_PARAMS_PATH,
+        )
+        for k, v in best.items():
+            if k != "policy_kwargs":
+                logger.info("  %s: %s", k, v)
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:

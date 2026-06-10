@@ -317,6 +317,7 @@ class HistoricalTradingEnv(gym.Env):
         daily_aux_features: np.ndarray | None = None,
         trading_dates: np.ndarray | pd.DatetimeIndex | list | None = None,
         proxy_feature_cache: np.ndarray | None = None,
+        obs_noise_std: float = 0.0,
     ):
         """
         Args:
@@ -326,6 +327,8 @@ class HistoricalTradingEnv(gym.Env):
             trading_dates: Optional length n_days calendar index for IMF session keys.
             proxy_feature_cache: Optional (n_days, n_assets, 13) from precompute_proxy_feature_matrix;
                 when set, skips recomputing the proxy matrix (faster for tuning / SubprocVecEnv).
+            obs_noise_std: Std-dev of zero-mean Gaussian noise added to observations during
+                training. Acts as a regularizer (similar to input dropout). Set to 0.0 for eval.
         """
         super().__init__()
         self.returns_array = np.asarray(returns_array, dtype=np.float32)
@@ -346,6 +349,7 @@ class HistoricalTradingEnv(gym.Env):
             drawdown_penalty if drawdown_penalty is not None else ENV_REWARD_DRAWDOWN_PENALTY
         )
         self.render_mode = render_mode
+        self.obs_noise_std = float(obs_noise_std)
         self._obs_per_asset = _obs_features_per_asset()
 
         self.observation_space = spaces.Box(
@@ -492,6 +496,9 @@ class HistoricalTradingEnv(gym.Env):
         else:
             per_asset = np.column_stack((features[:, :10], holdings))  # (n_assets, 11)
         obs = per_asset.flatten().astype(np.float32)
+        if self.obs_noise_std > 0.0:
+            noise = self.np_random.standard_normal(obs.shape).astype(np.float32)
+            obs = np.clip(obs + self.obs_noise_std * noise, -1.0, 1.0)
         return _sanitize_obs(obs)
 
     def render(self) -> None:

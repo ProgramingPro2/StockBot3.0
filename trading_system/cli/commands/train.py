@@ -43,6 +43,11 @@ def register(app: typer.Typer) -> None:
             "--ignore-early-stopping",
             help="Train for the full timestep budget; do not stop on validation plateau.",
         ),
+        walk_forward: bool = typer.Option(
+            False,
+            "--walk-forward",
+            help="Run 3-fold expanding walk-forward evaluation and report mean out-of-sample Sharpe across market regimes.",
+        ),
         debug: bool = typer.Option(False, "--debug", help="Enable verbose specialist verification logging."),
         json_output: bool = typer.Option(False, "--json", help="Emit only machine-readable result and suppress Rich output."),
     ) -> None:
@@ -74,6 +79,7 @@ def register(app: typer.Typer) -> None:
                     "Parallel envs": str(n_envs or PPO_N_ENVS),
                     "Torch vec (historical)": str(torch_vec),
                     "Ignore early stopping": str(ignore_early_stopping),
+                    "Walk-forward eval": str(walk_forward),
                 },
             )
             trade_list((tickers or ",".join(TRADE_TICKERS)).split(","), title="Trade list")
@@ -89,6 +95,7 @@ def register(app: typer.Typer) -> None:
             n_envs=n_envs,
             torch_vec=torch_vec,
             ignore_early_stopping=ignore_early_stopping,
+            walk_forward=walk_forward,
             debug=debug,
         )
         cmd_train(args)

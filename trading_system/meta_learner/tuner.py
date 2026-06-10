@@ -17,6 +17,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import torch
+from optuna.distributions import CategoricalDistribution
 from optuna.pruners import HyperbandPruner, MedianPruner
 from optuna.samplers import TPESampler
 from optuna.exceptions import ExperimentalWarning
@@ -44,6 +45,14 @@ from .proxy_specialists import precompute_proxy_feature_matrix
 from .runs_index import make_run_id, record_end, record_start, tb_log_dir_for
 
 _log = logging.getLogger("boardroom")
+
+# Default categorical search spaces (new studies). Resumed studies must reuse the same choices
+# Optuna recorded on the first trial — see ``_categorical_choices``.
+_NET_ARCH_CHOICES = ("tiny", "small", "medium", "large")
+_N_STEPS_CHOICES = (2048, 4096, 8192)
+_BATCH_SIZE_CHOICES = (256, 512, 1024, 2048)
+_N_EPOCHS_CHOICES = (3, 5, 10)
+_VF_COEF_CHOICES = (0.25, 0.5, 1.0)
 
 # SubprocVecEnv cannot be created inside multiprocessing.Pool workers (they are daemon=True).
 _SUBPROC_WARNED = False
@@ -83,8 +92,59 @@ def _safe_vec_env_close(env: Any) -> None:
 
 PPO_TUNE_PARAMS_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_best.json"
 PPO_TUNE_STUDY_PATH = META_LEARNER_MODEL_DIR / "ppo_tune_study.db"
+PPO_TUNE_JOURNAL_DIR = META_LEARNER_MODEL_DIR / "ppo_tune_journal"
+PPO_TUNE_JOURNAL_LOG = PPO_TUNE_JOURNAL_DIR / "journal.log"
 
 _tune_rdb_storage: RDBStorage | None = None
+_tune_journal_storage: Any | None = None
+
+
+def _journal_storage_available() -> bool:
+    try:
+        from optuna.storages import JournalStorage  # noqa: F401
+        from optuna.storages.journal import JournalFileBackend  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def get_tune_journal_storage() -> Any:
+    """Append-only Optuna journal backend for parallel tuning (lower contention than SQLite)."""
+    global _tune_journal_storage
+    if _tune_journal_storage is None:
+        from optuna.storages import JournalStorage
+        from optuna.storages.journal import JournalFileBackend
+
+        PPO_TUNE_JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+        journal_log = str(PPO_TUNE_JOURNAL_LOG)
+        lock_obj = None
+        try:
+            from optuna.storages.journal import JournalFileSymlinkLock
+
+            lock_obj = JournalFileSymlinkLock(f"{journal_log}.lock")
+        except ImportError:
+            pass
+        backend = JournalFileBackend(journal_log, lock_obj=lock_obj)
+        _tune_journal_storage = JournalStorage(backend)
+    return _tune_journal_storage
+
+
+def get_tune_storage(*, use_journal_storage: bool = False) -> Any:
+    """Return Optuna storage backend (journal for parallel workers, SQLite otherwise)."""
+    if use_journal_storage and _journal_storage_available():
+        return get_tune_journal_storage()
+    return get_tune_rdb_storage()
+
+
+def split_tune_train_val(returns_array: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Split returns into train/validation slices used by tuning."""
+    returns_array = np.asarray(returns_array, dtype=np.float32)
+    n = len(returns_array)
+    val_size = max(21, min(252, n // 5))
+    if n > val_size + 252:
+        return returns_array[: n - val_size], returns_array[n - val_size :]
+    return returns_array, returns_array
 
 
 def get_tune_rdb_storage() -> RDBStorage:
@@ -126,6 +186,9 @@ def _pack_best_params_from_trial_raw(raw: dict[str, Any], best_value: float | No
         "gae_lambda": raw["gae_lambda"],
         "clip_range": raw["clip_range"],
         "ent_coef": raw["ent_coef"],
+        "vf_coef": raw.get("vf_coef", 0.5),
+        "weight_decay": raw.get("weight_decay", 0.0001),
+        "obs_noise_std": raw.get("obs_noise_std", 0.0),
         "policy_kwargs": _net_arch_from_name(raw.get("net_arch", "small")),
         "historical_ratio": raw.get("historical_ratio", 1.0),
     }
@@ -139,6 +202,19 @@ def load_tuned_params_from_study(study_name: str) -> dict[str, Any] | None:
     name = (study_name or "").strip()
     if not name:
         return None
+    storage = None
+    if PPO_TUNE_JOURNAL_LOG.exists() and _journal_storage_available():
+        try:
+            storage = get_tune_journal_storage()
+            study = optuna.load_study(study_name=name, storage=storage)
+            if study.best_trial is not None:
+                bv = float(study.best_value) if study.best_value is not None else float("nan")
+                return _pack_best_params_from_trial_raw(
+                    dict(study.best_trial.params),
+                    bv if math.isfinite(bv) else None,
+                )
+        except Exception:
+            pass
     if not PPO_TUNE_STUDY_PATH.exists():
         return None
     try:
@@ -169,39 +245,92 @@ def _get_ppo_device() -> str:
     return "cpu"
 
 
+def _categorical_choices(study: optuna.Study, name: str, default: tuple[Any, ...]) -> list[Any]:
+    """Reuse categorical choices from an existing study so resumed runs do not change the value space."""
+    for t in reversed(study.trials):
+        if name not in t.params:
+            continue
+        dist = t.distributions.get(name)
+        if isinstance(dist, CategoricalDistribution):
+            choices = list(dist.choices)
+            if choices != list(default) and len(study.trials) > 0:
+                _log.debug(
+                    "Study %r: reusing legacy categorical %s=%s (default would be %s)",
+                    study.study_name,
+                    name,
+                    choices,
+                    list(default),
+                )
+            return choices
+    if len(study.trials) > 0:
+        _log.debug(
+            "Study %r: no prior %s distribution; using default %s",
+            study.study_name,
+            name,
+            list(default),
+        )
+    return list(default)
+
+
 def sample_ppo_params(
     trial: optuna.Trial,
     fixed_historical_ratio: float | None = None,
 ) -> dict[str, Any]:
     """Sample PPO and env hyperparameters for a trial."""
+    study = trial.study
     if fixed_historical_ratio is not None:
         historical_ratio = max(0.0, min(1.0, fixed_historical_ratio))
     elif TRAIN_HISTORICAL_RATIO_OVERRIDE:
         historical_ratio = max(0.0, min(1.0, TRAIN_HISTORICAL_RATIO))
     else:
         historical_ratio = trial.suggest_float("historical_ratio", 0.1, 0.9)
+    weight_decay = trial.suggest_float("weight_decay", 1e-5, 5e-3, log=True)
+    vf_coef = trial.suggest_categorical(
+        "vf_coef",
+        _categorical_choices(study, "vf_coef", _VF_COEF_CHOICES),
+    )
+    obs_noise_std = trial.suggest_float("obs_noise_std", 0.0, 0.05)
     return {
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True),
-        "n_steps": trial.suggest_categorical("n_steps", [2048, 4096, 8192]),
-        "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024, 2048]),
-        "n_epochs": trial.suggest_categorical("n_epochs", [3, 5, 10]),
+        "n_steps": trial.suggest_categorical(
+            "n_steps",
+            _categorical_choices(study, "n_steps", _N_STEPS_CHOICES),
+        ),
+        "batch_size": trial.suggest_categorical(
+            "batch_size",
+            _categorical_choices(study, "batch_size", _BATCH_SIZE_CHOICES),
+        ),
+        "n_epochs": trial.suggest_categorical(
+            "n_epochs",
+            _categorical_choices(study, "n_epochs", _N_EPOCHS_CHOICES),
+        ),
         "gamma": trial.suggest_float("gamma", 0.95, 0.999),
         "gae_lambda": trial.suggest_float("gae_lambda", 0.9, 0.99),
         "clip_range": trial.suggest_float("clip_range", 0.1, 0.3),
         "ent_coef": trial.suggest_float("ent_coef", 1e-4, 0.1, log=True),
+        "vf_coef": float(vf_coef),
+        "weight_decay": float(weight_decay),
+        "obs_noise_std": float(obs_noise_std),
         "policy_kwargs": _sample_net_arch(trial),
         "historical_ratio": historical_ratio,
     }
 
 
 def _sample_net_arch(trial: optuna.Trial) -> dict:
-    arch = trial.suggest_categorical("net_arch", ["small", "medium", "large"])
-    if arch == "small":
+    arch = trial.suggest_categorical(
+        "net_arch",
+        _categorical_choices(trial.study, "net_arch", _NET_ARCH_CHOICES),
+    )
+    if arch == "tiny":
+        net_arch = {"pi": [64], "vf": [64]}
+    elif arch == "small":
         net_arch = {"pi": [64, 64], "vf": [64, 64]}
     elif arch == "medium":
         net_arch = {"pi": [128, 128], "vf": [128, 128]}
-    else:
+    elif arch == "large":
         net_arch = {"pi": [256, 256], "vf": [256, 256]}
+    else:
+        net_arch = {"pi": [64, 64], "vf": [64, 64]}
     return {"net_arch": net_arch}
 
 
@@ -210,7 +339,7 @@ def run_tuning(
     n_assets: int,
     n_trials: int = 50,
     n_timesteps: int = 100_000,
-    n_evaluations: int = 5,
+    n_evaluations: int = 3,
     n_eval_episodes: int = 10,
     timeout: int | None = None,
     n_envs: int | None = None,
@@ -222,6 +351,11 @@ def run_tuning(
     show_progress: bool = True,
     historical_trading_dates: Any = None,
     use_torch_vec: bool | None = None,
+    eval_patience: int = 0,
+    disable_tensorboard: bool = False,
+    precomputed_train_proxy: np.ndarray | None = None,
+    precomputed_val_proxy: np.ndarray | None = None,
+    use_journal_storage: bool = False,
 ) -> dict[str, Any]:
     """
     Run Optuna hyperparameter tuning.
@@ -245,13 +379,8 @@ def run_tuning(
 
     # Use a validation slice for eval so tuning does not overfit to the same data as training
     n = len(returns_array)
-    val_size = max(21, min(252, n // 5))
-    if n > val_size + 252:
-        train_returns = returns_array[: n - val_size]
-        val_returns = returns_array[n - val_size :]
-    else:
-        train_returns = returns_array
-        val_returns = returns_array
+    train_returns, val_returns = split_tune_train_val(returns_array)
+    val_size = len(val_returns) if len(train_returns) != len(val_returns) else max(21, min(252, n // 5))
 
     train_trading_dates = None
     val_trading_dates = None
@@ -265,10 +394,16 @@ def run_tuning(
         else:
             val_trading_dates = td[: len(val_returns)]
 
-    train_proxy_cache = precompute_proxy_feature_matrix(train_returns)
-    val_proxy_cache = None
-    if len(val_returns) > 21:
+    if precomputed_train_proxy is not None:
+        train_proxy_cache = precomputed_train_proxy
+    else:
+        train_proxy_cache = precompute_proxy_feature_matrix(train_returns)
+    if precomputed_val_proxy is not None:
+        val_proxy_cache = precomputed_val_proxy
+    elif len(val_returns) > 21:
         val_proxy_cache = precompute_proxy_feature_matrix(val_returns)
+    else:
+        val_proxy_cache = None
 
     proxy_specialist_fn = create_proxy_specialist_fn(train_returns, n_assets)
 
@@ -286,7 +421,18 @@ def run_tuning(
             os.environ.setdefault("OMP_NUM_THREADS", "1")
 
         params = sample_ppo_params(trial, fixed_historical_ratio=fixed_historical_ratio)
+        if params["n_steps"] * n_envs > n_timesteps:
+            raise optuna.TrialPruned()
         historical_ratio = params.pop("historical_ratio")
+        trial_weight_decay = float(params.pop("weight_decay", 0.0001))
+        trial_vf_coef = float(params.pop("vf_coef", 0.5))
+        trial_obs_noise_std = float(params.pop("obs_noise_std", 0.0))
+        # Apply weight decay (L2 regularization) via Adam optimizer_kwargs
+        pk = params.get("policy_kwargs") or {}
+        pk = dict(pk)
+        pk.setdefault("optimizer_kwargs", {})
+        pk["optimizer_kwargs"]["weight_decay"] = trial_weight_decay
+        params["policy_kwargs"] = pk
 
         if historical_ratio >= 1.0:
             mode = "historical"
@@ -333,6 +479,7 @@ def run_tuning(
                     daily_aux_features=None,
                     historical_trading_dates=train_trading_dates,
                     proxy_feature_cache=train_proxy_cache,
+                    obs_noise_std=trial_obs_noise_std,
                 )
         else:
             env_fns = [
@@ -347,6 +494,7 @@ def run_tuning(
                     daily_aux_features=None,
                     historical_trading_dates=train_trading_dates,
                     proxy_feature_cache=train_proxy_cache,
+                    obs_noise_std=trial_obs_noise_std,
                 )
                 for i in range(n_envs)
             ]
@@ -374,31 +522,39 @@ def run_tuning(
                         env = SubprocVecEnv(env_fns)
 
         env = VecMonitor(env) if isinstance(env, VecEnv) else Monitor(env)
-        run_id = make_run_id(f"tune_t{trial.number}")
-        tb_dir = tb_log_dir_for(run_id)
-        try:
-            record_start(
-                run_id,
-                "tune",
-                timesteps=int(n_timesteps),
-                extra={
-                    "trial": int(trial.number),
-                    "study": study_name,
-                    "params": {k: params.get(k) for k in (
-                        "learning_rate",
-                        "n_steps",
-                        "batch_size",
-                        "n_epochs",
-                        "gamma",
-                        "gae_lambda",
-                        "clip_range",
-                        "ent_coef",
-                        "historical_ratio",
-                    )},
-                },
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        run_id: str | None = None
+        tb_log_name: str | None = None
+        if not disable_tensorboard:
+            run_id = make_run_id(f"tune_t{trial.number}")
+            tb_dir = tb_log_dir_for(run_id)
+            tb_log_name = run_id
+            try:
+                record_start(
+                    run_id,
+                    "tune",
+                    timesteps=int(n_timesteps),
+                    extra={
+                        "trial": int(trial.number),
+                        "study": study_name,
+                        "params": {
+                            **{k: params.get(k) for k in (
+                                "learning_rate",
+                                "n_steps",
+                                "batch_size",
+                                "n_epochs",
+                                "gamma",
+                                "gae_lambda",
+                                "clip_range",
+                                "ent_coef",
+                            )},
+                            "vf_coef": trial_vf_coef,
+                            "weight_decay": trial_weight_decay,
+                            "obs_noise_std": trial_obs_noise_std,
+                        },
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                pass
         model = PPO(
             "MlpPolicy",
             env,
@@ -410,10 +566,11 @@ def run_tuning(
             gae_lambda=params["gae_lambda"],
             clip_range=params["clip_range"],
             ent_coef=params["ent_coef"],
+            vf_coef=trial_vf_coef,
             policy_kwargs=params["policy_kwargs"],
             device=_get_ppo_device(),
             verbose=0,
-            tensorboard_log=str(tb_dir.parent),
+            tensorboard_log=None if disable_tensorboard else str(tb_dir.parent),
         )
         if _get_ppo_device() == "cuda" and os.environ.get("PPO_TORCH_COMPILE", "").strip().lower() in (
             "1",
@@ -433,6 +590,7 @@ def run_tuning(
             trading_dates=val_trading_dates,
             proxy_feature_cache=val_proxy_cache,
             optuna_trial=trial,
+            patience=eval_patience,
             verbose=0,
         )
         callbacks: list = [GracefulShutdownCallback(verbose=1), sharpe_eval_callback]
@@ -442,31 +600,36 @@ def run_tuning(
         trial_status = "ok"
         try:
             with trace_block("tune_learn", trial=trial.number, timesteps=n_timesteps):
-                model.learn(
-                    total_timesteps=n_timesteps,
-                    callback=callbacks,
-                    progress_bar=show_progress,
-                    tb_log_name=run_id,
-                    reset_num_timesteps=True,
-                )
+                learn_kwargs: dict[str, Any] = {
+                    "total_timesteps": n_timesteps,
+                    "callback": callbacks,
+                    "progress_bar": show_progress,
+                    "reset_num_timesteps": True,
+                }
+                if tb_log_name is not None:
+                    learn_kwargs["tb_log_name"] = tb_log_name
+                model.learn(**learn_kwargs)
         except optuna.TrialPruned:
             trial_status = "pruned"
-            try:
-                record_end(run_id, status=trial_status)
-            except Exception:  # noqa: BLE001
-                pass
+            if run_id is not None:
+                try:
+                    record_end(run_id, status=trial_status)
+                except Exception:  # noqa: BLE001
+                    pass
             raise
         except (AssertionError, ValueError):
             trial_status = "failed"
-            try:
-                record_end(run_id, status=trial_status)
-            except Exception:  # noqa: BLE001
-                pass
+            if run_id is not None:
+                try:
+                    record_end(run_id, status=trial_status)
+                except Exception:  # noqa: BLE001
+                    pass
         else:
-            try:
-                record_end(run_id, status=trial_status)
-            except Exception:  # noqa: BLE001
-                pass
+            if run_id is not None:
+                try:
+                    record_end(run_id, status=trial_status)
+                except Exception:  # noqa: BLE001
+                    pass
         finally:
             sharpe_eval_callback.close_eval_env()
             _safe_vec_env_close(env)
@@ -475,10 +638,11 @@ def run_tuning(
             return float("nan")
 
         if should_stop() and trial_status == "ok":
-            try:
-                record_end(run_id, status="stopped")
-            except Exception:  # noqa: BLE001
-                pass
+            if run_id is not None:
+                try:
+                    record_end(run_id, status="stopped")
+                except Exception:  # noqa: BLE001
+                    pass
             return float("nan")
 
         last = sharpe_eval_callback.last_mean_reward
@@ -498,7 +662,12 @@ def run_tuning(
     if device == "cpu":
         torch.set_num_threads(1 if single_thread else PPO_CPU_THREADS)
     sampler = TPESampler(n_startup_trials=10, seed=42)
-    if os.environ.get("OPTUNA_PRUNER", "hyperband").strip().lower() == "median":
+    # HyperbandPruner creates bracket sub-studies lazily; parallel workers race to look them
+    # up before they exist in JournalStorage, causing KeyError on the first trial.  Use
+    # MedianPruner for any parallel-journal run; HyperbandPruner is fine for single-worker runs.
+    pruner_env = os.environ.get("OPTUNA_PRUNER", "").strip().lower()
+    use_median = pruner_env == "median" or (use_journal_storage and pruner_env != "hyperband")
+    if use_median:
         pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=max(n_evaluations // 3, 1))
     else:
         pruner = HyperbandPruner(
@@ -508,7 +677,12 @@ def run_tuning(
         )
 
     META_LEARNER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    storage = get_tune_rdb_storage()
+    use_journal = use_journal_storage and _journal_storage_available()
+    if use_journal_storage and not use_journal:
+        _log.warning(
+            "JournalStorage unavailable (Optuna >= 3.1 required); falling back to SQLite."
+        )
+    storage = get_tune_storage(use_journal_storage=use_journal)
     if not load_if_exists:
         try:
             optuna.delete_study(study_name=study_name, storage=storage)
@@ -522,6 +696,16 @@ def run_tuning(
         study_name=study_name,
         load_if_exists=load_if_exists,
     )
+    if len(study.trials) > 0:
+        legacy_arch = _categorical_choices(study, "net_arch", _NET_ARCH_CHOICES)
+        if tuple(legacy_arch) != _NET_ARCH_CHOICES:
+            _log.info(
+                "Resuming study %r with net_arch choices %s (expanded default %s is only used for new studies). "
+                "Pass --new or a new --study-name to search the full space.",
+                study_name,
+                legacy_arch,
+                list(_NET_ARCH_CHOICES),
+            )
     if len(study.trials) == 0:
         prev = _previous_best_to_enqueue(params_path)
         if prev is not None:
@@ -535,15 +719,17 @@ def run_tuning(
         show_progress_bar=show_progress,
     )
 
-    return export_best_params_after_study(study_name, params_path)
+    return export_best_params_after_study(study_name, params_path, use_journal_storage=use_journal)
 
 
 def export_best_params_after_study(
     study_name: str,
     params_path: Path | None = None,
+    *,
+    use_journal_storage: bool = False,
 ) -> dict[str, Any]:
     """Load study from default storage and write best params JSON (same as end of run_tuning)."""
-    storage = get_tune_rdb_storage()
+    storage = get_tune_storage(use_journal_storage=use_journal_storage)
     p = params_path or PPO_TUNE_PARAMS_PATH
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
@@ -607,9 +793,6 @@ def _previous_best_to_enqueue(path: Path | None = None) -> dict[str, Any] | None
     if any(data.get(k) is None for k in keys):
         return None
     net_arch = _net_arch_to_name(pk)
-    if net_arch == "tiny":
-        # Tiny is no longer in the tuning search space; map legacy payloads to nearest supported arch.
-        net_arch = "small"
     result = {
         "learning_rate": data["learning_rate"],
         "n_steps": data["n_steps"],
@@ -623,6 +806,12 @@ def _previous_best_to_enqueue(path: Path | None = None) -> dict[str, Any] | None
     }
     if "historical_ratio" in data:
         result["historical_ratio"] = data["historical_ratio"]
+    if "vf_coef" in data:
+        result["vf_coef"] = data["vf_coef"]
+    if "weight_decay" in data:
+        result["weight_decay"] = data["weight_decay"]
+    if "obs_noise_std" in data:
+        result["obs_noise_std"] = data["obs_noise_std"]
     return result
 
 
@@ -649,36 +838,62 @@ def _save_best_params(
             pass
 
 
-def get_tune_status(
-    study_name: str | None = None,
-) -> dict[str, Any]:
-    """
-    Return status of tuning studies: list of study names and summary for each.
-    If study_name is given, include best trial and best value for that study.
-    """
-    if not PPO_TUNE_STUDY_PATH.exists():
-        return {"study_names": [], "studies": {}}
-    storage = get_tune_rdb_storage()
+def _collect_study_summaries(
+    storage: Any,
+    study_name: str | None,
+    into_names: list[str],
+    into_studies: dict[str, Any],
+) -> None:
+    """Query one storage backend and merge results into the provided accumulators."""
     try:
-        study_names = optuna.study.get_all_study_names(storage=storage)
+        names = optuna.study.get_all_study_names(storage=storage)
     except Exception:
-        return {"study_names": [], "studies": {}}
-    result: dict[str, Any] = {"study_names": study_names, "studies": {}}
-    for name in study_names:
+        return
+    for name in names:
+        if name not in into_names:
+            into_names.append(name)
         if study_name is not None and name != study_name:
+            continue
+        if name in into_studies:
             continue
         try:
             study = optuna.load_study(study_name=name, storage=storage)
             n_trials = len(study.trials)
             best_value = float(study.best_value) if study.best_trial else None
-            result["studies"][name] = {
+            into_studies[name] = {
                 "n_trials": n_trials,
                 "best_value": best_value,
                 "best_trial": study.best_trial.number if study.best_trial else None,
             }
         except Exception:
-            result["studies"][name] = {"error": "failed to load"}
-    return result
+            into_studies[name] = {"error": "failed to load"}
+
+
+def get_tune_status(
+    study_name: str | None = None,
+) -> dict[str, Any]:
+    """
+    Return status of tuning studies: list of study names and summary for each.
+    Queries both the SQLite and JournalStorage backends so studies from parallel
+    tuning runs (which use JournalStorage) appear alongside SQLite studies.
+    If study_name is given, include best trial and best value for that study.
+    """
+    study_names: list[str] = []
+    studies: dict[str, Any] = {}
+
+    if PPO_TUNE_STUDY_PATH.exists():
+        try:
+            _collect_study_summaries(get_tune_rdb_storage(), study_name, study_names, studies)
+        except Exception:
+            pass
+
+    if _journal_storage_available() and PPO_TUNE_JOURNAL_LOG.exists():
+        try:
+            _collect_study_summaries(get_tune_journal_storage(), study_name, study_names, studies)
+        except Exception:
+            pass
+
+    return {"study_names": sorted(study_names), "studies": studies}
 
 
 def load_tuned_params(path: Path | None = None) -> dict[str, Any] | None:

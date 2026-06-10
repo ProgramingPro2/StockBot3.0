@@ -8,7 +8,7 @@ import MetricsChart from "../components/MetricsChart";
 import TickerInput from "../components/TickerInput";
 import Field from "../components/Field";
 import { useJobByKind } from "../hooks/useJobByKind";
-import { useDefaultTickers } from "../hooks/useStaticConfig";
+import { useDefaultTickers, useStaticConfig } from "../hooks/useStaticConfig";
 
 function studyOptionLabel(s: TuneStudySummary): string {
   if (s.error) return `${s.name} (load error)`;
@@ -38,12 +38,15 @@ export default function Tune() {
   const [nEnvs, setNEnvs] = useState<number | "">("");
   const [parallelTrials, setParallelTrials] = useState<number | "">("");
   const [torchVec, setTorchVec] = useState(false);
+  const [ppoDevice, setPpoDevice] = useState<"" | "cpu" | "cuda">("");
   const [calibrationNote, setCalibrationNote] = useState<string | null>(null);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
 
   const job = useJobByKind("tune");
   const jobId = activeId ?? job?.id ?? null;
+  const staticConfig = useStaticConfig();
+  const envPpoDevice = String(staticConfig.data?.values?.PPO_DEVICE ?? "cuda");
 
   const loadStudies = useCallback(async () => {
     setStudiesLoading(true);
@@ -86,6 +89,7 @@ export default function Tune() {
     if (nEnvs !== "") params.n_envs = nEnvs;
     if (parallelTrials !== "") params.parallel_trials = parallelTrials;
     if (torchVec) params.torch_vec = true;
+    if (ppoDevice) params.ppo_device = ppoDevice;
     return ApiClient.startTune(params);
   };
 
@@ -197,6 +201,20 @@ export default function Tune() {
             {calibrationNote ? (
               <p className="text-xs text-ink-muted leading-relaxed">{calibrationNote}</p>
             ) : null}
+            <Field
+              label="PPO device"
+              hint={`Default uses PPO_DEVICE from .env (${envPpoDevice}). CPU is often faster for small MLPs with many envs.`}
+            >
+              <select
+                className="input w-full"
+                value={ppoDevice}
+                onChange={(e) => setPpoDevice(e.target.value as "" | "cpu" | "cuda")}
+              >
+                <option value="">Default ({envPpoDevice})</option>
+                <option value="cpu">CPU</option>
+                <option value="cuda">GPU (CUDA)</option>
+              </select>
+            </Field>
             <Toggle
               label="Batched vec env (historical-only, less Subproc IPC)"
               checked={torchVec}

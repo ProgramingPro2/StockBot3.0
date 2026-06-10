@@ -365,6 +365,9 @@ class JobManager:
         env["BOARDROOM_JOB_ID"] = job_id
         env["BOARDROOM_RUN_KIND"] = kind
         env["PYTHONUNBUFFERED"] = "1"
+        ppo_device = params.get("ppo_device")
+        if ppo_device in ("cpu", "cuda"):
+            env["PPO_DEVICE"] = str(ppo_device)
 
         info = JobInfo(
             id=job_id,

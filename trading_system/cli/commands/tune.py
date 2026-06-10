@@ -24,6 +24,21 @@ def register(app: typer.Typer) -> None:
         tickers: Optional[str] = typer.Option(None, "--tickers"),
         n_trials: Optional[int] = typer.Option(None, "--n-trials"),
         timesteps: Optional[int] = typer.Option(None, "--timesteps"),
+        n_evaluations: Optional[int] = typer.Option(
+            None,
+            "--n-evaluations",
+            help="Validation Sharpe evals per trial (default: 3).",
+        ),
+        eval_patience: Optional[int] = typer.Option(
+            None,
+            "--eval-patience",
+            help="Stop trial early after N evals without Sharpe improvement (0 = disabled).",
+        ),
+        no_tb: bool = typer.Option(
+            False,
+            "--no-tb",
+            help="Disable per-trial TensorBoard logging during tuning.",
+        ),
         timeout: int = typer.Option(0, "--timeout", help="Max seconds (0 = no limit)."),
         new: bool = typer.Option(False, "--new", help="Start a new study."),
         study_name: Optional[str] = typer.Option(None, "--study-name"),
@@ -69,12 +84,15 @@ def register(app: typer.Typer) -> None:
                     "Tickers": tickers or "TRADE_TICKERS",
                     "Trials": n_trials or 50,
                     "Timesteps/trial": timesteps or 100_000,
+                    "n_evaluations": str(n_evaluations if n_evaluations is not None else 3),
+                    "eval_patience": str(eval_patience if eval_patience is not None else 0),
+                    "no_tb": str(no_tb),
                     "Timeout (s)": timeout or 0,
                     "Study name": study_name or "ppo_tune",
                     "New study": str(new),
                     "Pick study": str(pick_study),
                     "Use historical": str(use_historical),
-                    "n_envs": str(n_envs if n_envs is not None else f"min(32, cpu)={min(32, os.cpu_count() or 8)}"),
+                    "n_envs": str(n_envs if n_envs is not None else "PPO_N_ENVS env default"),
                     "parallel_trials": str(parallel_trials if parallel_trials is not None else "env default"),
                     "torch_vec": str(torch_vec),
                     "bench": str(bench),
@@ -84,6 +102,9 @@ def register(app: typer.Typer) -> None:
             tickers=tickers,
             n_trials=n_trials,
             timesteps=timesteps,
+            n_evaluations=n_evaluations,
+            eval_patience=eval_patience,
+            no_tb=no_tb,
             timeout=timeout,
             new=new,
             study_name=study_name,
@@ -107,6 +128,21 @@ def register(app: typer.Typer) -> None:
         tickers: Optional[str] = typer.Option(None, "--tickers"),
         n_trials: Optional[int] = typer.Option(None, "--n-trials"),
         timesteps: Optional[int] = typer.Option(None, "--timesteps"),
+        n_evaluations: Optional[int] = typer.Option(
+            None,
+            "--n-evaluations",
+            help="Validation Sharpe evals per trial (default: 3).",
+        ),
+        eval_patience: Optional[int] = typer.Option(
+            None,
+            "--eval-patience",
+            help="Stop trial early after N evals without Sharpe improvement (0 = disabled).",
+        ),
+        no_tb: bool = typer.Option(
+            False,
+            "--no-tb",
+            help="Disable per-trial TensorBoard logging during tuning.",
+        ),
         timeout: int = typer.Option(0, "--timeout"),
         new: bool = typer.Option(False, "--new"),
         study_name: Optional[str] = typer.Option(None, "--study-name"),
@@ -138,6 +174,9 @@ def register(app: typer.Typer) -> None:
             tickers=tickers,
             n_trials=n_trials,
             timesteps=timesteps,
+            n_evaluations=n_evaluations,
+            eval_patience=eval_patience,
+            no_tb=no_tb,
             timeout=timeout,
             new=new,
             study_name=study_name,
@@ -163,3 +202,19 @@ def register(app: typer.Typer) -> None:
         from ..run import cmd_tune_status
 
         cmd_tune_status(make_args(study_name=study_name, tune_action="status"))
+
+    @tune_app.command(
+        "export",
+        help="Export best params from a study to JSON (useful after interrupted runs).",
+    )
+    def tune_export(
+        study_name: Optional[str] = typer.Option(
+            None,
+            "--study-name",
+            help="Study to export. Lists available studies if omitted.",
+        ),
+        json_output: bool = typer.Option(False, "--json"),
+    ) -> None:
+        from ..run import cmd_tune_export
+
+        cmd_tune_export(make_args(study_name=study_name, json_output=json_output))

@@ -73,6 +73,7 @@ class TuneParams(BaseModel):
     n_envs: Optional[int] = None
     parallel_trials: Optional[int] = None
     torch_vec: bool = False
+    ppo_device: Optional[Literal["cpu", "cuda"]] = None
     tickers: Optional[str] = None
     single_thread: bool = False
 
