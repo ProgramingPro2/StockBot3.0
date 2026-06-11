@@ -45,12 +45,16 @@ trading_system/outputs/jobs/
 trading_system/models/meta_learner/tensorboard/
 trading_system/models/meta_learner/runs.json
 
+# PyTorch Lightning (default logger dir at repo root)
+lightning_logs/
+
 # Web UI
 webapp/frontend/node_modules/
 webapp/frontend/dist/
 webapp/frontend/.vite/
 # Do not add vite.config.js alongside vite.config.ts — Vite prefers .js and it duplicates watchers.
 webapp/frontend/vite.config.js
+*.tsbuildinfo
 
 # Logs
 *.log
