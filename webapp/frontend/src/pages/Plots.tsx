@@ -1,9 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { Image as ImageIcon, X } from "lucide-react";
+import { Image as ImageIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 import { ApiClient, type OutputItem } from "../lib/api";
 import EquitySeriesChart from "../components/EquitySeriesChart";
 import PageHeader from "../components/PageHeader";
+import { Modal } from "../components/ui";
 import { formatRelative } from "../lib/format";
 
 function seriesJsonName(png: OutputItem): string | null {
@@ -84,51 +85,25 @@ export default function Plots() {
         )}
       </div>
 
-      {selected && modalSeriesUrl && (
-        <div
-          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-6 overflow-y-auto"
-          onClick={() => setSelected(null)}
-        >
-          <button
-            type="button"
-            className="absolute top-4 right-4 btn-ghost"
-            onClick={() => setSelected(null)}
-          >
-            <X className="h-4 w-4" /> close
-          </button>
-          <div
-            className="max-w-5xl w-full rounded-lg border border-bg-border bg-bg-subtle p-4 my-8"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <EquitySeriesChart
-              seriesUrl={modalSeriesUrl}
-              fallbackPngUrl={ApiClient.outputUrl(selected)}
-              fallbackAlt={selected}
-            />
-          </div>
-        </div>
-      )}
-
-      {selected && !modalSeriesUrl && (
-        <div
-          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-6"
-          onClick={() => setSelected(null)}
-        >
-          <button
-            type="button"
-            className="absolute top-4 right-4 btn-ghost"
-            onClick={() => setSelected(null)}
-          >
-            <X className="h-4 w-4" /> close
-          </button>
+      <Modal
+        open={!!selected}
+        onClose={() => setSelected(null)}
+        maxWidth="max-w-5xl"
+      >
+        {selected && modalSeriesUrl ? (
+          <EquitySeriesChart
+            seriesUrl={modalSeriesUrl}
+            fallbackPngUrl={ApiClient.outputUrl(selected)}
+            fallbackAlt={selected}
+          />
+        ) : selected ? (
           <img
             src={ApiClient.outputUrl(selected)}
             alt={selected}
-            className="max-h-full max-w-full rounded-lg border border-bg-border"
-            onClick={(e) => e.stopPropagation()}
+            className="max-h-[80vh] w-full rounded-lg border border-bg-border object-contain"
           />
-        </div>
-      )}
+        ) : null}
+      </Modal>
     </div>
   );
 }

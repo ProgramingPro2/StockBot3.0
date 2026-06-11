@@ -1,13 +1,32 @@
+import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ApiClient } from "../lib/api";
-import { Cpu, MemoryStick, Activity, Zap } from "lucide-react";
+import { useSystem } from "../hooks/useSystem";
+import { Cpu, MemoryStick, Activity, Zap, Menu } from "lucide-react";
 
-export default function TopBar() {
-  const sys = useQuery({
-    queryKey: ["system"],
-    queryFn: ApiClient.system,
-    refetchInterval: 4_000,
-  });
+function jobRoute(kind: string): string {
+  switch (kind) {
+    case "train":
+      return "/train";
+    case "tune":
+      return "/tune";
+    case "backtest":
+      return "/backtest";
+    case "paper":
+      return "/paper";
+    case "live":
+      return "/live";
+    default:
+      return "/";
+  }
+}
+
+type TopBarProps = {
+  onMenuToggle?: () => void;
+};
+
+export default function TopBar({ onMenuToggle }: TopBarProps) {
+  const sys = useSystem();
   const jobs = useQuery({
     queryKey: ["jobs"],
     queryFn: ApiClient.jobs,
@@ -15,21 +34,28 @@ export default function TopBar() {
   });
 
   const running = jobs.data?.running ?? [];
+  const mostRecent = [...running].sort((a, b) => (b.started ?? 0) - (a.started ?? 0))[0];
   const cpu = sys.data?.cpu_pct ?? 0;
   const mem = sys.data?.mem_used_pct ?? 0;
   const gpu = sys.data?.gpus?.[0];
 
   return (
-    <header className="h-14 border-b border-bg-border bg-bg-panel/60 backdrop-blur px-6 flex items-center justify-between gap-4">
-      <div className="text-sm text-ink-muted">
-        Hierarchical multi-agent trading system
-      </div>
+    <header className="flex h-14 items-center justify-between gap-4 border-b border-bg-border bg-bg-panel/60 px-4 backdrop-blur lg:px-6">
+      <button
+        type="button"
+        onClick={onMenuToggle}
+        className="btn-ghost -ml-2 p-2 lg:hidden"
+        aria-label="Open menu"
+      >
+        <Menu className="h-5 w-5" />
+      </button>
+      <div className="flex-1 lg:flex-none" />
       <div className="flex items-center gap-2">
         {running.length > 0 ? (
-          <div className="pill-accent">
+          <Link to={jobRoute(mostRecent?.kind ?? "")} className="pill-accent">
             <Activity className="h-3.5 w-3.5" />
             {running.length} running
-          </div>
+          </Link>
         ) : (
           <div className="pill-muted">
             <Activity className="h-3.5 w-3.5" />

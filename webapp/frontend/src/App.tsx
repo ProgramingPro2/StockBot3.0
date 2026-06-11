@@ -1,5 +1,6 @@
 import { Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
+import { ToastProvider } from "./components/ui";
 import Dashboard from "./pages/Dashboard";
 import Train from "./pages/Train";
 import Tune from "./pages/Tune";
@@ -16,22 +17,25 @@ import SystemPage from "./pages/System";
 
 export default function App() {
   return (
-    <Routes>
-      <Route element={<Layout />}>
-        <Route index element={<Dashboard />} />
-        <Route path="/train" element={<Train />} />
-        <Route path="/tune" element={<Tune />} />
-        <Route path="/backtest" element={<Backtest />} />
-        <Route path="/paper" element={<Paper />} />
-        <Route path="/live" element={<Live />} />
-        <Route path="/models" element={<ModelsPage />} />
-        <Route path="/schedule" element={<SchedulePage />} />
-        <Route path="/plots" element={<Plots />} />
-        <Route path="/logs" element={<LogsPage />} />
-        <Route path="/tensorboard" element={<TensorBoardPage />} />
-        <Route path="/config" element={<ConfigPage />} />
-        <Route path="/system" element={<SystemPage />} />
-      </Route>
-    </Routes>
+    <>
+      <Routes>
+        <Route element={<Layout />}>
+          <Route index element={<Dashboard />} />
+          <Route path="/train" element={<Train />} />
+          <Route path="/tune" element={<Tune />} />
+          <Route path="/backtest" element={<Backtest />} />
+          <Route path="/paper" element={<Paper />} />
+          <Route path="/live" element={<Live />} />
+          <Route path="/models" element={<ModelsPage />} />
+          <Route path="/schedule" element={<SchedulePage />} />
+          <Route path="/plots" element={<Plots />} />
+          <Route path="/logs" element={<LogsPage />} />
+          <Route path="/tensorboard" element={<TensorBoardPage />} />
+          <Route path="/config" element={<ConfigPage />} />
+          <Route path="/system" element={<SystemPage />} />
+        </Route>
+      </Routes>
+      <ToastProvider />
+    </>
   );
 }

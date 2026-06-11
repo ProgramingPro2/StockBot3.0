@@ -1,3 +1,15 @@
+import type { TuneStudySummary } from "./api";
+
+export function studyOptionLabel(s: TuneStudySummary): string {
+  if (s.error) return `${s.name} (load error)`;
+  const bits: string[] = [`${s.n_trials} trials`];
+  if (s.best_value != null && Number.isFinite(s.best_value)) {
+    bits.push(`best ${s.best_value.toFixed(4)}`);
+    if (s.best_trial != null) bits.push(`trial #${s.best_trial}`);
+  }
+  return `${s.name} — ${bits.join(", ")}`;
+}
+
 export function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];

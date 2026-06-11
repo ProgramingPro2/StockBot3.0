@@ -3,6 +3,7 @@ import { useState } from "react";
 import { FileText } from "lucide-react";
 import { ApiClient } from "../lib/api";
 import PageHeader from "../components/PageHeader";
+import { EmptyState } from "../components/ui";
 import { formatBytes, formatRelative } from "../lib/format";
 
 type Item = { name: string; size_bytes: number; mtime: number; kind: string };
@@ -23,7 +24,7 @@ export default function LogsPage() {
     queryKey: ["log-content", selected],
     queryFn: async () => {
       if (!selected) return "";
-      const res = await fetch(`/api/outputs/file/${selected}`);
+      const res = await fetch(ApiClient.outputUrl(selected));
       return res.text();
     },
     enabled: !!selected,
@@ -56,7 +57,7 @@ export default function LogsPage() {
               </button>
             ))}
             {logs.length === 0 && (
-              <div className="px-3 py-6 text-sm text-ink-muted">No log files yet.</div>
+              <EmptyState message="No log files yet." />
             )}
           </div>
         </div>
@@ -64,9 +65,15 @@ export default function LogsPage() {
           <div className="px-3 py-2 text-xs text-ink-muted border-b border-bg-border">
             {selected ? selected : "Select a file"}
           </div>
-          <pre className="log-stream h-[520px] overflow-y-auto p-3 whitespace-pre-wrap break-words">
-            {text.data || (selected ? "Loading…" : "")}
-          </pre>
+          <div className="log-stream h-[520px] overflow-y-auto p-3">
+            {text.isLoading && selected ? (
+              <div className="skeleton h-full min-h-[480px] rounded" />
+            ) : (
+              <pre className="whitespace-pre-wrap break-words m-0">
+                {text.data || (selected ? "" : "")}
+              </pre>
+            )}
+          </div>
         </div>
       </div>
     </div>

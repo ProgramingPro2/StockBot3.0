@@ -3,6 +3,7 @@ import { useState } from "react";
 import { LineChart } from "lucide-react";
 import { ApiClient } from "../lib/api";
 import PageHeader from "../components/PageHeader";
+import { EmptyState } from "../components/ui";
 import { formatRelative } from "../lib/format";
 
 type Run = {
@@ -44,25 +45,31 @@ export default function TensorBoardPage() {
             >
               All runs
             </button>
-            {(runs.data?.runs ?? []).map((run) => (
-              <button
-                key={run.run_id}
-                onClick={() => setSelected(run.run_id)}
-                className={`w-full text-left px-3 py-2 text-sm hover:bg-bg-subtle ${selected === run.run_id ? "bg-bg-subtle" : ""}`}
-              >
-                <div className="font-mono text-xs truncate">{run.run_id}</div>
-                <div className="text-[11px] text-ink-muted">
-                  {run.kind} · {run.timesteps ? `${(run.timesteps / 1000).toFixed(0)}k steps` : "—"}
-                </div>
-                <div className="text-[11px] text-ink-muted">
-                  {run.started ? formatRelative(new Date(run.started).getTime() / 1000) : "—"} · {run.status ?? ""}
-                </div>
-              </button>
-            ))}
-            {runs.data?.runs.length === 0 && (
-              <div className="px-3 py-6 text-sm text-ink-muted">
-                No training runs yet. Start one from the Train page.
+            {runs.isLoading ? (
+              <div className="p-3 space-y-2">
+                {[1, 2, 3, 4].map((i) => (
+                  <div key={i} className="skeleton h-14 rounded" />
+                ))}
               </div>
+            ) : (
+              (runs.data?.runs ?? []).map((run) => (
+                <button
+                  key={run.run_id}
+                  onClick={() => setSelected(run.run_id)}
+                  className={`w-full text-left px-3 py-2 text-sm hover:bg-bg-subtle ${selected === run.run_id ? "bg-bg-subtle" : ""}`}
+                >
+                  <div className="font-mono text-xs truncate">{run.run_id}</div>
+                  <div className="text-[11px] text-ink-muted">
+                    {run.kind} · {run.timesteps ? `${(run.timesteps / 1000).toFixed(0)}k steps` : "—"}
+                  </div>
+                  <div className="text-[11px] text-ink-muted">
+                    {run.started ? formatRelative(new Date(run.started).getTime() / 1000) : "—"} · {run.status ?? ""}
+                  </div>
+                </button>
+              ))
+            )}
+            {!runs.isLoading && runs.data?.runs.length === 0 && (
+              <EmptyState message="No training runs yet. Start one from the Train page." />
             )}
           </div>
         </div>

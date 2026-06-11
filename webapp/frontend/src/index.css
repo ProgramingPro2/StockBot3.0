@@ -50,8 +50,20 @@ body {
   .panel-padded {
     @apply panel p-5;
   }
+  .card-header {
+    @apply flex items-center justify-between gap-3 px-5 py-4 border-b border-bg-border;
+  }
+  .stat {
+    @apply panel-padded flex flex-col gap-1;
+  }
+  .focus-ring {
+    @apply focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:ring-offset-2 focus-visible:ring-offset-bg;
+  }
+  .skeleton {
+    @apply animate-pulse rounded bg-bg-subtle;
+  }
   .btn {
-    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition focus:outline-none focus:ring-2 focus:ring-accent/40 disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 disabled:opacity-50 disabled:cursor-not-allowed;
   }
   .btn-primary {
     @apply btn bg-accent text-white hover:bg-accent/90 shadow-glow;

@@ -9,6 +9,14 @@ import {
   YAxis,
 } from "recharts";
 import { ApiClient } from "../lib/api";
+import {
+  AXIS_FONT_SIZE,
+  AXIS_STROKE,
+  CHART_COLORS,
+  GRID_STROKE,
+  LABEL_STYLE,
+  TOOLTIP_STYLE,
+} from "../lib/theme";
 import { jobMetricsWs } from "../lib/ws";
 
 export type MetricRow = {
@@ -41,12 +49,12 @@ type ChartConfig = {
 };
 
 const charts: ChartConfig[] = [
-  { title: "Episode reward (mean)", field: "ep_rew_mean", color: "#7c5cff" },
-  { title: "Policy loss", field: "policy_loss", color: "#34d399" },
-  { title: "Value loss", field: "value_loss", color: "#f87171" },
-  { title: "Entropy loss", field: "entropy_loss", color: "#fbbf24" },
-  { title: "Explained variance", field: "explained_variance", color: "#22d3ee" },
-  { title: "Approx KL", field: "approx_kl", color: "#f472b6" },
+  { title: "Episode reward (mean)", field: "ep_rew_mean", color: CHART_COLORS[0] },
+  { title: "Policy loss", field: "policy_loss", color: CHART_COLORS[1] },
+  { title: "Value loss", field: "value_loss", color: CHART_COLORS[2] },
+  { title: "Entropy loss", field: "entropy_loss", color: CHART_COLORS[3] },
+  { title: "Explained variance", field: "explained_variance", color: CHART_COLORS[4] },
+  { title: "Approx KL", field: "approx_kl", color: CHART_COLORS[5] },
 ];
 
 function isRolloutRow(r: unknown): boolean {
@@ -132,22 +140,17 @@ export default function MetricsChart({ jobId }: { jobId: string }) {
                 data={specialistRows}
                 margin={{ left: 0, right: 8, top: 4, bottom: 0 }}
               >
-                <CartesianGrid stroke="#1f2430" strokeDasharray="3 3" />
+                <CartesianGrid stroke={GRID_STROKE} strokeDasharray="3 3" />
                 <XAxis
                   dataKey="epoch"
-                  stroke="#6b7280"
-                  fontSize={11}
+                  stroke={AXIS_STROKE}
+                  fontSize={AXIS_FONT_SIZE}
                   tickFormatter={(v) => (typeof v === "number" ? `${v}` : "")}
                 />
-                <YAxis stroke="#6b7280" fontSize={11} width={40} />
+                <YAxis stroke={AXIS_STROKE} fontSize={AXIS_FONT_SIZE} width={40} />
                 <Tooltip
-                  contentStyle={{
-                    background: "#11141c",
-                    border: "1px solid #1f2430",
-                    borderRadius: 8,
-                    fontSize: 12,
-                  }}
-                  labelStyle={{ color: "#9aa3b8" }}
+                  contentStyle={TOOLTIP_STYLE}
+                  labelStyle={LABEL_STYLE}
                   formatter={(value: number) =>
                     typeof value === "number" ? value.toFixed(4) : value
                   }
@@ -155,7 +158,7 @@ export default function MetricsChart({ jobId }: { jobId: string }) {
                 <Line
                   type="monotone"
                   dataKey="train_loss"
-                  stroke="#a78bfa"
+                  stroke={CHART_COLORS[6]}
                   dot={false}
                   strokeWidth={2}
                   isAnimationActive={false}
@@ -180,11 +183,11 @@ export default function MetricsChart({ jobId }: { jobId: string }) {
                     data={rolloutRows}
                     margin={{ left: 0, right: 8, top: 4, bottom: 0 }}
                   >
-                    <CartesianGrid stroke="#1f2430" strokeDasharray="3 3" />
+                    <CartesianGrid stroke={GRID_STROKE} strokeDasharray="3 3" />
                     <XAxis
                       dataKey="timesteps"
-                      stroke="#6b7280"
-                      fontSize={11}
+                      stroke={AXIS_STROKE}
+                      fontSize={AXIS_FONT_SIZE}
                       tickFormatter={(v) =>
                         typeof v === "number"
                           ? v >= 1000
@@ -193,15 +196,10 @@ export default function MetricsChart({ jobId }: { jobId: string }) {
                           : ""
                       }
                     />
-                    <YAxis stroke="#6b7280" fontSize={11} width={40} />
+                    <YAxis stroke={AXIS_STROKE} fontSize={AXIS_FONT_SIZE} width={40} />
                     <Tooltip
-                      contentStyle={{
-                        background: "#11141c",
-                        border: "1px solid #1f2430",
-                        borderRadius: 8,
-                        fontSize: 12,
-                      }}
-                      labelStyle={{ color: "#9aa3b8" }}
+                      contentStyle={TOOLTIP_STYLE}
+                      labelStyle={LABEL_STYLE}
                       formatter={(value: number) =>
                         typeof value === "number" ? value.toFixed(4) : value
                       }

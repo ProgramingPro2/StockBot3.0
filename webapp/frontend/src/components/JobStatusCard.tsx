@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
-import { CheckCircle, XCircle, Loader, StopCircle, Clock } from "lucide-react";
 import { ApiClient, type JobInfo } from "../lib/api";
+import { getStatusMeta, TONE_CLASSES } from "../lib/jobStatus";
 
 type Props = {
   /** The job to display status for. Pass null to render nothing. */
@@ -107,18 +107,8 @@ export default function JobStatusCard({ job }: Props) {
         ? now - job.started
         : null;
 
-  const statusMeta: Record<
-    string,
-    { icon: React.ReactNode; label: string; className: string }
-  > = {
-    pending:   { icon: <Clock className="h-4 w-4" />,       label: "Pending",   className: "text-ink-muted" },
-    running:   { icon: <Loader className="h-4 w-4 animate-spin" />, label: "Running", className: "text-blue-400" },
-    stopping:  { icon: <StopCircle className="h-4 w-4" />,  label: "Stopping",  className: "text-amber-400" },
-    completed: { icon: <CheckCircle className="h-4 w-4" />, label: "Completed", className: "text-emerald-400" },
-    failed:    { icon: <XCircle className="h-4 w-4" />,     label: "Failed",    className: "text-rose-400" },
-    cancelled: { icon: <XCircle className="h-4 w-4" />,     label: "Cancelled", className: "text-ink-muted" },
-  };
-  const sm = statusMeta[job.status] ?? statusMeta.pending;
+  const meta = getStatusMeta(job.status);
+  const { Icon } = meta;
   const data = result.data as Record<string, unknown> | null | undefined;
 
   // Featured stats chips
@@ -152,9 +142,9 @@ export default function JobStatusCard({ job }: Props) {
     >
       {/* Header row */}
       <div className="flex items-center gap-2 text-sm">
-        <span className={clsx("flex items-center gap-1.5 font-medium", sm.className)}>
-          {sm.icon}
-          {sm.label}
+        <span className={clsx("flex items-center gap-1.5 font-medium", TONE_CLASSES[meta.tone])}>
+          <Icon className={clsx("h-4 w-4", job.status === "running" && "animate-spin")} />
+          {meta.label}
         </span>
         <span className="text-ink-muted">·</span>
         <span className="text-ink-muted capitalize">{job.kind}</span>
@@ -169,7 +159,7 @@ export default function JobStatusCard({ job }: Props) {
         {job.exit_code !== undefined && job.exit_code !== 0 && (
           <>
             <span className="text-ink-muted">·</span>
-            <span className="text-xs text-rose-400">exit {job.exit_code}</span>
+            <span className="text-xs text-danger">exit {job.exit_code}</span>
           </>
         )}
       </div>
@@ -213,7 +203,7 @@ export default function JobStatusCard({ job }: Props) {
         <p className="text-xs text-ink-muted">Loading result…</p>
       )}
       {result.isError && (
-        <p className="text-xs text-rose-400">Could not load result data.</p>
+        <p className="text-xs text-danger">Could not load result data.</p>
       )}
     </div>
   );

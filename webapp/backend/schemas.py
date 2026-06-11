@@ -120,46 +120,6 @@ class SpecialistCacheParams(BaseModel):
     force_rebuild: bool = False
 
 
-class SpecialistCacheEntry(BaseModel):
-    cache_key: str
-    start_date: str
-    end_date: str
-    tickers: list[str] = Field(default_factory=list)
-    n_days: int = 0
-    n_tickers: int = 0
-    refit_every: int = 0
-    window: int = 21
-    size_bytes: int = 0
-    mtime: float = 0
-    generation_seconds: Optional[float] = None
-
-
-class SpecialistCheckpointEntry(BaseModel):
-    checkpoint_id: str
-    tickers: list[str] = Field(default_factory=list)
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    refit_every: Optional[int] = None
-    last_bar: int = 0
-    n_days: int = 0
-    n_tickers: int = 0
-    progress_pct: float = 0
-    size_bytes: int = 0
-    mtime: float = 0
-
-
-class SpecialistCacheStatusResponse(BaseModel):
-    cache_dir: str
-    default_refit_every: int
-    caches: list[SpecialistCacheEntry] = Field(default_factory=list)
-    checkpoints: list[SpecialistCheckpointEntry] = Field(default_factory=list)
-
-
-class SpecialistCacheDeleteResponse(BaseModel):
-    ok: bool
-    detail: str
-
-
 class StartJobResponse(BaseModel):
     job: JobInfo
 

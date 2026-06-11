@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import JobStatusCard from "../components/JobStatusCard";
 import { BarChart3, Play } from "lucide-react";
@@ -9,36 +9,30 @@ import LogStream from "../components/LogStream";
 import StatsTable from "../components/StatsTable";
 import TickerInput from "../components/TickerInput";
 import Field from "../components/Field";
-import { useJobByKind } from "../hooks/useJobByKind";
+import JobRunnerLayout from "../components/JobRunnerLayout";
+import Toggle from "../components/ui/Toggle";
+import { useActiveJob } from "../hooks/useActiveJob";
+import { useJobResult, parseSeries } from "../hooks/useJobResult";
 import { useDefaultTickers } from "../hooks/useStaticConfig";
 import { formatBytes, formatRelative } from "../lib/format";
 import EquitySeriesChart from "../components/EquitySeriesChart";
+import EnvSection from "../components/EnvSection";
 
 export default function Backtest() {
   const defaults = useDefaultTickers();
   const [tickers, setTickers] = useState("");
   const [model, setModel] = useState("");
   const [inSample, setInSample] = useState(false);
-  const [activeId, setActiveId] = useState<string | null>(null);
 
-  const job = useJobByKind("backtest");
-  const jobId = activeId ?? job?.id ?? null;
+  const { job, jobId, onStarted } = useActiveJob("backtest");
 
   const models = useQuery<ModelsResponse>({
     queryKey: ["models"],
     queryFn: ApiClient.models,
     refetchInterval: 10_000,
   });
-  const result = useQuery({
-    queryKey: ["job-result", jobId],
-    queryFn: () => (jobId ? ApiClient.jobResult(jobId) : Promise.resolve(null)),
-    enabled: !!jobId,
-    refetchInterval: jobId ? 4_000 : false,
-  });
-
-  useEffect(() => {
-    if (!activeId && job?.id) setActiveId(job.id);
-  }, [activeId, job?.id]);
+  const result = useJobResult(jobId);
+  const { plotName, seriesUrl } = parseSeries(result.data as Record<string, unknown> | null | undefined);
 
   const onStart = async () => {
     const params: Record<string, unknown> = {};
@@ -48,13 +42,6 @@ export default function Backtest() {
     return ApiClient.startBacktest(params);
   };
 
-  const res = result.data as { plot_path?: string; series_path?: string } | null;
-  const plotName = res?.plot_path?.split("/").pop();
-  const seriesJsonName =
-    res?.series_path?.split("/").pop() ??
-    (plotName?.toLowerCase().endsWith(".png") ? `${plotName.slice(0, -4)}.json` : undefined);
-  const seriesUrl = seriesJsonName ? ApiClient.seriesUrl(seriesJsonName) : undefined;
-
   return (
     <div className="space-y-6">
       <PageHeader
@@ -63,95 +50,98 @@ export default function Backtest() {
         icon={<BarChart3 className="h-6 w-6" />}
       />
 
-      <div className="grid gap-6 xl:grid-cols-[420px,1fr]">
-        <div className="panel-padded space-y-4">
-          <Field label="Tickers" hint="Default uses TRADE_TICKERS from .env.">
-            <TickerInput value={tickers} onChange={setTickers} defaultTickers={defaults} />
-          </Field>
-          <Field label="Model" hint="Pick a saved PPO model. Default uses ppo_trader.zip.">
-            <select
-              className="select"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-            >
-              <option value="">(default / latest)</option>
-              {(models.data?.models ?? []).map((m: ModelInfo) => (
-                <option key={m.name} value={m.name}>
-                  {m.name}
-                  {m.feature_source ? ` [${m.feature_source}]` : ""}
-                  {" · "}
-                  {formatBytes(m.size_bytes)} · {formatRelative(m.mtime)}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <label className="flex items-start justify-between gap-3 rounded-lg border border-bg-border bg-bg-subtle px-3 py-2 text-sm cursor-pointer">
-            <span className="min-w-0">
-              <span className="block">In-sample mode</span>
-              <span className="mt-0.5 block text-xs text-ink-muted font-normal">
-                Default is out-of-sample (holds out the most recent test window per TEST_WINDOW_DAYS). Enable to evaluate on all available data instead.
-              </span>
-            </span>
-            <input
-              type="checkbox"
-              className="mt-0.5 h-4 w-4 shrink-0 accent-accent"
+      <JobRunnerLayout
+        configPanel={
+          <>
+            <Field label="Tickers" hint="Default uses TRADE_TICKERS from .env.">
+              <TickerInput value={tickers} onChange={setTickers} defaultTickers={defaults} />
+            </Field>
+            <Field label="Model" hint="Pick a saved PPO model. Default uses ppo_trader.zip.">
+              <select
+                className="select"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+              >
+                <option value="">(default / latest)</option>
+                {(models.data?.models ?? []).map((m: ModelInfo) => (
+                  <option key={m.name} value={m.name}>
+                    {m.name}
+                    {m.feature_source ? ` [${m.feature_source}]` : ""}
+                    {" · "}
+                    {formatBytes(m.size_bytes)} · {formatRelative(m.mtime)}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Toggle
+              label="In-sample mode"
+              hint="Default is out-of-sample (holds out the most recent test window per TEST_WINDOW_DAYS). Enable to evaluate on all available data instead."
               checked={inSample}
-              onChange={(e) => setInSample(e.target.checked)}
+              onChange={setInSample}
             />
-          </label>
-          <JobControl
-            job={job}
-            onStart={onStart}
-            startLabel="Run backtest"
-            startIcon={<Play className="h-4 w-4" />}
-            onStarted={(info) => setActiveId(info.id)}
-          />
-        </div>
+            <JobControl
+              job={job}
+              onStart={onStart}
+              startLabel="Run backtest"
+              startIcon={<Play className="h-4 w-4" />}
+              onStarted={onStarted}
+            />
 
-        <div className="space-y-4 min-w-0">
-          {jobId && <JobStatusCard job={job?.id === jobId ? job : null} />}
-          {jobId && <LogStream jobId={jobId} />}
+            <EnvSection
+              title="Backtest defaults"
+              keys={[
+                "STARTING_CAPITAL",
+                "TRANSACTION_COST_BPS",
+                "SLIPPAGE_BPS",
+                "TEST_WINDOW_PLACEMENT",
+                "TEST_WINDOW_DAYS",
+              ]}
+            />
+          </>
+        }
+        resultsPanel={
+          jobId ? (
+            <>
+              <JobStatusCard job={job?.id === jobId ? job : null} />
+              <LogStream jobId={jobId} />
 
-          {result.data && Boolean((result.data as { stats?: unknown }).stats) && (
-            <div className="grid gap-4 lg:grid-cols-[1fr,360px]">
-              <div className="panel overflow-hidden bg-black/40">
-                {plotName && seriesUrl && (
-                  <div className="space-y-2 p-2">
-                    <EquitySeriesChart
-                      seriesUrl={seriesUrl}
-                      fallbackPngUrl={ApiClient.outputUrl(plotName)}
-                      fallbackAlt={plotName}
-                    />
-                    <a
-                      href={ApiClient.outputUrl(plotName)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-xs text-accent hover:underline"
-                    >
-                      Open static PNG
-                    </a>
+              {result.data && Boolean((result.data as { stats?: unknown }).stats) && (
+                <div className="grid gap-4 lg:grid-cols-[1fr,360px]">
+                  <div className="panel overflow-hidden bg-black/40">
+                    {plotName && seriesUrl && (
+                      <div className="space-y-2 p-2">
+                        <EquitySeriesChart
+                          seriesUrl={seriesUrl}
+                          fallbackPngUrl={ApiClient.outputUrl(plotName)}
+                          fallbackAlt={plotName}
+                        />
+                        <a
+                          href={ApiClient.outputUrl(plotName)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-accent hover:underline"
+                        >
+                          Open static PNG
+                        </a>
+                      </div>
+                    )}
+                    {plotName && !seriesUrl && (
+                      <img
+                        src={ApiClient.outputUrl(plotName)}
+                        alt={plotName}
+                        className="block w-full"
+                        loading="lazy"
+                      />
+                    )}
                   </div>
-                )}
-                {plotName && !seriesUrl && (
-                  <img
-                    src={ApiClient.outputUrl(plotName)}
-                    alt={plotName}
-                    className="block w-full"
-                    loading="lazy"
-                  />
-                )}
-              </div>
-              <StatsTable stats={(result.data as { stats: Record<string, number> }).stats} />
-            </div>
-          )}
-
-          {!jobId && (
-            <div className="panel-padded text-sm text-ink-muted">
-              Pick a model and start a backtest to see the equity curve and final stats here.
-            </div>
-          )}
-        </div>
-      </div>
+                  <StatsTable stats={(result.data as { stats: Record<string, number> }).stats} />
+                </div>
+              )}
+            </>
+          ) : null
+        }
+        emptyMessage="Pick a model and start a backtest to see the equity curve and final stats here."
+      />
     </div>
   );
 }

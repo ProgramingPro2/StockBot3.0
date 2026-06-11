@@ -35,6 +35,7 @@ export default {
           panel: "#11141c",
           subtle: "#161a24",
           border: "#1f2430",
+          elevated: "#1a1f2e",
         },
         ink: {
           DEFAULT: "#e7eaf2",
@@ -56,6 +57,10 @@ export default {
         warn: {
           DEFAULT: "#fbbf24",
           soft: "#fbbf2422",
+        },
+        info: {
+          DEFAULT: "#3b82f6",
+          soft: "#3b82f622",
         },
       },
       boxShadow: {

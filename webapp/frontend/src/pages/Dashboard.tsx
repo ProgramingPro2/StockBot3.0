@@ -15,11 +15,30 @@ import {
 import { ApiClient, type JobInfo, type OutputItem } from "../lib/api";
 import EquitySeriesChart from "../components/EquitySeriesChart";
 import PageHeader from "../components/PageHeader";
-import StatusPill from "../components/StatusPill";
+import { Card, EmptyState, Stat, StatusBadge } from "../components/ui";
+import { parseSeries } from "../hooks/useJobResult";
+import { useSystem } from "../hooks/useSystem";
 import { formatBytes, formatRelative } from "../lib/format";
 
+function jobRoute(kind: string): string {
+  switch (kind) {
+    case "train":
+      return "/train";
+    case "tune":
+      return "/tune";
+    case "backtest":
+      return "/backtest";
+    case "paper":
+      return "/paper";
+    case "live":
+      return "/live";
+    default:
+      return "/";
+  }
+}
+
 export default function Dashboard() {
-  const sys = useQuery({ queryKey: ["system"], queryFn: ApiClient.system, refetchInterval: 4_000 });
+  const sys = useSystem();
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: ApiClient.jobs, refetchInterval: 3_000 });
   const outputs = useQuery({ queryKey: ["outputs"], queryFn: ApiClient.outputs, refetchInterval: 8_000 });
 
@@ -42,42 +61,39 @@ export default function Dashboard() {
       />
 
       <div className="grid gap-4 md:grid-cols-3">
-        <div className="panel-padded">
-          <div className="flex items-center justify-between">
-            <span className="text-xs uppercase tracking-wide text-ink-muted">Active jobs</span>
-            <Activity className="h-4 w-4 text-accent" />
-          </div>
-          <div className="mt-2 text-3xl font-semibold">{running.length}</div>
-          <div className="text-xs text-ink-muted mt-1">
-            {running.map((j) => j.kind).join(", ") || "Nothing in flight"}
-          </div>
-        </div>
-        <div className="panel-padded">
-          <div className="flex items-center justify-between">
-            <span className="text-xs uppercase tracking-wide text-ink-muted">CPU / Memory</span>
-            <Cpu className="h-4 w-4 text-ink-muted" />
-          </div>
-          <div className="mt-2 text-3xl font-semibold">
-            {Math.round(sys.data?.cpu_pct ?? 0)}% <span className="text-ink-muted text-base">/ {Math.round(sys.data?.mem_used_pct ?? 0)}%</span>
-          </div>
-          <div className="text-xs text-ink-muted mt-1">
-            {sys.data ? `${formatBytes((sys.data.mem_used_mb ?? 0) * 1024 * 1024)} of ${formatBytes((sys.data.mem_total_mb ?? 0) * 1024 * 1024)}` : ""}
-          </div>
-        </div>
-        <div className="panel-padded">
-          <div className="flex items-center justify-between">
-            <span className="text-xs uppercase tracking-wide text-ink-muted">GPU</span>
-            <Zap className="h-4 w-4 text-success" />
-          </div>
-          <div className="mt-2 text-2xl font-semibold truncate">
-            {gpu ? gpu.name : "Not detected"}
-          </div>
-          <div className="text-xs text-ink-muted mt-1">
-            {gpu
+        <Stat
+          label="Active jobs"
+          value={running.length}
+          hint={running.map((j) => j.kind).join(", ") || "Nothing in flight"}
+          icon={<Activity className="h-4 w-4 text-accent" />}
+        />
+        <Stat
+          label="CPU / Memory"
+          value={
+            <>
+              {Math.round(sys.data?.cpu_pct ?? 0)}%{" "}
+              <span className="text-ink-muted text-base">/ {Math.round(sys.data?.mem_used_pct ?? 0)}%</span>
+            </>
+          }
+          hint={
+            sys.data
+              ? `${formatBytes((sys.data.mem_used_mb ?? 0) * 1024 * 1024)} of ${formatBytes((sys.data.mem_total_mb ?? 0) * 1024 * 1024)}`
+              : ""
+          }
+          icon={<Cpu className="h-4 w-4 text-ink-muted" />}
+        />
+        <Stat
+          label="GPU"
+          value={
+            <span className="text-2xl truncate block">{gpu ? gpu.name : "Not detected"}</span>
+          }
+          hint={
+            gpu
               ? `${(gpu.util_pct ?? 0).toFixed(0)}% util · ${formatBytes((gpu.mem_used_mb ?? 0) * 1024 * 1024)} / ${formatBytes((gpu.mem_total_mb ?? 0) * 1024 * 1024)} VRAM`
-              : "CUDA unavailable"}
-          </div>
-        </div>
+              : "CUDA unavailable"
+          }
+          icon={<Zap className="h-4 w-4 text-success" />}
+        />
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">
@@ -118,12 +134,11 @@ function QuickStartCard() {
     { to: "/paper", label: "Paper trade", Icon: PlayCircle },
   ];
   return (
-    <div className="panel-padded">
-      <h2 className="text-base font-semibold">Quick start</h2>
-      <p className="text-sm text-ink-muted mt-1">
-        Jump straight into a workflow. Each one writes its logs and results into the jobs registry.
-      </p>
-      <div className="mt-4 grid grid-cols-2 gap-2">
+    <Card
+      title="Quick start"
+      subtitle="Jump straight into a workflow. Each one writes its logs and results into the jobs registry."
+    >
+      <div className="grid grid-cols-2 gap-2">
         {items.map(({ to, label, Icon }) => (
           <Link
             key={to}
@@ -136,33 +151,35 @@ function QuickStartCard() {
           </Link>
         ))}
       </div>
-    </div>
+    </Card>
   );
 }
 
 function RunningJobsCard({ jobs, history }: { jobs: JobInfo[]; history: JobInfo[] }) {
+  const rows = [...jobs, ...history].slice(0, 6);
   return (
-    <div className="panel-padded">
-      <h2 className="text-base font-semibold">Recent activity</h2>
-      <div className="mt-3 divide-y divide-bg-border/60">
-        {[...jobs, ...history].slice(0, 6).map((job) => (
-          <div key={job.id} className="flex items-center justify-between py-2.5">
+    <Card title="Recent activity">
+      <div className="divide-y divide-bg-border/60">
+        {rows.map((job) => (
+          <Link
+            key={job.id}
+            to={jobRoute(job.kind)}
+            className="flex items-center justify-between py-2.5 hover:bg-bg-subtle/50 -mx-2 px-2 rounded transition"
+          >
             <div>
               <div className="text-sm font-medium">{job.kind}</div>
               <div className="text-xs text-ink-muted">
                 {formatRelative(job.started)} · id {job.id.slice(0, 6)}
               </div>
             </div>
-            <StatusPill status={job.status} />
-          </div>
+            <StatusBadge status={job.status} />
+          </Link>
         ))}
         {jobs.length + history.length === 0 && (
-          <div className="py-6 text-sm text-ink-muted text-center">
-            No jobs yet. Start one from the sidebar.
-          </div>
+          <EmptyState message="No jobs yet. Start one from the sidebar." />
         )}
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -181,25 +198,21 @@ function LatestPlotCard({
   mtime?: number;
   to: string;
 }) {
-  const jsonName =
-    seriesName ??
-    (pngName?.toLowerCase().endsWith(".png") ? `${pngName.slice(0, -4)}.json` : undefined);
-  const seriesUrl = jsonName ? ApiClient.seriesUrl(jsonName) : undefined;
+  const { seriesUrl } = parseSeries({ plot_path: pngName, series_path: seriesName });
 
   return (
-    <div className="panel-padded">
-      <div className="flex items-start justify-between">
-        <div>
-          <h2 className="text-base font-semibold">{title}</h2>
-          <p className="text-sm text-ink-muted">{subtitle}</p>
-        </div>
+    <Card
+      title={title}
+      subtitle={subtitle}
+      actions={
         <Link to={to} className="btn-ghost text-xs">
           Open <ArrowRight className="h-3.5 w-3.5" />
         </Link>
-      </div>
+      }
+    >
       {pngName ? (
         seriesUrl ? (
-          <div className="mt-4 rounded-lg overflow-hidden border border-bg-border bg-black/40 h-52">
+          <div className="rounded-lg overflow-hidden border border-bg-border bg-black/40 h-52">
             <EquitySeriesChart
               compact
               seriesUrl={seriesUrl}
@@ -208,7 +221,7 @@ function LatestPlotCard({
             />
           </div>
         ) : (
-          <div className="mt-4 rounded-lg overflow-hidden border border-bg-border bg-black/40">
+          <div className="rounded-lg overflow-hidden border border-bg-border bg-black/40">
             <img
               src={ApiClient.outputUrl(pngName)}
               alt={title}
@@ -218,7 +231,7 @@ function LatestPlotCard({
           </div>
         )
       ) : (
-        <div className="mt-4 h-44 rounded-lg border border-dashed border-bg-border grid place-items-center text-sm text-ink-muted">
+        <div className="h-44 rounded-lg border border-dashed border-bg-border grid place-items-center text-sm text-ink-muted">
           <HardDrive className="h-5 w-5 mr-2 inline" /> No plot yet
         </div>
       )}
@@ -227,6 +240,6 @@ function LatestPlotCard({
           {pngName} · {formatRelative(mtime)}
         </div>
       )}
-    </div>
+    </Card>
   );
 }

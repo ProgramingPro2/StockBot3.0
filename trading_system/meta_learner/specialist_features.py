@@ -308,183 +308,6 @@ def _load_cache(
         return None
 
 
-def _tft_checkpoint_meta_path(ckpt_path: Path) -> Path:
-    return ckpt_path.parent / f"{ckpt_path.stem}_meta.json"
-
-
-def _save_tft_checkpoint(
-    ckpt_path: Path,
-    out: np.ndarray,
-    last_bar: int,
-    tickers: list[str],
-    dates: pd.DatetimeIndex,
-    refit_every: int,
-) -> None:
-    """Persist partial TFT walk-forward output plus a JSON sidecar for the web UI."""
-    np.savez_compressed(ckpt_path, out=out, last_bar=np.int64(last_bar))
-    meta = {
-        "kind": "tft_walkforward_checkpoint",
-        "tickers": sorted(tickers),
-        "start_date": str(dates[0].date()),
-        "end_date": str(dates[-1].date()),
-        "refit_every": int(refit_every),
-        "last_bar": int(last_bar),
-        "n_days": int(out.shape[0]),
-        "n_tickers": int(out.shape[1]),
-    }
-    with open(_tft_checkpoint_meta_path(ckpt_path), "w") as f:
-        json.dump(meta, f, indent=2)
-
-
-def _remove_tft_checkpoint(ckpt_path: Path) -> None:
-    try:
-        if ckpt_path.exists():
-            ckpt_path.unlink()
-    except OSError:
-        pass
-    meta_path = _tft_checkpoint_meta_path(ckpt_path)
-    try:
-        if meta_path.exists():
-            meta_path.unlink()
-    except OSError:
-        pass
-
-
-def list_specialist_cache_status() -> dict[str, Any]:
-    """Summarize completed caches and partial TFT checkpoints for the web UI."""
-    from ..config import SPECIALIST_REFIT_EVERY_BARS  # type: ignore[attr-defined]
-
-    cache_dir = SPECIALIST_FEATURES_CACHE_DIR
-    caches: list[dict[str, Any]] = []
-    checkpoints: list[dict[str, Any]] = []
-    seen_ckpt_ids: set[str] = set()
-
-    for meta_path in sorted(cache_dir.glob("*_meta.json")):
-        stem = meta_path.name.replace("_meta.json", "")
-        if stem.startswith("tft_wf_ckpt_"):
-            try:
-                with open(meta_path) as f:
-                    meta = json.load(f)
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.warning("Could not read checkpoint meta %s: %s", meta_path, exc)
-                continue
-            npz_path = cache_dir / f"{stem}.npz"
-            last_bar = int(meta.get("last_bar", 0))
-            n_days = int(meta.get("n_days", 0))
-            progress = (last_bar / n_days) if n_days > 0 else 0.0
-            checkpoints.append(
-                {
-                    "checkpoint_id": stem,
-                    "tickers": meta.get("tickers") or [],
-                    "start_date": meta.get("start_date"),
-                    "end_date": meta.get("end_date"),
-                    "refit_every": meta.get("refit_every"),
-                    "last_bar": last_bar,
-                    "n_days": n_days,
-                    "n_tickers": int(meta.get("n_tickers", 0)),
-                    "progress_pct": round(min(1.0, max(0.0, progress)), 4),
-                    "size_bytes": int(npz_path.stat().st_size) if npz_path.exists() else 0,
-                    "mtime": float(npz_path.stat().st_mtime) if npz_path.exists() else float(meta_path.stat().st_mtime),
-                }
-            )
-            seen_ckpt_ids.add(stem)
-            continue
-
-        npz_path = cache_dir / f"{stem}.npz"
-        if not npz_path.exists():
-            continue
-        try:
-            with open(meta_path) as f:
-                meta = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Could not read cache meta %s: %s", meta_path, exc)
-            continue
-        tickers_raw = meta.get("tickers", [])
-        tickers_list = [str(t).upper() for t in tickers_raw]
-        caches.append(
-            {
-                "cache_key": stem,
-                "start_date": str(meta.get("start_date", "")),
-                "end_date": str(meta.get("end_date", "")),
-                "tickers": tickers_list,
-                "n_days": int(meta.get("n_days", 0)),
-                "n_tickers": int(meta.get("n_assets", meta.get("n_tickers", 0))),
-                "refit_every": int(meta.get("refit_every", 0)),
-                "window": int(meta.get("window", 21)),
-                "size_bytes": int(npz_path.stat().st_size),
-                "mtime": float(npz_path.stat().st_mtime),
-                "generation_seconds": meta.get("generation_time_seconds"),
-            }
-        )
-
-    for npz_path in sorted(cache_dir.glob("tft_wf_ckpt_*.npz")):
-        stem = npz_path.stem
-        if stem in seen_ckpt_ids:
-            continue
-        try:
-            ckpt = np.load(npz_path)
-            last_bar = int(ckpt["last_bar"])
-            out = ckpt["out"]
-            n_days, n_tickers = int(out.shape[0]), int(out.shape[1])
-            progress = (last_bar / n_days) if n_days > 0 else 0.0
-            checkpoints.append(
-                {
-                    "checkpoint_id": stem,
-                    "tickers": [],
-                    "start_date": None,
-                    "end_date": None,
-                    "refit_every": None,
-                    "last_bar": last_bar,
-                    "n_days": n_days,
-                    "n_tickers": n_tickers,
-                    "progress_pct": round(min(1.0, max(0.0, progress)), 4),
-                    "size_bytes": int(npz_path.stat().st_size),
-                    "mtime": float(npz_path.stat().st_mtime),
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not read orphan checkpoint %s: %s", npz_path, exc)
-
-    caches.sort(key=lambda c: c.get("mtime", 0), reverse=True)
-    checkpoints.sort(key=lambda c: c.get("mtime", 0), reverse=True)
-    return {
-        "cache_dir": str(cache_dir),
-        "default_refit_every": int(SPECIALIST_REFIT_EVERY_BARS),
-        "caches": caches,
-        "checkpoints": checkpoints,
-    }
-
-
-def delete_specialist_cache(cache_key: str) -> bool:
-    """Remove a completed specialist matrix cache (.npz + _meta.json)."""
-    key = cache_key.strip()
-    if not key or "/" in key or "\\" in key:
-        return False
-    npz_path = SPECIALIST_FEATURES_CACHE_DIR / f"{key}.npz"
-    meta_path = SPECIALIST_FEATURES_CACHE_DIR / f"{key}_meta.json"
-    removed = False
-    for path in (npz_path, meta_path):
-        try:
-            if path.exists():
-                path.unlink()
-                removed = True
-        except OSError as exc:
-            logger.warning("Could not delete %s: %s", path, exc)
-    return removed
-
-
-def delete_tft_checkpoint(checkpoint_id: str) -> bool:
-    """Remove a partial TFT walk-forward checkpoint (.npz + sidecar meta)."""
-    cid = checkpoint_id.strip()
-    if not cid.startswith("tft_wf_ckpt_") or "/" in cid or "\\" in cid:
-        return False
-    ckpt_path = SPECIALIST_FEATURES_CACHE_DIR / f"{cid}.npz"
-    if not ckpt_path.exists():
-        return False
-    _remove_tft_checkpoint(ckpt_path)
-    return True
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Rule-based specialist functions (vectorized; shift(1) ensures no-lookahead)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -878,6 +701,47 @@ def _walkforward_momentum_scores(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def get_latest_cache_end(
+    tickers: list[str],
+    refit_every: int | None = None,
+    window: int = 21,
+) -> pd.Timestamp | None:
+    """Return the latest `end_date` covered by any compatible completed cache for these tickers.
+
+    Used by the training pipeline to clip OHLCV data so it never requests specialist
+    features beyond what has been pre-computed.  Returns None if no cache exists yet.
+    """
+    if refit_every is None:
+        refit_every = int(SPECIALIST_REFIT_EVERY_BARS)
+    want_tickers = sorted(t.strip().upper() for t in tickers)
+    latest: pd.Timestamp | None = None
+    for meta_path in SPECIALIST_FEATURES_CACHE_DIR.glob("*_meta.json"):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            if meta.get("schema_version") != SCHEMA_VERSION:
+                continue
+            if int(meta.get("refit_every", -1)) != refit_every:
+                continue
+            if int(meta.get("window", -1)) != window:
+                continue
+            cached_tickers = sorted(
+                str(t).strip().upper() for t in meta.get("tickers", [])
+            )
+            if cached_tickers != want_tickers:
+                continue
+            # Verify the .npz actually exists
+            key = meta.get("cache_key") or meta_path.name.replace("_meta.json", "")
+            if not (SPECIALIST_FEATURES_CACHE_DIR / f"{key}.npz").exists():
+                continue
+            end = pd.Timestamp(meta.get("end_date", "1900-01-01"))
+            if latest is None or end > latest:
+                latest = end
+        except Exception:  # noqa: BLE001
+            continue
+    return latest
+
+
 def _tft_checkpoint_path(dates: pd.DatetimeIndex, tickers: list[str], refit_every: int) -> Path:
     """Deterministic path for a TFT walk-forward checkpoint .npz file."""
     raw = f"tft_ckpt:{sorted(tickers)}:{str(dates[0].date())}:{str(dates[-1].date())}:{refit_every}"
@@ -1121,7 +985,7 @@ def _walkforward_tft_scores(
 
         # Save checkpoint so a restart can resume from this window
         try:
-            _save_tft_checkpoint(ckpt_path, out, r_idx, tickers, dates, refit_every)
+            np.savez_compressed(ckpt_path, out=out, last_bar=np.int64(r_idx))
         except OSError as exc:
             logger.warning("TFT checkpoint save failed: %s", exc)
 
@@ -1137,7 +1001,11 @@ def _walkforward_tft_scores(
         return None
 
     # Full run complete — remove checkpoint file
-    _remove_tft_checkpoint(ckpt_path)
+    try:
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+    except OSError:
+        pass
 
     return out
 
@@ -1366,7 +1234,11 @@ def _slice_from_superset_cache(
                 continue
             c_start = pd.Timestamp(meta.get("start_date", "2200-01-01"))
             c_end = pd.Timestamp(meta.get("end_date", "1900-01-01"))
-            if c_start > start_ts or c_end < end_ts:
+            # Allow up to 7 calendar days of end overshoot — the requested end
+            # may be "today" or a weekend/holiday that the cache's last trading
+            # day covers. The mask below clips to actual cached rows.
+            end_overshoot_days = (end_ts - c_end).days
+            if c_start > start_ts or end_overshoot_days > 7:
                 continue
             key = meta.get("cache_key") or meta_path.name.replace("_meta.json", "")
             npz_path = SPECIALIST_FEATURES_CACHE_DIR / f"{key}.npz"

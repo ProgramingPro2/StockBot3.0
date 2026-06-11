@@ -8,18 +8,11 @@ import LogStream from "../components/LogStream";
 import MetricsChart from "../components/MetricsChart";
 import TickerInput from "../components/TickerInput";
 import Field from "../components/Field";
-import { useJobByKind } from "../hooks/useJobByKind";
+import JobRunnerLayout from "../components/JobRunnerLayout";
+import Toggle from "../components/ui/Toggle";
+import { useActiveJob } from "../hooks/useActiveJob";
 import { useDefaultTickers, useStaticConfig } from "../hooks/useStaticConfig";
-
-function studyOptionLabel(s: TuneStudySummary): string {
-  if (s.error) return `${s.name} (load error)`;
-  const bits: string[] = [`${s.n_trials} trials`];
-  if (s.best_value != null && Number.isFinite(s.best_value)) {
-    bits.push(`best ${s.best_value.toFixed(4)}`);
-    if (s.best_trial != null) bits.push(`trial #${s.best_trial}`);
-  }
-  return `${s.name} — ${bits.join(", ")}`;
-}
+import { studyOptionLabel } from "../lib/format";
 
 export default function Tune() {
   const defaults = useDefaultTickers();
@@ -42,10 +35,8 @@ export default function Tune() {
   const [ppoDevice, setPpoDevice] = useState<"" | "cpu" | "cuda">("");
   const [calibrationNote, setCalibrationNote] = useState<string | null>(null);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
-  const [activeId, setActiveId] = useState<string | null>(null);
 
-  const job = useJobByKind("tune");
-  const jobId = activeId ?? job?.id ?? null;
+  const { job, jobId, onStarted } = useActiveJob("tune");
   const staticConfig = useStaticConfig();
   const envPpoDevice = String(staticConfig.data?.values?.PPO_DEVICE ?? "cuda");
 
@@ -61,10 +52,6 @@ export default function Tune() {
       setStudiesLoading(false);
     }
   }, []);
-
-  useEffect(() => {
-    if (!activeId && job?.id) setActiveId(job.id);
-  }, [activeId, job?.id]);
 
   useEffect(() => {
     if (newStudy) return;
@@ -118,229 +105,205 @@ export default function Tune() {
         icon={<SlidersHorizontal className="h-6 w-6" />}
       />
 
-      <div className="grid gap-6 xl:grid-cols-[420px,1fr]">
-        <div className="panel-padded space-y-4">
-          <Field label="Tickers" hint="Default uses TRADE_TICKERS from .env.">
-            <TickerInput value={tickers} onChange={setTickers} defaultTickers={defaults} />
-          </Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Trials">
-              <input
-                type="number"
-                className="input"
-                min={1}
-                value={nTrials}
-                onChange={(e) => setNTrials(parseInt(e.target.value || "1", 10))}
-              />
+      <JobRunnerLayout
+        configPanel={
+          <>
+            <Field label="Tickers" hint="Default uses TRADE_TICKERS from .env.">
+              <TickerInput value={tickers} onChange={setTickers} defaultTickers={defaults} />
             </Field>
-            <Field label="Timesteps / trial">
-              <input
-                type="number"
-                className="input"
-                min={1000}
-                step={5000}
-                value={timesteps}
-                onChange={(e) => setTimesteps(parseInt(e.target.value || "0", 10))}
-              />
-            </Field>
-          </div>
-          <Field label="Timeout (seconds)">
-            <input
-              type="number"
-              className="input"
-              min={0}
-              value={timeout}
-              onChange={(e) => setTimeout(parseInt(e.target.value || "0", 10))}
-            />
-          </Field>
-
-          <div className="border-t border-ink-muted/20 pt-3 space-y-3">
-            <h3 className="text-sm font-semibold text-ink">PPO performance</h3>
             <div className="grid grid-cols-2 gap-3">
-              <Field
-                label="Parallel envs"
-                hint="Leave empty for server default (min(32, CPU count))."
-              >
+              <Field label="Trials">
                 <input
                   type="number"
                   className="input"
                   min={1}
-                  value={nEnvs}
-                  onChange={(e) =>
-                    setNEnvs(e.target.value === "" ? "" : parseInt(e.target.value, 10))
-                  }
-                  placeholder="default"
+                  value={nTrials}
+                  onChange={(e) => setNTrials(parseInt(e.target.value || "1", 10))}
                 />
               </Field>
-              <Field
-                label="Parallel Optuna trials"
-                hint="Leave empty for PPO_PARALLEL_TRIALS from .env (usually 1)."
-              >
+              <Field label="Timesteps / trial">
                 <input
                   type="number"
                   className="input"
-                  min={1}
-                  value={parallelTrials}
-                  onChange={(e) =>
-                    setParallelTrials(
-                      e.target.value === "" ? "" : parseInt(e.target.value, 10),
-                    )
-                  }
-                  placeholder="default"
+                  min={1000}
+                  step={5000}
+                  value={timesteps}
+                  onChange={(e) => setTimesteps(parseInt(e.target.value || "0", 10))}
                 />
               </Field>
             </div>
-            <button
-              type="button"
-              className="btn-secondary flex w-full items-center justify-center gap-2 text-sm"
-              onClick={() => void applyCalibration()}
-              disabled={calibrationBusy}
-            >
-              <Wand2 className="h-4 w-4" />
-              {calibrationBusy ? "Detecting…" : "Auto-fill for this machine"}
-            </button>
-            {calibrationNote ? (
-              <p className="text-xs text-ink-muted leading-relaxed">{calibrationNote}</p>
-            ) : null}
-            <Field
-              label="PPO device"
-              hint={`Default uses PPO_DEVICE from .env (${envPpoDevice}). CPU is often faster for small MLPs with many envs.`}
-            >
-              <select
-                className="input w-full"
-                value={ppoDevice}
-                onChange={(e) => setPpoDevice(e.target.value as "" | "cpu" | "cuda")}
-              >
-                <option value="">Default ({envPpoDevice})</option>
-                <option value="cpu">CPU</option>
-                <option value="cuda">GPU (CUDA)</option>
-              </select>
-            </Field>
-            <Toggle
-              label="Batched vec env (historical-only, less Subproc IPC)"
-              checked={torchVec}
-              onChange={setTorchVec}
-            />
-          </div>
-
-          {newStudy ? (
-            <Field label="Study name (optional; empty → auto-generated)">
+            <Field label="Timeout (seconds)">
               <input
+                type="number"
                 className="input"
-                value={studyName}
-                onChange={(e) => setStudyName(e.target.value)}
-                placeholder="my_study"
+                min={0}
+                value={timeout}
+                onChange={(e) => setTimeout(parseInt(e.target.value || "0", 10))}
               />
             </Field>
-          ) : (
-            <div className="space-y-3">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+
+            <div className="border-t border-ink-muted/20 pt-3 space-y-3">
+              <h3 className="text-sm font-semibold text-ink">PPO performance</h3>
+              <div className="grid grid-cols-2 gap-3">
                 <Field
-                  label="Resume study"
-                  hint="Lists Optuna studies from models/meta_learner/ppo_tune_study.db."
-                  className="min-w-0 flex-1"
+                  label="Parallel envs"
+                  hint="Leave empty for server default (min(32, CPU count))."
                 >
-                  <select
-                    className="input w-full"
-                    value={resumeSelect}
-                    onChange={(e) => setResumeSelect(e.target.value)}
+                  <input
+                    type="number"
+                    className="input"
+                    min={1}
+                    value={nEnvs}
+                    onChange={(e) =>
+                      setNEnvs(e.target.value === "" ? "" : parseInt(e.target.value, 10))
+                    }
+                    placeholder="default"
+                  />
+                </Field>
+                <Field
+                  label="Parallel Optuna trials"
+                  hint="Leave empty for PPO_PARALLEL_TRIALS from .env (usually 1)."
+                >
+                  <input
+                    type="number"
+                    className="input"
+                    min={1}
+                    value={parallelTrials}
+                    onChange={(e) =>
+                      setParallelTrials(
+                        e.target.value === "" ? "" : parseInt(e.target.value, 10),
+                      )
+                    }
+                    placeholder="default"
+                  />
+                </Field>
+              </div>
+              <button
+                type="button"
+                className="btn-secondary flex w-full items-center justify-center gap-2 text-sm"
+                onClick={() => void applyCalibration()}
+                disabled={calibrationBusy}
+              >
+                <Wand2 className="h-4 w-4" />
+                {calibrationBusy ? "Detecting…" : "Auto-fill for this machine"}
+              </button>
+              {calibrationNote ? (
+                <p className="text-xs text-ink-muted leading-relaxed">{calibrationNote}</p>
+              ) : null}
+              <Field
+                label="PPO device"
+                hint={`Default uses PPO_DEVICE from .env (${envPpoDevice}). CPU is often faster for small MLPs with many envs.`}
+              >
+                <select
+                  className="input w-full"
+                  value={ppoDevice}
+                  onChange={(e) => setPpoDevice(e.target.value as "" | "cpu" | "cuda")}
+                >
+                  <option value="">Default ({envPpoDevice})</option>
+                  <option value="cpu">CPU</option>
+                  <option value="cuda">GPU (CUDA)</option>
+                </select>
+              </Field>
+              <Toggle
+                label="Batched vec env (historical-only, less Subproc IPC)"
+                checked={torchVec}
+                onChange={setTorchVec}
+              />
+            </div>
+
+            {newStudy ? (
+              <Field label="Study name (optional; empty → auto-generated)">
+                <input
+                  className="input"
+                  value={studyName}
+                  onChange={(e) => setStudyName(e.target.value)}
+                  placeholder="my_study"
+                />
+              </Field>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                  <Field
+                    label="Resume study"
+                    hint="Lists Optuna studies from models/meta_learner/ppo_tune_study.db."
+                    className="min-w-0 flex-1"
+                  >
+                    <select
+                      className="input w-full"
+                      value={resumeSelect}
+                      onChange={(e) => setResumeSelect(e.target.value)}
+                      disabled={studiesLoading}
+                    >
+                      <option value="">Default (ppo_tune)</option>
+                      {studies.map((s) => (
+                        <option key={s.name} value={s.name}>
+                          {studyOptionLabel(s)}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  <button
+                    type="button"
+                    className="btn-secondary flex shrink-0 items-center justify-center gap-2 px-3 py-2 text-sm"
+                    onClick={() => void loadStudies()}
                     disabled={studiesLoading}
                   >
-                    <option value="">Default (ppo_tune)</option>
-                    {studies.map((s) => (
-                      <option key={s.name} value={s.name}>
-                        {studyOptionLabel(s)}
-                      </option>
-                    ))}
-                  </select>
+                    <RefreshCw className={`h-4 w-4 ${studiesLoading ? "animate-spin" : ""}`} />
+                    Refresh list
+                  </button>
+                </div>
+                {studiesError ? (
+                  <p className="text-sm text-danger">{studiesError}</p>
+                ) : null}
+                {!studiesLoading && studies.length === 0 && !studiesError ? (
+                  <p className="text-sm text-ink-muted">
+                    No studies in storage yet; run will use the default study name ppo_tune.
+                  </p>
+                ) : null}
+                <Field label="Custom study name (optional)" hint="Overrides the dropdown if set.">
+                  <input
+                    className="input"
+                    value={resumeOverride}
+                    onChange={(e) => setResumeOverride(e.target.value)}
+                    placeholder="Exact Optuna study name"
+                  />
                 </Field>
-                <button
-                  type="button"
-                  className="btn-secondary flex shrink-0 items-center justify-center gap-2 px-3 py-2 text-sm"
-                  onClick={() => void loadStudies()}
-                  disabled={studiesLoading}
-                >
-                  <RefreshCw className={`h-4 w-4 ${studiesLoading ? "animate-spin" : ""}`} />
-                  Refresh list
-                </button>
               </div>
-              {studiesError ? (
-                <p className="text-sm text-rose-600 dark:text-rose-400">{studiesError}</p>
-              ) : null}
-              {!studiesLoading && studies.length === 0 && !studiesError ? (
-                <p className="text-sm text-ink-muted">
-                  No studies in storage yet; run will use the default study name ppo_tune.
-                </p>
-              ) : null}
-              <Field label="Custom study name (optional)" hint="Overrides the dropdown if set.">
-                <input
-                  className="input"
-                  value={resumeOverride}
-                  onChange={(e) => setResumeOverride(e.target.value)}
-                  placeholder="Exact Optuna study name"
-                />
-              </Field>
+            )}
+            <div className="space-y-2">
+              <Toggle label="Start new study" checked={newStudy} onChange={setNewStudy} />
+              <Toggle
+                label="Use historical data only (no mixed trials)"
+                checked={useHistorical}
+                onChange={setUseHistorical}
+              />
+              <Toggle
+                label="Single PyTorch thread (reproducible)"
+                checked={singleThread}
+                onChange={setSingleThread}
+              />
             </div>
-          )}
-          <div className="space-y-2">
-            <Toggle label="Start new study" checked={newStudy} onChange={setNewStudy} />
-            <Toggle
-              label="Use historical data only (no mixed trials)"
-              checked={useHistorical}
-              onChange={setUseHistorical}
+            <JobControl
+              job={job}
+              onStart={onStart}
+              startLabel="Start tuning"
+              startIcon={<Play className="h-4 w-4" />}
+              busyLabel="Submitting…"
+              onStarted={onStarted}
             />
-            <Toggle
-              label="Single PyTorch thread (reproducible)"
-              checked={singleThread}
-              onChange={setSingleThread}
-            />
-          </div>
-          <JobControl
-            job={job}
-            onStart={onStart}
-            startLabel="Start tuning"
-            startIcon={<Play className="h-4 w-4" />}
-            busyLabel="Submitting…"
-            onStarted={(info) => setActiveId(info.id)}
-          />
-        </div>
-
-        <div className="space-y-4 min-w-0">
-          {jobId ? (
+          </>
+        }
+        resultsPanel={
+          jobId ? (
             <>
               <JobStatusCard job={job?.id === jobId ? job : null} />
               <MetricsChart jobId={jobId} />
               <LogStream jobId={jobId} />
             </>
-          ) : (
-            <div className="panel-padded text-sm text-ink-muted">
-              Configure a run on the left and start it to see Optuna trials stream here.
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function Toggle({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <label className="flex items-center justify-between gap-3 rounded-lg border border-bg-border bg-bg-subtle px-3 py-2 text-sm cursor-pointer">
-      <span>{label}</span>
-      <input
-        type="checkbox"
-        className="h-4 w-4 accent-accent"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
+          ) : null
+        }
+        emptyMessage="Configure a run on the left and start it to see Optuna trials stream here."
       />
-    </label>
+    </div>
   );
 }

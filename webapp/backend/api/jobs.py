@@ -15,9 +15,7 @@ from ..schemas import (
     JobInfo,
     JobListResponse,
     PaperLiveParams,
-    SpecialistCacheDeleteResponse,
     SpecialistCacheParams,
-    SpecialistCacheStatusResponse,
     StartJobResponse,
     StopJobResponse,
     TrainParams,
@@ -124,36 +122,104 @@ def start_specialist_cache(params: SpecialistCacheParams) -> StartJobResponse:
     return StartJobResponse(job=info)
 
 
-@router.get("/specialist-cache/status", response_model=SpecialistCacheStatusResponse)
-def specialist_cache_status() -> SpecialistCacheStatusResponse:
-    """List completed specialist matrices and partial TFT checkpoints (resume targets)."""
-    from trading_system.meta_learner.specialist_features import list_specialist_cache_status
+@router.get("/specialist-cache/status")
+def get_specialist_cache_status() -> dict[str, Any]:
+    """Return all completed caches and any TFT checkpoints in the cache directory."""
+    import numpy as np
 
-    return SpecialistCacheStatusResponse(**list_specialist_cache_status())
+    from trading_system.meta_learner.specialist_features import (
+        SPECIALIST_FEATURES_CACHE_DIR,
+    )
+
+    caches: list[dict[str, Any]] = []
+    checkpoints: list[dict[str, Any]] = []
+
+    cache_dir = SPECIALIST_FEATURES_CACHE_DIR
+    if not cache_dir.exists():
+        return {"caches": caches, "checkpoints": checkpoints}
+
+    # Completed caches (look for *_meta.json sidecar files)
+    for meta_path in sorted(cache_dir.glob("*_meta.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            key = meta.get("cache_key") or meta_path.name.replace("_meta.json", "")
+            npz = cache_dir / f"{key}.npz"
+            if not npz.exists():
+                continue
+            slot_src = meta.get("slot_sources", {})
+            real_slots = sum(1 for v in slot_src.values() if v in ("specialist", "real"))
+            proxy_slots = len(slot_src) - real_slots
+            caches.append({
+                "cache_key": key,
+                "start_date": meta.get("start_date"),
+                "end_date": meta.get("end_date"),
+                "n_days": meta.get("n_days"),
+                "n_tickers": meta.get("n_tickers"),
+                "tickers": meta.get("tickers", []),
+                "size_bytes": npz.stat().st_size,
+                "mtime": npz.stat().st_mtime,
+                "slot_sources": slot_src,
+                "real_slots": real_slots,
+                "proxy_slots": proxy_slots,
+                "elapsed_seconds": meta.get("elapsed_seconds"),
+                "refit_every": meta.get("refit_every"),
+            })
+        except Exception:
+            continue
+
+    # TFT checkpoints (partial builds)
+    for ckpt in sorted(cache_dir.glob("tft_wf_ckpt_*.npz"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = np.load(str(ckpt), allow_pickle=False)
+            last_bar = int(data["last_bar"])
+            out_shape = data["out"].shape
+            n_days = out_shape[0]
+            caches_for_key = [c for c in caches if c.get("cache_key") == ckpt.stem.replace("tft_wf_ckpt_", "")]
+            # Try to find matching meta from any cache that overlaps
+            checkpoints.append({
+                "checkpoint_id": ckpt.name,
+                "last_bar": last_bar,
+                "n_days": n_days,
+                "progress_pct": round(last_bar / max(n_days, 1), 4),
+                "tickers": [],
+                "start_date": None,
+                "end_date": None,
+                "mtime": ckpt.stat().st_mtime,
+            })
+        except Exception:
+            continue
+
+    return {"caches": caches, "checkpoints": checkpoints}
 
 
-@router.delete(
-    "/specialist-cache/caches/{cache_key}",
-    response_model=SpecialistCacheDeleteResponse,
-)
-def delete_specialist_cache(cache_key: str) -> SpecialistCacheDeleteResponse:
-    from trading_system.meta_learner.specialist_features import delete_specialist_cache as _delete
+@router.delete("/specialist-cache/{cache_key}")
+def delete_specialist_cache(cache_key: str) -> dict[str, Any]:
+    """Delete a completed specialist cache (.npz + _meta.json)."""
+    from trading_system.meta_learner.specialist_features import SPECIALIST_FEATURES_CACHE_DIR
 
-    if _delete(cache_key):
-        return SpecialistCacheDeleteResponse(ok=True, detail=f"Deleted cache {cache_key}")
-    raise HTTPException(status_code=404, detail="cache not found")
+    deleted: list[str] = []
+    for suffix in (".npz", "_meta.json"):
+        p = SPECIALIST_FEATURES_CACHE_DIR / f"{cache_key}{suffix}"
+        if p.exists():
+            p.unlink()
+            deleted.append(p.name)
+    return {"deleted": deleted}
 
 
-@router.delete(
-    "/specialist-cache/checkpoints/{checkpoint_id}",
-    response_model=SpecialistCacheDeleteResponse,
-)
-def delete_specialist_checkpoint(checkpoint_id: str) -> SpecialistCacheDeleteResponse:
-    from trading_system.meta_learner.specialist_features import delete_tft_checkpoint
+@router.delete("/specialist-cache/checkpoint/{checkpoint_id}")
+def delete_specialist_checkpoint(checkpoint_id: str) -> dict[str, Any]:
+    """Delete a TFT checkpoint file."""
+    from trading_system.meta_learner.specialist_features import SPECIALIST_FEATURES_CACHE_DIR
 
-    if delete_tft_checkpoint(checkpoint_id):
-        return SpecialistCacheDeleteResponse(ok=True, detail=f"Deleted checkpoint {checkpoint_id}")
-    raise HTTPException(status_code=404, detail="checkpoint not found")
+    # Sanitize: only allow the expected filename pattern
+    if not checkpoint_id.startswith("tft_wf_ckpt_") or ".." in checkpoint_id:
+        raise HTTPException(status_code=400, detail="invalid checkpoint id")
+    p = SPECIALIST_FEATURES_CACHE_DIR / checkpoint_id
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="checkpoint not found")
+    p.unlink()
+    return {"deleted": checkpoint_id}
 
 
 @router.post("/{job_id}/stop", response_model=StopJobResponse)

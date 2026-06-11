@@ -113,18 +113,16 @@ export const ApiClient = {
   startSpecialistCache: (params: SpecialistCacheParams) =>
     api.post("/api/jobs/specialist-cache/start", params).then((r) => r.data.job),
   getSpecialistCacheStatus: () =>
-    api.get<SpecialistCacheStatus>("/api/jobs/specialist-cache/status").then((r) => r.data),
-  deleteSpecialistCache: (cacheKey: string) =>
     api
-      .delete<{ ok: boolean; detail: string }>(
-        `/api/jobs/specialist-cache/caches/${encodeURIComponent(cacheKey)}`,
+      .get<{ caches: SpecialistCacheEntry[]; checkpoints: SpecialistCacheCheckpoint[] }>(
+        "/api/jobs/specialist-cache/status",
       )
       .then((r) => r.data),
+  deleteSpecialistCache: (cacheKey: string) =>
+    api.delete(`/api/jobs/specialist-cache/${encodeURIComponent(cacheKey)}`).then((r) => r.data),
   deleteSpecialistCheckpoint: (checkpointId: string) =>
     api
-      .delete<{ ok: boolean; detail: string }>(
-        `/api/jobs/specialist-cache/checkpoints/${encodeURIComponent(checkpointId)}`,
-      )
+      .delete(`/api/jobs/specialist-cache/checkpoint/${encodeURIComponent(checkpointId)}`)
       .then((r) => r.data),
   stopJob: (id: string) => api.post(`/api/jobs/${id}/stop`).then((r) => r.data.job),
   killJob: (id: string) => api.post(`/api/jobs/${id}/kill`).then((r) => r.data.job),
@@ -166,39 +164,34 @@ export type SpecialistCacheParams = {
   force_rebuild?: boolean;
 };
 
-export type SpecialistCacheEntry = {
-  cache_key: string;
-  start_date: string;
-  end_date: string;
-  tickers: string[];
-  n_days: number;
-  n_tickers: number;
-  refit_every: number;
-  window: number;
-  size_bytes: number;
-  mtime: number;
-  generation_seconds?: number | null;
-};
-
 export type SpecialistCacheCheckpoint = {
   checkpoint_id: string;
+  last_bar: number;
+  n_days: number;
+  progress_pct: number;
   tickers: string[];
   start_date?: string | null;
   end_date?: string | null;
   refit_every?: number | null;
-  last_bar: number;
-  n_days: number;
-  n_tickers: number;
-  progress_pct: number;
-  size_bytes: number;
+  window?: number | null;
   mtime: number;
 };
 
-export type SpecialistCacheStatus = {
-  cache_dir: string;
-  default_refit_every: number;
-  caches: SpecialistCacheEntry[];
-  checkpoints: SpecialistCacheCheckpoint[];
+export type SpecialistCacheEntry = {
+  cache_key: string;
+  start_date: string;
+  end_date: string;
+  n_days: number;
+  n_tickers: number;
+  tickers: string[];
+  size_bytes: number;
+  mtime: number;
+  slot_sources?: Record<string, string> | null;
+  real_slots?: number | null;
+  proxy_slots?: number | null;
+  elapsed_seconds?: number | null;
+  refit_every?: number | null;
+  window?: number | null;
 };
 
 export type ModelInfo = {

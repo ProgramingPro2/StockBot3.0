@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Play, Square, XOctagon } from "lucide-react";
 import { useState } from "react";
 import { ApiClient, type JobInfo } from "../lib/api";
-import StatusPill from "./StatusPill";
+import { ConfirmDialog, StatusBadge } from "./ui";
 
 type Props = {
   job: JobInfo | null;
@@ -29,6 +29,7 @@ export default function JobControl({
 }: Props) {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
+  const [killPending, setKillPending] = useState(false);
 
   const startMut = useMutation({
     mutationFn: onStart,
@@ -54,16 +55,6 @@ export default function JobControl({
     job?.status === "pending" ||
     job?.status === "stopping";
   const isStopping = job?.status === "stopping";
-
-  const onKillClick = () => {
-    if (!job) return;
-    const ok = window.confirm(
-      "Force-kill this job? Partial progress (best params, checkpoints) may not be saved. Use Stop first for a clean exit."
-    );
-    if (!ok) return;
-    setError(null);
-    killMut.mutate(job.id);
-  };
 
   return (
     <div className="space-y-2">
@@ -109,7 +100,7 @@ export default function JobControl({
             <button
               type="button"
               disabled={killMut.isPending}
-              onClick={onKillClick}
+              onClick={() => setKillPending(true)}
               className="btn-danger"
               title="Force kill: SIGKILL the subprocess immediately (no graceful save)"
             >
@@ -122,13 +113,29 @@ export default function JobControl({
             </button>
           </>
         )}
-        {job && <StatusPill status={job.status} />}
+        {job && <StatusBadge status={job.status} />}
         {job?.id && <span className="text-xs text-ink-muted">id: {job.id}</span>}
       </div>
       {error && <div className="text-sm text-danger">{error}</div>}
       {disabled && disabledReason && (
         <div className="text-xs text-ink-muted">{disabledReason}</div>
       )}
+
+      <ConfirmDialog
+        open={killPending}
+        title="Force kill job"
+        message="Force-kill this job? Partial progress (best params, checkpoints) may not be saved. Use Stop first for a clean exit."
+        confirmLabel="Kill"
+        destructive
+        onCancel={() => setKillPending(false)}
+        onConfirm={() => {
+          if (job) {
+            setError(null);
+            killMut.mutate(job.id);
+          }
+          setKillPending(false);
+        }}
+      />
     </div>
   );
 }

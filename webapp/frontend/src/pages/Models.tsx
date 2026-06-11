@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Package, Star, Trash2 } from "lucide-react";
-import { ApiClient, type ModelInfo, type ModelsResponse } from "../lib/api";
+import { ApiClient, type ModelsResponse } from "../lib/api";
 import PageHeader from "../components/PageHeader";
+import { ConfirmDialog, useToast } from "../components/ui";
 import { formatBytes, formatRelative } from "../lib/format";
 
 export default function Models() {
   const qc = useQueryClient();
-  const [error, setError] = useState<string | null>(null);
+  const toast = useToast();
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const models = useQuery<ModelsResponse>({
     queryKey: ["models"],
     queryFn: ApiClient.models,
@@ -16,13 +18,19 @@ export default function Models() {
 
   const setDefault = useMutation({
     mutationFn: (name: string | null) => ApiClient.setLiveDefault(name),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["models"] }),
-    onError: (err: Error) => setError(err.message),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["models"] });
+      toast.add("Live default updated", "success");
+    },
+    onError: (err: Error) => toast.add(err.message, "error"),
   });
   const deleteOne = useMutation({
     mutationFn: (name: string) => ApiClient.deleteModel(name),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["models"] }),
-    onError: (err: Error) => setError(err.message),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["models"] });
+      toast.add("Model deleted", "success");
+    },
+    onError: (err: Error) => toast.add(err.message, "error"),
   });
 
   return (
@@ -32,9 +40,6 @@ export default function Models() {
         description="PPO models saved under trading_system/models/meta_learner. Star one to set it as the default for live trading."
         icon={<Package className="h-6 w-6" />}
       />
-      {error && (
-        <div className="panel-padded border-danger/30 text-danger text-sm">{error}</div>
-      )}
       <div className="panel overflow-hidden">
           <table className="table-clean">
           <thead>
@@ -60,8 +65,8 @@ export default function Models() {
                       <span
                         className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${
                           featureSource === "specialist"
-                            ? "bg-violet-500/15 text-violet-300"
-                            : "bg-sky-500/15 text-sky-300"
+                            ? "bg-accent/15 text-accent"
+                            : "bg-info/15 text-info"
                         }`}
                       >
                         {featureSource}
@@ -94,15 +99,7 @@ export default function Models() {
                   <td className="text-right">
                     <button
                       className="btn-ghost text-danger"
-                      onClick={() => {
-                        if (
-                          confirm(
-                            `Delete ${m.name}? This cannot be undone.`,
-                          )
-                        ) {
-                          deleteOne.mutate(m.name);
-                        }
-                      }}
+                      onClick={() => setConfirmDelete(m.name)}
                       disabled={deleteOne.isPending || isDefault}
                       title={isDefault ? "Unset live default first" : undefined}
                     >
@@ -114,7 +111,7 @@ export default function Models() {
             })}
             {models.data?.models.length === 0 && (
               <tr>
-                <td colSpan={5} className="text-center py-8 text-ink-muted">
+                <td colSpan={7} className="text-center py-8 text-ink-muted">
                   No models yet. Run a training job to create one.
                 </td>
               </tr>
@@ -130,6 +127,19 @@ export default function Models() {
           Clear live default
         </button>
       )}
+
+      <ConfirmDialog
+        open={confirmDelete !== null}
+        title="Delete model"
+        message={`Delete ${confirmDelete}? This cannot be undone.`}
+        confirmLabel="Delete"
+        destructive
+        onCancel={() => setConfirmDelete(null)}
+        onConfirm={() => {
+          if (confirmDelete) deleteOne.mutate(confirmDelete);
+          setConfirmDelete(null);
+        }}
+      />
     </div>
   );
 }

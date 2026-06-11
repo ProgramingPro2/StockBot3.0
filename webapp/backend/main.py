@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="The Boardroom - Web UI",
-    version="1.0.0",
+    version="2.0.0",
     description="Control plane for The Boardroom hierarchical multi-agent trading system.",
     lifespan=lifespan,
 )

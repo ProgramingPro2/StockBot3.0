@@ -553,6 +553,40 @@ def cmd_train(args: argparse.Namespace) -> None:
     _aligned_train = None
     if historical_ratio > 0:
         aligned_full, returns_array = _load_aligned_returns(tickers)
+
+        # When using specialist features, clip the OHLCV data to the latest
+        # date covered by a completed specialist cache.  This ensures the
+        # chronological split never produces training/validation/test windows
+        # that extend beyond the pre-computed feature matrix, which would
+        # otherwise trigger an expensive cache rebuild for just a few days.
+        if (
+            FEATURE_SOURCE == "specialist"
+            and returns_array is not None
+            and aligned_full is not None
+        ):
+            try:
+                from ..meta_learner.specialist_features import get_latest_cache_end
+
+                _cache_end = get_latest_cache_end(tickers=tickers)
+                if _cache_end is not None:
+                    _data_end = pd.Timestamp(aligned_full.index[-1]).normalize()
+                    if _data_end > _cache_end:
+                        _clip = aligned_full.index <= _cache_end
+                        _n_before = int(len(aligned_full))
+                        aligned_full = aligned_full.loc[_clip]
+                        returns_array = returns_array[: int(_clip.sum())]
+                        logger.info(
+                            "Clipped OHLCV data from %s → %s to match specialist "
+                            "cache end (%d → %d trading days). "
+                            "Run 'specialist-cache --force-rebuild' to extend the cache.",
+                            _data_end.date(),
+                            _cache_end.date(),
+                            _n_before,
+                            len(aligned_full),
+                        )
+            except Exception as _clip_ex:
+                logger.debug("Specialist cache end check failed (non-fatal): %s", _clip_ex)
+
         if returns_array is not None and aligned_full is not None:
             train_returns, test_returns, _aligned_train, aligned_test = _chronological_train_test_split(
                 aligned_full, returns_array

@@ -18,8 +18,7 @@ import {
 } from "recharts";
 import type { EquitySeries, RebalanceEvent } from "../lib/series";
 import { useSeries } from "../lib/series";
-
-const TICK_COLORS = ["#7c5cff", "#34d399", "#f87171", "#fbbf24", "#22d3ee", "#f472b6", "#a78bfa", "#fb923c"];
+import { AXIS_STROKE, CHART_COLORS, GRID_STROKE, LABEL_STYLE, TOOLTIP_STYLE } from "../lib/theme";
 
 function binReturns(values: number[], binCount: number): { label: string; count: number }[] {
   const clean = values.filter((v) => Number.isFinite(v));
@@ -79,13 +78,6 @@ function augmentRows(
     };
   });
 }
-
-const tooltipStyle = {
-  background: "#11141c",
-  border: "1px solid #1f2430",
-  borderRadius: 8,
-  fontSize: 12,
-};
 
 type Props = {
   seriesUrl: string;
@@ -193,7 +185,7 @@ export default function EquitySeriesChart({
     const dateStr = i !== undefined ? series.dates[i] : "";
     const trades = pl.rebTrades;
     return (
-      <div className="rounded-lg border border-bg-border px-2 py-1.5 text-xs" style={tooltipStyle}>
+      <div className="rounded-lg border border-bg-border px-2 py-1.5 text-xs" style={TOOLTIP_STYLE}>
         <div className="text-ink-muted mb-1">{dateStr}</div>
         {payload.map((p, idx) => {
           const entry = p as { name?: string; value?: number; dataKey?: string | number };
@@ -225,17 +217,17 @@ export default function EquitySeriesChart({
       <div className="panel overflow-hidden bg-black/40" style={{ height: equityHeight }}>
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart data={chartRows} margin={{ left: 4, right: 8, top: 8, bottom: 0 }} syncId="equitySync">
-            <CartesianGrid stroke="#1f2430" strokeDasharray="3 3" />
+            <CartesianGrid stroke={GRID_STROKE} strokeDasharray="3 3" />
             <XAxis
               dataKey="idx"
               type="number"
               domain={["dataMin", "dataMax"]}
-              stroke="#6b7280"
+              stroke={AXIS_STROKE}
               fontSize={10}
               tickFormatter={tickFormatter}
             />
             <YAxis
-              stroke="#6b7280"
+              stroke={AXIS_STROKE}
               fontSize={10}
               width={52}
               tickFormatter={(v) =>
@@ -243,17 +235,17 @@ export default function EquitySeriesChart({
               }
             />
             <Tooltip content={equityTooltip as React.ComponentProps<typeof Tooltip>["content"]} />
-            <ReferenceLine y={cap} stroke="#4b5563" strokeDasharray="4 4" />
-            <Line type="monotone" dataKey="equity" name="Strategy" stroke="#7c5cff" dot={false} strokeWidth={2} isAnimationActive={false} />
-            <Line type="monotone" dataKey="bh" name="Buy & hold" stroke="#6b7280" dot={false} strokeWidth={1.5} isAnimationActive={false} />
-            <Scatter name="Rebalance +" dataKey="rebUp" fill="#34d399" shape="triangle" isAnimationActive={false} />
-            <Scatter name="Rebalance -" dataKey="rebDown" fill="#f87171" shape="triangle" isAnimationActive={false} />
-            <Scatter name="Rebalance" dataKey="rebFlat" fill="#9ca3af" shape="square" isAnimationActive={false} />
+            <ReferenceLine y={cap} stroke={AXIS_STROKE} strokeDasharray="4 4" />
+            <Line type="monotone" dataKey="equity" name="Strategy" stroke={CHART_COLORS[0]} dot={false} strokeWidth={2} isAnimationActive={false} />
+            <Line type="monotone" dataKey="bh" name="Buy & hold" stroke={AXIS_STROKE} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+            <Scatter name="Rebalance +" dataKey="rebUp" fill={CHART_COLORS[1]} shape="triangle" isAnimationActive={false} />
+            <Scatter name="Rebalance -" dataKey="rebDown" fill={CHART_COLORS[2]} shape="triangle" isAnimationActive={false} />
+            <Scatter name="Rebalance" dataKey="rebFlat" fill={LABEL_STYLE.color} shape="square" isAnimationActive={false} />
             {!compact && (
               <Brush
                 dataKey="idx"
                 height={brushHeight}
-                stroke="#4b5563"
+                stroke={AXIS_STROKE}
                 travellerWidth={8}
                 tickFormatter={tickFormatter}
               />
@@ -267,11 +259,11 @@ export default function EquitySeriesChart({
           <div className="panel overflow-hidden bg-black/40" style={{ height: 160 }}>
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={chartRows} margin={{ left: 4, right: 8, top: 4, bottom: 0 }} syncId="equitySync">
-                <CartesianGrid stroke="#1f2430" strokeDasharray="3 3" />
-                <XAxis dataKey="idx" type="number" domain={["dataMin", "dataMax"]} stroke="#6b7280" fontSize={10} tickFormatter={tickFormatter} />
-                <YAxis stroke="#6b7280" fontSize={10} width={52} tickFormatter={(v) => `${(Number(v) * 100).toFixed(0)}%`} />
+                <CartesianGrid stroke={GRID_STROKE} strokeDasharray="3 3" />
+                <XAxis dataKey="idx" type="number" domain={["dataMin", "dataMax"]} stroke={AXIS_STROKE} fontSize={10} tickFormatter={tickFormatter} />
+                <YAxis stroke={AXIS_STROKE} fontSize={10} width={52} tickFormatter={(v) => `${(Number(v) * 100).toFixed(0)}%`} />
                 <Tooltip
-                  contentStyle={tooltipStyle}
+                  contentStyle={TOOLTIP_STYLE}
                   labelFormatter={(_, p) => {
                     const pl = p?.[0]?.payload as { idx?: number } | undefined;
                     const i = pl?.idx;
@@ -279,7 +271,7 @@ export default function EquitySeriesChart({
                   }}
                   formatter={(value: number) => [`${(Number(value) * 100).toFixed(2)}%`, "Drawdown"]}
                 />
-                <Area type="monotone" dataKey="drawdown" stroke="#f87171" fill="#f87171" fillOpacity={0.35} isAnimationActive={false} />
+                <Area type="monotone" dataKey="drawdown" stroke={CHART_COLORS[2]} fill={CHART_COLORS[2]} fillOpacity={0.35} isAnimationActive={false} />
               </AreaChart>
             </ResponsiveContainer>
           </div>
@@ -300,11 +292,11 @@ export default function EquitySeriesChart({
             <div style={{ height: 200 }}>
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={histData} margin={{ left: 4, right: 8, top: 8, bottom: 24 }}>
-                  <CartesianGrid stroke="#1f2430" strokeDasharray="3 3" />
-                  <XAxis dataKey="label" stroke="#6b7280" fontSize={9} angle={-35} textAnchor="end" height={50} interval="preserveStartEnd" />
-                  <YAxis stroke="#6b7280" fontSize={10} width={40} allowDecimals={false} />
-                  <Tooltip contentStyle={tooltipStyle} formatter={(value: number) => [value, "Days"]} labelFormatter={(l) => `Bin ~${l}`} />
-                  <Bar dataKey="count" fill="#7c5cff" isAnimationActive={false} />
+                  <CartesianGrid stroke={GRID_STROKE} strokeDasharray="3 3" />
+                  <XAxis dataKey="label" stroke={AXIS_STROKE} fontSize={9} angle={-35} textAnchor="end" height={50} interval="preserveStartEnd" />
+                  <YAxis stroke={AXIS_STROKE} fontSize={10} width={40} allowDecimals={false} />
+                  <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(value: number) => [value, "Days"]} labelFormatter={(l) => `Bin ~${l}`} />
+                  <Bar dataKey="count" fill={CHART_COLORS[0]} isAnimationActive={false} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
@@ -314,10 +306,10 @@ export default function EquitySeriesChart({
             <div className="panel overflow-hidden bg-black/40" style={{ height: 220 }}>
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={weightRows} margin={{ left: 4, right: 8, top: 8, bottom: 0 }}>
-                  <CartesianGrid stroke="#1f2430" strokeDasharray="3 3" />
-                  <XAxis dataKey="date" stroke="#6b7280" fontSize={9} tickFormatter={(d) => (d && d.length >= 10 ? d.slice(5, 10) : d)} interval="preserveStartEnd" />
-                  <YAxis stroke="#6b7280" fontSize={10} width={44} tickFormatter={(v) => `${v}%`} domain={[0, 100]} />
-                  <Tooltip contentStyle={tooltipStyle} formatter={(value: number, name: string) => [`${Number(value).toFixed(1)}%`, name]} />
+                  <CartesianGrid stroke={GRID_STROKE} strokeDasharray="3 3" />
+                  <XAxis dataKey="date" stroke={AXIS_STROKE} fontSize={9} tickFormatter={(d) => (d && d.length >= 10 ? d.slice(5, 10) : d)} interval="preserveStartEnd" />
+                  <YAxis stroke={AXIS_STROKE} fontSize={10} width={44} tickFormatter={(v) => `${v}%`} domain={[0, 100]} />
+                  <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(value: number, name: string) => [`${Number(value).toFixed(1)}%`, name]} />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
                   {series.tickers.map((t, i) => (
                     <Area
@@ -325,8 +317,8 @@ export default function EquitySeriesChart({
                       type="stepAfter"
                       dataKey={t}
                       stackId="w"
-                      stroke={TICK_COLORS[i % TICK_COLORS.length]}
-                      fill={TICK_COLORS[i % TICK_COLORS.length]}
+                      stroke={CHART_COLORS[i % CHART_COLORS.length]}
+                      fill={CHART_COLORS[i % CHART_COLORS.length]}
                       fillOpacity={0.7}
                       isAnimationActive={false}
                     />

@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Calendar, Play, RefreshCw, Save, Square } from "lucide-react";
 import { ApiClient } from "../lib/api";
 import PageHeader from "../components/PageHeader";
+import { useToast } from "../components/ui";
 
 type ScheduleService = {
   id: string;
@@ -21,9 +22,9 @@ type ScheduleStatus = {
 
 export default function SchedulePage() {
   const qc = useQueryClient();
+  const toast = useToast();
   const [draft, setDraft] = useState("");
   const [dirty, setDirty] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const doc = useQuery({ queryKey: ["schedule"], queryFn: ApiClient.schedule });
   const status = useQuery<ScheduleStatus>({
@@ -40,21 +41,21 @@ export default function SchedulePage() {
     mutationFn: (raw: string) => ApiClient.saveSchedule(raw),
     onSuccess: () => {
       setDirty(false);
-      setError(null);
       qc.invalidateQueries({ queryKey: ["schedule"] });
       qc.invalidateQueries({ queryKey: ["schedule-status"] });
     },
-    onError: (err: Error) => setError(err.message),
+    onError: (err: Error) => toast.add(err.message, "error"),
   });
 
   const runNow = useMutation({
     mutationFn: (id: string) => ApiClient.runScheduleNow(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["schedule-status"] }),
-    onError: (err: Error) => setError(err.message),
+    onError: (err: Error) => toast.add(err.message, "error"),
   });
   const stop = useMutation({
     mutationFn: (id: string) => ApiClient.stopScheduleService(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["schedule-status"] }),
+    onError: (err: Error) => toast.add(err.message, "error"),
   });
 
   return (
@@ -74,9 +75,6 @@ export default function SchedulePage() {
           </button>
         }
       />
-      {error && (
-        <div className="panel-padded border-danger/30 text-danger text-sm">{error}</div>
-      )}
 
       <div className="grid gap-4 lg:grid-cols-[1fr,360px]">
         <div className="panel overflow-hidden">

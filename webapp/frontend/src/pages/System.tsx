@@ -2,6 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { Cpu } from "lucide-react";
 import { ApiClient } from "../lib/api";
 import PageHeader from "../components/PageHeader";
+import { EmptyState, Stat } from "../components/ui";
+import { useSystem } from "../hooks/useSystem";
 import { formatBytes } from "../lib/format";
 
 type GpuInfo = {
@@ -13,22 +15,8 @@ type GpuInfo = {
   temperature_c?: number;
 };
 
-type SystemSnapshot = {
-  cpu_pct: number;
-  mem_used_pct: number;
-  mem_used_mb: number;
-  mem_total_mb: number;
-  cuda_available: boolean;
-  gpus: GpuInfo[];
-  host: Record<string, unknown>;
-};
-
 export default function SystemPage() {
-  const sys = useQuery<SystemSnapshot>({
-    queryKey: ["system"],
-    queryFn: ApiClient.system,
-    refetchInterval: 3_000,
-  });
+  const sys = useSystem();
   const cfg = useQuery({ queryKey: ["static-config"], queryFn: ApiClient.staticConfig });
 
   return (
@@ -69,7 +57,7 @@ export default function SystemPage() {
               </tr>
             </thead>
             <tbody>
-              {sys.data.gpus.map((g) => (
+              {(sys.data.gpus as GpuInfo[]).map((g) => (
                 <tr key={g.index}>
                   <td>{g.index}</td>
                   <td className="font-mono text-xs">{g.name}</td>
@@ -83,6 +71,10 @@ export default function SystemPage() {
               ))}
             </tbody>
           </table>
+        </div>
+      ) : sys.data ? (
+        <div className="panel">
+          <EmptyState message="No GPU data available." />
         </div>
       ) : null}
 
@@ -116,16 +108,6 @@ export default function SystemPage() {
           </table>
         </div>
       </div>
-    </div>
-  );
-}
-
-function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
-  return (
-    <div className="panel-padded">
-      <div className="text-xs uppercase tracking-wide text-ink-muted">{label}</div>
-      <div className="mt-2 text-3xl font-semibold">{value}</div>
-      {hint && <div className="text-xs text-ink-muted mt-1">{hint}</div>}
     </div>
   );
 }
