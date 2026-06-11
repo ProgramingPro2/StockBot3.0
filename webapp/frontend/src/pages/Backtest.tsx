@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import JobStatusCard from "../components/JobStatusCard";
 import { BarChart3, Play } from "lucide-react";
 import { ApiClient, type ModelInfo, type ModelsResponse } from "../lib/api";
 import PageHeader from "../components/PageHeader";
@@ -108,6 +109,7 @@ export default function Backtest() {
         </div>
 
         <div className="space-y-4 min-w-0">
+          {jobId && <JobStatusCard job={job?.id === jobId ? job : null} />}
           {jobId && <LogStream jobId={jobId} />}
 
           {result.data && Boolean((result.data as { stats?: unknown }).stats) && (

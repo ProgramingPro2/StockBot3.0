@@ -91,6 +91,59 @@ from .proxy_specialists import proxy_specialists_vectorized_batch
 
 logger = get_logger()
 
+
+def _quiet_thirdparty_logging() -> None:
+    """Silence noisy third-party output during walk-forward generation.
+
+    Lightning re-logs hardware banners and upsell tips on every Trainer
+    construction (~90 refits per run), and sklearn warns on every LGB predict
+    call; none of it is actionable here.
+    """
+    import logging as _logging
+    import os as _os
+    import warnings as _warnings
+
+    for name in ("lightning", "lightning.pytorch", "lightning.fabric", "pytorch_lightning"):
+        _logging.getLogger(name).setLevel(_logging.WARNING)
+    _warnings.filterwarnings("ignore", message=".*does not have valid feature names.*")
+    _warnings.filterwarnings("ignore", message=".*does not have many workers.*")
+    _warnings.filterwarnings("ignore", message=".*you defined a `validation_step`.*")
+    _warnings.filterwarnings("ignore", message=".*ReduceLROnPlateau conditioned on metric.*")
+    _warnings.filterwarnings("ignore", message=".*litmodels.*")
+    # Suppress Lightning's stdout tip about litmodels / cloud uploads.
+    # It's written via rich's Console.print(), not through Python logging,
+    # so we patch it out at the env-var level that Lightning checks first.
+    _os.environ.setdefault("LIGHTNING_DISABLE_SUPERFLUOUS_WARNINGS", "1")
+    _os.environ.setdefault("LT_DISABLE_LIGHTNING_TIPS", "1")
+
+
+def _emit_progress(stage: str, frac: float, detail: str = "") -> None:
+    """Append a progress row to the web UI metrics stream (no-op outside jobs).
+
+    The Boardroom job manager tails BOARDROOM_METRICS_PATH and broadcasts each
+    line over WebSocket; the Train page renders these rows as a progress bar.
+    """
+    path = os.environ.get("BOARDROOM_METRICS_PATH", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "event": "progress",
+                        "stage": stage,
+                        "progress": round(max(0.0, min(1.0, float(frac))), 4),
+                        "detail": detail,
+                        "ts": time.time(),
+                    }
+                )
+                + "\n"
+            )
+    except OSError:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config constants (with graceful fallback if not yet in config.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,6 +306,183 @@ def _load_cache(
     except Exception as exc:
         logger.warning("Cache load failed for %s: %s — will regenerate", npz_path, exc)
         return None
+
+
+def _tft_checkpoint_meta_path(ckpt_path: Path) -> Path:
+    return ckpt_path.parent / f"{ckpt_path.stem}_meta.json"
+
+
+def _save_tft_checkpoint(
+    ckpt_path: Path,
+    out: np.ndarray,
+    last_bar: int,
+    tickers: list[str],
+    dates: pd.DatetimeIndex,
+    refit_every: int,
+) -> None:
+    """Persist partial TFT walk-forward output plus a JSON sidecar for the web UI."""
+    np.savez_compressed(ckpt_path, out=out, last_bar=np.int64(last_bar))
+    meta = {
+        "kind": "tft_walkforward_checkpoint",
+        "tickers": sorted(tickers),
+        "start_date": str(dates[0].date()),
+        "end_date": str(dates[-1].date()),
+        "refit_every": int(refit_every),
+        "last_bar": int(last_bar),
+        "n_days": int(out.shape[0]),
+        "n_tickers": int(out.shape[1]),
+    }
+    with open(_tft_checkpoint_meta_path(ckpt_path), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def _remove_tft_checkpoint(ckpt_path: Path) -> None:
+    try:
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+    except OSError:
+        pass
+    meta_path = _tft_checkpoint_meta_path(ckpt_path)
+    try:
+        if meta_path.exists():
+            meta_path.unlink()
+    except OSError:
+        pass
+
+
+def list_specialist_cache_status() -> dict[str, Any]:
+    """Summarize completed caches and partial TFT checkpoints for the web UI."""
+    from ..config import SPECIALIST_REFIT_EVERY_BARS  # type: ignore[attr-defined]
+
+    cache_dir = SPECIALIST_FEATURES_CACHE_DIR
+    caches: list[dict[str, Any]] = []
+    checkpoints: list[dict[str, Any]] = []
+    seen_ckpt_ids: set[str] = set()
+
+    for meta_path in sorted(cache_dir.glob("*_meta.json")):
+        stem = meta_path.name.replace("_meta.json", "")
+        if stem.startswith("tft_wf_ckpt_"):
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Could not read checkpoint meta %s: %s", meta_path, exc)
+                continue
+            npz_path = cache_dir / f"{stem}.npz"
+            last_bar = int(meta.get("last_bar", 0))
+            n_days = int(meta.get("n_days", 0))
+            progress = (last_bar / n_days) if n_days > 0 else 0.0
+            checkpoints.append(
+                {
+                    "checkpoint_id": stem,
+                    "tickers": meta.get("tickers") or [],
+                    "start_date": meta.get("start_date"),
+                    "end_date": meta.get("end_date"),
+                    "refit_every": meta.get("refit_every"),
+                    "last_bar": last_bar,
+                    "n_days": n_days,
+                    "n_tickers": int(meta.get("n_tickers", 0)),
+                    "progress_pct": round(min(1.0, max(0.0, progress)), 4),
+                    "size_bytes": int(npz_path.stat().st_size) if npz_path.exists() else 0,
+                    "mtime": float(npz_path.stat().st_mtime) if npz_path.exists() else float(meta_path.stat().st_mtime),
+                }
+            )
+            seen_ckpt_ids.add(stem)
+            continue
+
+        npz_path = cache_dir / f"{stem}.npz"
+        if not npz_path.exists():
+            continue
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Could not read cache meta %s: %s", meta_path, exc)
+            continue
+        tickers_raw = meta.get("tickers", [])
+        tickers_list = [str(t).upper() for t in tickers_raw]
+        caches.append(
+            {
+                "cache_key": stem,
+                "start_date": str(meta.get("start_date", "")),
+                "end_date": str(meta.get("end_date", "")),
+                "tickers": tickers_list,
+                "n_days": int(meta.get("n_days", 0)),
+                "n_tickers": int(meta.get("n_assets", meta.get("n_tickers", 0))),
+                "refit_every": int(meta.get("refit_every", 0)),
+                "window": int(meta.get("window", 21)),
+                "size_bytes": int(npz_path.stat().st_size),
+                "mtime": float(npz_path.stat().st_mtime),
+                "generation_seconds": meta.get("generation_time_seconds"),
+            }
+        )
+
+    for npz_path in sorted(cache_dir.glob("tft_wf_ckpt_*.npz")):
+        stem = npz_path.stem
+        if stem in seen_ckpt_ids:
+            continue
+        try:
+            ckpt = np.load(npz_path)
+            last_bar = int(ckpt["last_bar"])
+            out = ckpt["out"]
+            n_days, n_tickers = int(out.shape[0]), int(out.shape[1])
+            progress = (last_bar / n_days) if n_days > 0 else 0.0
+            checkpoints.append(
+                {
+                    "checkpoint_id": stem,
+                    "tickers": [],
+                    "start_date": None,
+                    "end_date": None,
+                    "refit_every": None,
+                    "last_bar": last_bar,
+                    "n_days": n_days,
+                    "n_tickers": n_tickers,
+                    "progress_pct": round(min(1.0, max(0.0, progress)), 4),
+                    "size_bytes": int(npz_path.stat().st_size),
+                    "mtime": float(npz_path.stat().st_mtime),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read orphan checkpoint %s: %s", npz_path, exc)
+
+    caches.sort(key=lambda c: c.get("mtime", 0), reverse=True)
+    checkpoints.sort(key=lambda c: c.get("mtime", 0), reverse=True)
+    return {
+        "cache_dir": str(cache_dir),
+        "default_refit_every": int(SPECIALIST_REFIT_EVERY_BARS),
+        "caches": caches,
+        "checkpoints": checkpoints,
+    }
+
+
+def delete_specialist_cache(cache_key: str) -> bool:
+    """Remove a completed specialist matrix cache (.npz + _meta.json)."""
+    key = cache_key.strip()
+    if not key or "/" in key or "\\" in key:
+        return False
+    npz_path = SPECIALIST_FEATURES_CACHE_DIR / f"{key}.npz"
+    meta_path = SPECIALIST_FEATURES_CACHE_DIR / f"{key}_meta.json"
+    removed = False
+    for path in (npz_path, meta_path):
+        try:
+            if path.exists():
+                path.unlink()
+                removed = True
+        except OSError as exc:
+            logger.warning("Could not delete %s: %s", path, exc)
+    return removed
+
+
+def delete_tft_checkpoint(checkpoint_id: str) -> bool:
+    """Remove a partial TFT walk-forward checkpoint (.npz + sidecar meta)."""
+    cid = checkpoint_id.strip()
+    if not cid.startswith("tft_wf_ckpt_") or "/" in cid or "\\" in cid:
+        return False
+    ckpt_path = SPECIALIST_FEATURES_CACHE_DIR / f"{cid}.npz"
+    if not ckpt_path.exists():
+        return False
+    _remove_tft_checkpoint(ckpt_path)
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -465,6 +695,7 @@ def _walkforward_regime_flag(
         next_r = refits[i + 1] if i + 1 < len(refits) else n_days
         trained_windows.append((r_idx, next_r, vae, km, s_mean, s_std, regime_labels))
         logger.info("Regime VAE refit at bar %d/%d (window [%d, %d))", r_idx, n_days, r_idx, next_r)
+        _emit_progress("regime_vae", 0.05 + 0.20 * (r_idx / max(n_days, 1)), f"bar {r_idx}/{n_days}")
 
     if not trained_windows:
         logger.warning("No regime VAE windows trained; using proxy 0.5")
@@ -616,6 +847,7 @@ def _walkforward_momentum_scores(
         model, imputer, scaler = result
         next_r = refits[i + 1] if i + 1 < len(refits) else n_days
         logger.info("Momentum LGB refit at bar %d/%d (window [%d, %d))", r_idx, n_days, r_idx, next_r)
+        _emit_progress("momentum_lgb", 0.25 + 0.10 * (r_idx / max(n_days, 1)), f"bar {r_idx}/{n_days}")
 
         # Batch inference for all tickers in window [r_idx, next_r)
         X_stack = np.stack(
@@ -644,6 +876,13 @@ def _walkforward_momentum_scores(
 # ─────────────────────────────────────────────────────────────────────────────
 # TFT quant_prob walk-forward (best-effort; proxy fallback when insufficient data)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _tft_checkpoint_path(dates: pd.DatetimeIndex, tickers: list[str], refit_every: int) -> Path:
+    """Deterministic path for a TFT walk-forward checkpoint .npz file."""
+    raw = f"tft_ckpt:{sorted(tickers)}:{str(dates[0].date())}:{str(dates[-1].date())}:{refit_every}"
+    h = hashlib.md5(raw.encode()).hexdigest()[:16]
+    return SPECIALIST_FEATURES_CACHE_DIR / f"tft_wf_ckpt_{h}.npz"
 
 
 def _walkforward_tft_scores(
@@ -695,7 +934,34 @@ def _walkforward_tft_scores(
         )
         return None
 
-    any_trained = False
+    # ── Checkpoint / resume ──────────────────────────────────────────────────
+    # After each successful refit we save the partial `out` array to a .npz.
+    # On restart we reload it and skip windows that are already filled in
+    # (detected by the last filled bar being past the window start).
+    ckpt_path = _tft_checkpoint_path(dates, tickers, refit_every)
+    resume_from_bar: int = 0
+    if ckpt_path.exists():
+        try:
+            ckpt = np.load(ckpt_path)
+            ckpt_out = ckpt["out"]
+            ckpt_bar = int(ckpt["last_bar"])
+            if ckpt_out.shape == (n_days, n_assets):
+                out = ckpt_out
+                resume_from_bar = ckpt_bar
+                logger.info(
+                    "TFT checkpoint found — resuming from bar %d/%d (%d/%d refits already done)",
+                    resume_from_bar,
+                    n_days,
+                    sum(1 for r in refits if r <= resume_from_bar),
+                    len(refits),
+                )
+            else:
+                logger.warning("TFT checkpoint shape mismatch (%s vs %s) — ignoring", ckpt_out.shape, (n_days, n_assets))
+        except Exception as exc:
+            logger.warning("TFT checkpoint load failed (%s) — starting fresh", exc)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    any_trained = resume_from_bar > 0  # already have data if resuming
 
     def _add_log_vol(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -709,8 +975,14 @@ def _walkforward_tft_scores(
         return df
 
     for i, r_idx in enumerate(refits):
-        cutoff = dates[r_idx - 1]
         next_r = refits[i + 1] if i + 1 < len(refits) else n_days
+
+        # Skip windows already computed in a prior (interrupted) run
+        if r_idx <= resume_from_bar:
+            logger.debug("TFT checkpoint skip bar %d (already done)", r_idx)
+            continue
+
+        cutoff = dates[r_idx - 1]
 
         # Build training data sliced to refit cutoff
         train_parts: list[pd.DataFrame] = []
@@ -784,86 +1056,74 @@ def _walkforward_tft_scores(
                 logger.warning("TFT training failed at bar %d: %s", r_idx, exc)
                 continue
 
-        # Batch inference for window [r_idx, next_r)
-        # Tickers absent from this training window (e.g. not yet IPO'd) are unknown
-        # categories to the fitted dataset; including them aborts inference for the
-        # whole batch ("Unknown category" error), so skip them - they keep the
-        # fallback value for this window.
+        # Per-ticker inference: build one encoder context per ticker (data up to
+        # the refit cutoff), run a single forward pass, and use the last window's
+        # first-step prediction as a constant probability score for the whole
+        # window [r_idx, next_r).
+        #
+        # This avoids the two bugs in the previous batch approach:
+        #   1. preds[t_i] indexes by flat window order, not by ticker.
+        #   2. Date mapping failed on tz-aware yfinance timestamps vs tz-naive
+        #      aligned_close index.
         train_tickers = set(combined["ticker"].unique())
-        inf_parts: list[pd.DataFrame] = []
-        ticker_order: list[str] = []
+        tft_model.eval()
+
         for ticker in tickers:
             if ticker not in train_tickers:
-                continue
-            df = ohlcv_dict.get(ticker)
-            if df is None or df.empty:
-                continue
-            # Use data up to end of inference window, but TFT only sees encoder context
-            df_inf = df[df.index <= dates[min(next_r, n_days) - 1]]
-            if len(df_inf) < TFT_MAX_ENCODER_LENGTH + 1:
-                continue
-            prep = prepare_tft_data_inference(df_inf, ticker=ticker)
-            if not prep.empty:
-                inf_parts.append(_add_log_vol(prep))
-                ticker_order.append(ticker)
-
-        if not inf_parts:
-            continue
-
-        try:
-            inf_combined = _fix_time_idx(pd.concat(inf_parts, ignore_index=True))
-            inf_ds = TimeSeriesDataSet.from_dataset(train_ds, inf_combined, stop_randomization=True)
-            inf_dl = inf_ds.to_dataloader(train=False, batch_size=32, num_workers=0)
-            tft_model.eval()
-            with torch.no_grad():
-                preds = tft_model.predict(inf_dl)
-        except Exception as exc:
-            logger.warning("TFT inference failed at bar %d: %s", r_idx, exc)
-            continue
-
-        # Map predictions back to (dates, tickers) grid.
-        # After prepare_tft_data_inference -> reset_index(), the date column may be
-        # named "Date", "Datetime", "date", "index", etc. depending on yfinance version.
-        _date_col_candidates = [
-            c for c in inf_combined.columns
-            if c.lower() in ("date", "datetime", "index", "timestamp")
-        ]
-        _date_col = _date_col_candidates[0] if _date_col_candidates else None
-
-        for t_i, ticker in enumerate(ticker_order):
-            if t_i >= len(preds):
                 continue
             t_col = tickers.index(ticker) if ticker in tickers else -1
             if t_col < 0:
                 continue
-            ticker_preds = preds[t_i]
-            if ticker_preds.dim() == 2:
-                ticker_preds = ticker_preds[:, 0]
-            inf_ticker_df = inf_combined[inf_combined["ticker"] == ticker].reset_index(drop=True)
-            for row_i in range(min(len(ticker_preds), len(inf_ticker_df))):
-                row = inf_ticker_df.iloc[row_i]
-                try:
-                    if _date_col is not None:
-                        bar_date = pd.Timestamp(row[_date_col])
-                    else:
-                        # Fall back: reconstruct date from global dates array using time_idx
-                        t_idx = int(row.get("time_idx", -1))
-                        if 0 <= t_idx < len(dates):
-                            bar_date = dates[t_idx]
-                        else:
-                            continue
-                    bar_date = bar_date.normalize()
-                    if bar_date in dates:
-                        bar_t = dates.get_loc(bar_date)
-                        if r_idx <= bar_t < next_r:
-                            forecast = float(ticker_preds[row_i])
-                            prob = float(1.0 / (1.0 + math.exp(-20.0 * forecast)))
-                            out[bar_t, t_col] = float(np.clip(prob, 0.0, 1.0))
-                except Exception:
+            df = ohlcv_dict.get(ticker)
+            if df is None or df.empty:
+                continue
+            # Use only data up to (and including) the refit cutoff so the model
+            # has no look-ahead into [r_idx, next_r).
+            df_enc = df[df.index <= cutoff].tail(
+                TFT_MAX_ENCODER_LENGTH + TFT_MAX_PREDICTION_LENGTH + 10
+            )
+            if len(df_enc) < TFT_MAX_ENCODER_LENGTH + 1:
+                continue
+
+            prep = prepare_tft_data_inference(df_enc, ticker=ticker)
+            if prep.empty:
+                continue
+            prep = _add_log_vol(prep)
+            prep = _fix_time_idx(prep)
+
+            try:
+                inf_ds = TimeSeriesDataSet.from_dataset(
+                    train_ds, prep, stop_randomization=True
+                )
+                inf_dl = inf_ds.to_dataloader(
+                    train=False, batch_size=len(inf_ds), num_workers=0
+                )
+                with torch.no_grad():
+                    ticker_preds = tft_model.predict(inf_dl)
+                # ticker_preds shape: (n_windows, max_pred_len) or (n_windows,)
+                # Use the last window's first-step prediction as the score.
+                if ticker_preds.numel() == 0:
                     continue
+                if ticker_preds.dim() >= 2:
+                    score = float(ticker_preds[-1, 0])
+                else:
+                    score = float(ticker_preds[-1])
+                prob = float(1.0 / (1.0 + math.exp(-20.0 * score)))
+                prob = float(np.clip(prob, 0.0, 1.0))
+                out[r_idx:next_r, t_col] = prob
+            except Exception as exc:
+                logger.debug("TFT per-ticker inference failed (%s, bar %d): %s", ticker, r_idx, exc)
+                continue
 
         any_trained = True
         logger.info("TFT refit at bar %d/%d (window [%d, %d))", r_idx, n_days, r_idx, next_r)
+        _emit_progress("tft_quant_prob", 0.35 + 0.63 * (r_idx / max(n_days, 1)), f"bar {r_idx}/{n_days}")
+
+        # Save checkpoint so a restart can resume from this window
+        try:
+            _save_tft_checkpoint(ckpt_path, out, r_idx, tickers, dates, refit_every)
+        except OSError as exc:
+            logger.warning("TFT checkpoint save failed: %s", exc)
 
     if not any_trained:
         logger.info("TFT: no successful refits — proxy fallback for quant_prob")
@@ -875,6 +1135,10 @@ def _walkforward_tft_scores(
             "— proxy fallback for quant_prob"
         )
         return None
+
+    # Full run complete — remove checkpoint file
+    _remove_tft_checkpoint(ckpt_path)
+
     return out
 
 
@@ -933,6 +1197,9 @@ def precompute_specialist_feature_matrix(
         aligned_close.pct_change().fillna(0.0).values.astype(np.float32)
     )
 
+    _quiet_thirdparty_logging()
+    _emit_progress("proxy_base", 0.01, f"{n_days} days x {n_assets} assets")
+
     # Step 1: proxy baseline for all 13 slots using sliding window (no z-score)
     out = np.zeros((n_days, n_assets, N_SLOTS), dtype=np.float32)
     if n_days > window:
@@ -948,6 +1215,7 @@ def precompute_specialist_feature_matrix(
 
     # Step 2: rule-based slots from OHLCV (override proxy)
     logger.info("Computing rule-based specialist slots (mean_reversion, volatility, rel_strength, liquidity)...")
+    _emit_progress("rule_based", 0.03, "mean_reversion / volatility / rel_strength / liquidity")
 
     close_df = aligned_close.reindex(dates).ffill()
     if close_df.shape[1] != n_assets:
@@ -1262,6 +1530,7 @@ def get_or_build_specialist_matrix(
     metadata["warmup_bars"] = int(out_mask.sum() - int(np.sum(~out_mask[:int(np.argmax(out_mask))])))
 
     _save_cache(key, matrix, dates, tickers_upper, metadata, elapsed)
+    _emit_progress("done", 1.0, f"cached {matrix.shape[0]} days in {elapsed:.0f}s")
 
     return matrix, dates, metadata
 

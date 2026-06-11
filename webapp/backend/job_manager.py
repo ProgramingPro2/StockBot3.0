@@ -41,18 +41,32 @@ ALL_KINDS: set[JobKind] = {
 
 @dataclass
 class _Broadcaster:
-    """Many-to-many fan-out for log lines or metric rows."""
+    """Many-to-many fan-out for log lines or metric rows.
 
-    subscribers: list[asyncio.Queue[str | None]] = field(default_factory=list)
+    ``push()`` and ``close()`` are called from background threads; they must
+    use ``loop.call_soon_threadsafe()`` so the event loop's selector is
+    interrupted and waiting ``queue.get()`` coroutines wake up promptly.
+    Without this, metrics (infrequent rows) silently queue inside the asyncio
+    deque but the WS handler never wakes up until the next unrelated I/O event.
+    """
+
+    # Each entry is (queue, loop) so push() can call call_soon_threadsafe.
+    subscribers: list[tuple[asyncio.Queue[str | None], asyncio.AbstractEventLoop]] = field(
+        default_factory=list
+    )
     closed: bool = False
     history: list[str] = field(default_factory=list)
     history_limit: int = 2000
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def subscribe(self, replay: bool = True) -> asyncio.Queue[str | None]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()  # fallback for sync callers
         q: asyncio.Queue[str | None] = asyncio.Queue(maxsize=1024)
         with self._lock:
-            self.subscribers.append(q)
+            self.subscribers.append((q, loop))
             history = list(self.history) if replay else []
             already_closed = self.closed
         for line in history:
@@ -69,10 +83,27 @@ class _Broadcaster:
 
     def unsubscribe(self, q: asyncio.Queue[str | None]) -> None:
         with self._lock:
-            try:
-                self.subscribers.remove(q)
-            except ValueError:
-                pass
+            self.subscribers = [(sq, lp) for sq, lp in self.subscribers if sq is not q]
+
+    @staticmethod
+    def _enqueue(q: asyncio.Queue[str | None], item: str | None) -> None:
+        """Run on the event loop thread via call_soon_threadsafe."""
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            if item is None:
+                # sentinel must get through; drop oldest data item
+                try:
+                    q.get_nowait()
+                    q.put_nowait(item)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
+            else:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(item)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
 
     def push(self, line: str) -> None:
         with self._lock:
@@ -82,16 +113,12 @@ class _Broadcaster:
             if len(self.history) > self.history_limit:
                 del self.history[: len(self.history) - self.history_limit]
             subs = list(self.subscribers)
-        for q in subs:
+        for q, loop in subs:
             try:
-                q.put_nowait(line)
-            except asyncio.QueueFull:
-                # drop the oldest item to make room
-                try:
-                    q.get_nowait()
-                    q.put_nowait(line)
-                except (asyncio.QueueEmpty, asyncio.QueueFull):
-                    pass
+                loop.call_soon_threadsafe(self._enqueue, q, line)
+            except RuntimeError:
+                # loop has been closed; skip
+                pass
 
     def close(self) -> None:
         with self._lock:
@@ -99,10 +126,10 @@ class _Broadcaster:
                 return
             self.closed = True
             subs = list(self.subscribers)
-        for q in subs:
+        for q, loop in subs:
             try:
-                q.put_nowait(None)
-            except asyncio.QueueFull:
+                loop.call_soon_threadsafe(self._enqueue, q, None)
+            except RuntimeError:
                 pass
 
 

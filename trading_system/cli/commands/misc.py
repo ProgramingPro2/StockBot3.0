@@ -6,6 +6,7 @@ from typing import Optional
 import typer
 
 from ...utils.logger import set_debug
+from ..formatting import write_result_path
 from ._common import make_args
 
 
@@ -63,17 +64,42 @@ def register(app: typer.Typer) -> None:
             refit_every=refit_every,
             force_rebuild=force_rebuild,
         )
-        typer.echo(
-            f"Specialist cache ready in {time.time() - t0:.1f}s | shape={matrix.shape} | "
-            f"{dates[0].date()} -> {dates[-1].date()} ({len(dates)} trading days)"
-        )
+        elapsed = time.time() - t0
         slot_names = [
             "sentiment", "quant_prob", "fund_score", "regime_flag", "momentum_score",
             "mean_reversion", "volatility", "event_risk", "relative_strength", "liquidity",
             "ret_5d_norm", "ret_21d_norm", "vol_21d_norm",
         ]
-        for slot_idx, source in sorted(meta.get("slot_sources", {}).items(), key=lambda x: int(x[0])):
-            typer.echo(f"  slot {int(slot_idx):2d} {slot_names[int(slot_idx)]:<18} {source}")
+        slot_sources = {
+            slot_names[int(k)]: v
+            for k, v in sorted(meta.get("slot_sources", {}).items(), key=lambda x: int(x[0]))
+        }
+        real_slots = sum(1 for v in slot_sources.values() if v == "specialist")
+        proxy_slots = len(slot_sources) - real_slots
+        result = {
+            "status": "ok",
+            "shape": list(matrix.shape),
+            "n_days": int(len(dates)),
+            "n_tickers": int(matrix.shape[1]),
+            "n_slots": int(matrix.shape[2]),
+            "start_date": str(dates[0].date()),
+            "end_date": str(dates[-1].date()),
+            "tickers": tick_list,
+            "elapsed_seconds": round(elapsed, 1),
+            "refit_every_bars": refit_every or meta.get("refit_every"),
+            "real_slots": real_slots,
+            "proxy_slots": proxy_slots,
+            "slot_sources": slot_sources,
+            "cache_key": meta.get("cache_key"),
+        }
+        write_result_path(result)
+        typer.echo(
+            f"Specialist cache ready in {elapsed:.1f}s | shape={matrix.shape} | "
+            f"{dates[0].date()} -> {dates[-1].date()} ({len(dates)} trading days) | "
+            f"{real_slots} real slots / {proxy_slots} proxy"
+        )
+        for slot_name, source in slot_sources.items():
+            typer.echo(f"  {slot_name:<20} {source}")
 
     @app.command("benchmark-device", help="Compare PPO training speed: CPU vs GPU.")
     def benchmark(

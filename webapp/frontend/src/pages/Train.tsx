@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Flame, Play, ExternalLink, Wand2, Database } from "lucide-react";
-import { ApiClient, type SpecialistCacheParams, type TuneStudySummary } from "../lib/api";
+import { ApiClient, type JobInfo, type SpecialistCacheParams, type TuneStudySummary } from "../lib/api";
 import PageHeader from "../components/PageHeader";
 import JobControl from "../components/JobControl";
 import LogStream from "../components/LogStream";
 import MetricsChart from "../components/MetricsChart";
+import JobProgress from "../components/JobProgress";
+import JobStatusCard from "../components/JobStatusCard";
 import StatsTable from "../components/StatsTable";
 import TickerInput from "../components/TickerInput";
 import Field from "../components/Field";
@@ -13,6 +15,7 @@ import { useDefaultTickers } from "../hooks/useStaticConfig";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import EquitySeriesChart from "../components/EquitySeriesChart";
+import SpecialistCachePanel from "../components/SpecialistCachePanel";
 
 function studyOptionLabel(s: TuneStudySummary): string {
   if (s.error) return `${s.name} (load error)`;
@@ -47,7 +50,25 @@ export default function Train() {
 
   const job = useJobByKind("train");
   const cacheJob = useJobByKind("specialist-cache");
-  const jobId = activeJobId ?? job?.id ?? null;
+  // Bind the log/metrics pane to: a job started from this page, else the
+  // most recently started *running* train/cache job (so a refresh while the
+  // specialist cache builds keeps showing its logs), else the latest of either.
+  const isActive = (j: JobInfo | null): boolean =>
+    !!j && (j.status === "pending" || j.status === "running" || j.status === "stopping");
+  const newest = (a: JobInfo | null, b: JobInfo | null): JobInfo | null => {
+    if (!a) return b;
+    if (!b) return a;
+    return (b.started ?? 0) > (a.started ?? 0) ? b : a;
+  };
+  const runningJob = newest(isActive(job) ? job : null, isActive(cacheJob) ? cacheJob : null);
+  const jobId = activeJobId ?? runningJob?.id ?? newest(job, cacheJob)?.id ?? null;
+  const isCacheView = !!jobId && jobId === cacheJob?.id;
+  const cacheJobRunning =
+    cacheJob?.status === "pending" ||
+    cacheJob?.status === "running" ||
+    cacheJob?.status === "stopping";
+  // The job object for the currently-viewed job (for status card)
+  const activeJob = jobId === cacheJob?.id ? cacheJob : jobId === job?.id ? job : null;
 
   const result = useQuery({
     queryKey: ["job-result", jobId],
@@ -69,10 +90,6 @@ export default function Train() {
     trainResult?.series_path?.split("/").pop() ??
     (trainPlotName?.toLowerCase().endsWith(".png") ? `${trainPlotName.slice(0, -4)}.json` : undefined);
   const trainSeriesUrl = trainSeriesJson ? ApiClient.seriesUrl(trainSeriesJson) : undefined;
-
-  useEffect(() => {
-    if (!activeJobId && job?.id) setActiveJobId(job.id);
-  }, [activeJobId, job?.id]);
 
   const onStart = async () => {
     const params: Record<string, unknown> = {
@@ -316,9 +333,20 @@ export default function Train() {
             </Field>
             <Toggle
               label="Force rebuild"
-              hint="Regenerate even if a compatible cache exists."
+              hint="Regenerate even if a compatible cache exists. Does not delete TFT walk-forward checkpoints — use Discard below to start TFT from scratch."
               checked={cacheForceRebuild}
               onChange={setCacheForceRebuild}
+            />
+            <SpecialistCachePanel
+              isJobRunning={cacheJobRunning}
+              onStarted={(info) => setActiveJobId(info.id)}
+              onApplyToForm={(s) => {
+                setCacheStart(s.start);
+                setCacheEnd(s.end ?? "");
+                setCacheRefitEvery(s.refit_every ?? "");
+                if (s.tickers) setTickers(s.tickers);
+                setCacheForceRebuild(s.force_rebuild ?? false);
+              }}
             />
             <JobControl
               job={cacheJob}
@@ -334,7 +362,9 @@ export default function Train() {
         <div className="space-y-4 min-w-0">
           {jobId && (
             <>
-              <MetricsChart jobId={jobId} />
+              <JobStatusCard job={activeJob} />
+              <JobProgress jobId={jobId} />
+              {!isCacheView && <MetricsChart jobId={jobId} />}
               <LogStream jobId={jobId} />
               {result.data && typeof (result.data as { stats?: unknown }).stats === "object" && (
                 <div className="space-y-4">

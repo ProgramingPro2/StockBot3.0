@@ -15,7 +15,9 @@ from ..schemas import (
     JobInfo,
     JobListResponse,
     PaperLiveParams,
+    SpecialistCacheDeleteResponse,
     SpecialistCacheParams,
+    SpecialistCacheStatusResponse,
     StartJobResponse,
     StopJobResponse,
     TrainParams,
@@ -120,6 +122,38 @@ def start_benchmark(params: BenchmarkParams) -> StartJobResponse:
 def start_specialist_cache(params: SpecialistCacheParams) -> StartJobResponse:
     info = get_manager().start("specialist-cache", params.model_dump(exclude_none=True))
     return StartJobResponse(job=info)
+
+
+@router.get("/specialist-cache/status", response_model=SpecialistCacheStatusResponse)
+def specialist_cache_status() -> SpecialistCacheStatusResponse:
+    """List completed specialist matrices and partial TFT checkpoints (resume targets)."""
+    from trading_system.meta_learner.specialist_features import list_specialist_cache_status
+
+    return SpecialistCacheStatusResponse(**list_specialist_cache_status())
+
+
+@router.delete(
+    "/specialist-cache/caches/{cache_key}",
+    response_model=SpecialistCacheDeleteResponse,
+)
+def delete_specialist_cache(cache_key: str) -> SpecialistCacheDeleteResponse:
+    from trading_system.meta_learner.specialist_features import delete_specialist_cache as _delete
+
+    if _delete(cache_key):
+        return SpecialistCacheDeleteResponse(ok=True, detail=f"Deleted cache {cache_key}")
+    raise HTTPException(status_code=404, detail="cache not found")
+
+
+@router.delete(
+    "/specialist-cache/checkpoints/{checkpoint_id}",
+    response_model=SpecialistCacheDeleteResponse,
+)
+def delete_specialist_checkpoint(checkpoint_id: str) -> SpecialistCacheDeleteResponse:
+    from trading_system.meta_learner.specialist_features import delete_tft_checkpoint
+
+    if delete_tft_checkpoint(checkpoint_id):
+        return SpecialistCacheDeleteResponse(ok=True, detail=f"Deleted checkpoint {checkpoint_id}")
+    raise HTTPException(status_code=404, detail="checkpoint not found")
 
 
 @router.post("/{job_id}/stop", response_model=StopJobResponse)

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Play, RefreshCw, SlidersHorizontal, Wand2 } from "lucide-react";
 import { ApiClient, type TuneStudySummary } from "../lib/api";
+import JobStatusCard from "../components/JobStatusCard";
 import PageHeader from "../components/PageHeader";
 import JobControl from "../components/JobControl";
 import LogStream from "../components/LogStream";
@@ -307,6 +308,7 @@ export default function Tune() {
         <div className="space-y-4 min-w-0">
           {jobId ? (
             <>
+              <JobStatusCard job={job?.id === jobId ? job : null} />
               <MetricsChart jobId={jobId} />
               <LogStream jobId={jobId} />
             </>

@@ -112,6 +112,20 @@ export const ApiClient = {
     api.post("/api/jobs/benchmark/start", params).then((r) => r.data.job),
   startSpecialistCache: (params: SpecialistCacheParams) =>
     api.post("/api/jobs/specialist-cache/start", params).then((r) => r.data.job),
+  getSpecialistCacheStatus: () =>
+    api.get<SpecialistCacheStatus>("/api/jobs/specialist-cache/status").then((r) => r.data),
+  deleteSpecialistCache: (cacheKey: string) =>
+    api
+      .delete<{ ok: boolean; detail: string }>(
+        `/api/jobs/specialist-cache/caches/${encodeURIComponent(cacheKey)}`,
+      )
+      .then((r) => r.data),
+  deleteSpecialistCheckpoint: (checkpointId: string) =>
+    api
+      .delete<{ ok: boolean; detail: string }>(
+        `/api/jobs/specialist-cache/checkpoints/${encodeURIComponent(checkpointId)}`,
+      )
+      .then((r) => r.data),
   stopJob: (id: string) => api.post(`/api/jobs/${id}/stop`).then((r) => r.data.job),
   killJob: (id: string) => api.post(`/api/jobs/${id}/kill`).then((r) => r.data.job),
   models: () => api.get<ModelsResponse>("/api/models").then((r) => r.data),
@@ -150,6 +164,41 @@ export type SpecialistCacheParams = {
   refit_every?: number;
   window?: number;
   force_rebuild?: boolean;
+};
+
+export type SpecialistCacheEntry = {
+  cache_key: string;
+  start_date: string;
+  end_date: string;
+  tickers: string[];
+  n_days: number;
+  n_tickers: number;
+  refit_every: number;
+  window: number;
+  size_bytes: number;
+  mtime: number;
+  generation_seconds?: number | null;
+};
+
+export type SpecialistCacheCheckpoint = {
+  checkpoint_id: string;
+  tickers: string[];
+  start_date?: string | null;
+  end_date?: string | null;
+  refit_every?: number | null;
+  last_bar: number;
+  n_days: number;
+  n_tickers: number;
+  progress_pct: number;
+  size_bytes: number;
+  mtime: number;
+};
+
+export type SpecialistCacheStatus = {
+  cache_dir: string;
+  default_refit_every: number;
+  caches: SpecialistCacheEntry[];
+  checkpoints: SpecialistCacheCheckpoint[];
 };
 
 export type ModelInfo = {
