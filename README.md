@@ -352,3 +352,7 @@ make docker-down
 Open <http://localhost:28473>. TensorBoard is also reachable directly at <http://localhost:6006/tb/> (path prefix matches the web UI proxy) if you prefer it standalone.
 
 The compose file mounts the project's `.env`, `config/`, `outputs/`, `models/` and `data/cache/` so trained models, logs, and plots are persisted on the host.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
